@@ -322,6 +322,17 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
 
+    /* Immediate mode: inside BEGIN/END, writing attribute 0 completes a vertex
+     * -- DATA2F's y or DATA4F's w, the two encodings rsx_commands.c captures.
+     * Snapshot every attribute's current value, as that path does. */
+    if (rsx->in_begin_end && rsx->sink.immediate &&
+        (method == 0x1884u || method == M_VTX_ATTR_4F + 0xCu) &&
+        rsx->imm_count < RSX_DSP_IMM_MAX_VERTS) {
+        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
+            rsx_dsp_vertex_default(rsx, a, rsx->imm_verts[rsx->imm_count][a]);
+        rsx->imm_count++;
+    }
+
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
      * vec4 (hardware auto-increment, confirmed against the RPCS3 oracle). */
@@ -366,6 +377,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            rsx->imm_count = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
@@ -377,6 +389,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                 rsx->sink.inline_array(rsx->sink.user, rsx,
                                        rsx->inline_data, rsx->inline_len);
             rsx->inline_len = 0;
+            if (rsx->imm_count && rsx->sink.immediate)
+                rsx->sink.immediate(rsx->sink.user, rsx,
+                                    (const float (*)[RSX_DSP_NUM_VERTEX_ATTR][4])rsx->imm_verts,
+                                    rsx->imm_count);
+            rsx->imm_count = 0;
             if (rsx->sink.end)
                 rsx->sink.end(rsx->sink.user, rsx);
         }

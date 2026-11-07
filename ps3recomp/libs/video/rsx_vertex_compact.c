@@ -175,6 +175,16 @@ void rsx_vertex_fetch_plan_set_inline(
     plan->inline_bytes = bytes;
 }
 
+void rsx_vertex_fetch_plan_set_immediate(
+    rsx_vertex_fetch_plan* plan,
+    const float (*verts)[RSX_DSP_NUM_VERTEX_ATTR][4], u32 count)
+{
+    if (!plan || !verts || !count)
+        return;
+    plan->imm_verts = verts;
+    plan->imm_count = count;
+}
+
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
 {
@@ -186,6 +196,8 @@ void rsx_vertex_fetch_plan_prepare(
         fetch->stable_base = NULL;
         fetch->stable_first = 0;
         fetch->stable_last = 0;
+        if (plan->imm_verts)
+            continue;   /* read straight from imm_verts in _fetch_one */
         if (!refs || !count ||
             !fetch->desc.type || !fetch->desc.size || !fetch->elem_size)
             continue;
@@ -253,6 +265,14 @@ int rsx_vertex_fetch_one(
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
         float* value = (float*)(out + slot * 16u);
+        if (plan->imm_verts) {
+            /* Immediate mode: the vertex carries every attribute, enabled
+             * array or not (rsx_fetch_attrib's imm_active rule). */
+            memcpy(value, ref->vertex_id < plan->imm_count
+                              ? plan->imm_verts[ref->vertex_id][attr]
+                              : fetch->default_value, 16);
+            continue;
+        }
         if (!fetch->desc.type || !fetch->desc.size) {
             memcpy(value, fetch->default_value, 16);
             continue;

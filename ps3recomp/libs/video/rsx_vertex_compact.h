@@ -70,6 +70,10 @@ typedef struct rsx_vertex_fetch_plan {
     u32 inline_bytes;
     u32 inline_off[RSX_DSP_NUM_VERTEX_ATTR]; /* byte offset within a vertex */
     u32 inline_stride;                       /* decoded once, at _init      */
+    /* Immediate-mode source (rsx_dispatch_sink.immediate): when set, every
+     * attribute of vertex i is imm_verts[i][attr], array enabled or not. */
+    const float (*imm_verts)[RSX_DSP_NUM_VERTEX_ATTR][4];
+    u32 imm_count;
 } rsx_vertex_fetch_plan;
 
 /* Deterministic ascending-register layout; each selected register remains a
@@ -96,6 +100,12 @@ u32 rsx_vertex_inline_layout(
 void rsx_vertex_fetch_plan_set_inline(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const u8* data, u32 bytes);
+
+/* Point a plan at immediate-mode vertices instead of guest memory. Call
+ * between _init and _prepare; NULL `verts` leaves the plan unchanged. */
+void rsx_vertex_fetch_plan_set_immediate(
+    rsx_vertex_fetch_plan* plan,
+    const float (*verts)[RSX_DSP_NUM_VERTEX_ATTR][4], u32 count);
 
 /* Decode all 16 descriptors/defaults once for a draw. */
 void rsx_vertex_fetch_plan_init(

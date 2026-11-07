@@ -85,6 +85,10 @@ extern "C" {
  * vertex stream is worse than no draw. */
 #define RSX_DSP_INLINE_MAX_BYTES 65536
 
+/* Cap on immediate-mode vertices in one BEGIN_END pair; the same cap as the
+ * vtable path's RSX_IMM_MAX_VERTS (rsx_commands.h). */
+#define RSX_DSP_IMM_MAX_VERTS 256
+
 typedef struct rsx_dispatch rsx_dispatch;
 
 /* Execution sink: what the dispatcher calls when a method DOES something.
@@ -107,6 +111,14 @@ typedef struct rsx_dispatch_sink {
     void (*inline_array)(void* user, const rsx_dispatch* rsx,
                          const u8* data, u32 bytes);
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
+    /* Immediate-mode batch: SET_VERTEX_DATA*_M written between BEGIN_END(prim)
+     * and BEGIN_END(0). Writing attribute 0 emits a vertex that carries the
+     * current value of every attribute (like glVertex), so `verts` is `count`
+     * vertices x 16 attributes x float4. Delivered at END, before `end`. Only
+     * captured when this is set. inFamous draws its Bink movie quad this way;
+     * the vtable path has the same rule (rsx_state.imm_verts). */
+    void (*immediate)(void* user, const rsx_dispatch* rsx,
+                      const float (*verts)[RSX_DSP_NUM_VERTEX_ATTR][4], u32 count);
 } rsx_dispatch_sink;
 
 struct rsx_dispatch {
@@ -121,6 +133,7 @@ struct rsx_dispatch {
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
+    u32 imm_count;                    /* immediate vertices this primitive  */
 
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
@@ -136,6 +149,10 @@ struct rsx_dispatch {
      * emits no inline arrays at all, still lost an order of magnitude of
      * poll rate in the regression gate purely from the added stride. */
     u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+
+    /* Immediate-mode vertices (sink.immediate). After inline_data for the
+     * same reason inline_data is last. */
+    float imm_verts[RSX_DSP_IMM_MAX_VERTS][RSX_DSP_NUM_VERTEX_ATTR][4];
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

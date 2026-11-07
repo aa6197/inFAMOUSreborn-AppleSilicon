@@ -187,6 +187,8 @@ static struct {
      * FIFO rather than from a vertex array. */
     const u8* inl;
     u32 inl_bytes;
+    const float (*imm)[RSX_DSP_NUM_VERTEX_ATTR][4];   /* sink_immediate */
+    u32 imm_count;
 } dc;
 
 /* ---- guest memory -------------------------------------------------------- */
@@ -1106,6 +1108,8 @@ static void dc_reset(void)
     dc.fetch_ok = 1;
     dc.inl = NULL;
     dc.inl_bytes = 0;
+    dc.imm = NULL;
+    dc.imm_count = 0;
 }
 
 static int dc_push_ref(u32 vertex_id, u32 base_index)
@@ -1211,6 +1215,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
+    rsx_vertex_fetch_plan_set_immediate(&dc.fetch_plan, dc.imm, dc.imm_count);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
@@ -1259,6 +1264,27 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     if (dc.n_arr >= ENG_MAX_BATCHES) return;
     dc.arr[dc.n_arr].first = 0;
     dc.arr[dc.n_arr].count = bytes / stride;
+    dc.n_arr++;
+}
+
+/* Immediate-mode vertices (SET_VERTEX_DATA*_M inside BEGIN/END): queue them as
+ * one consecutive batch and let the fetch plan read them out of the captured
+ * snapshot (rsx_vertex_fetch_plan_set_immediate). The vtable path draws the
+ * same vertices (rsx_commands.c, BEGIN_END(0)); RSX_NO_IMMEDIATE=1 turns both
+ * off. */
+static void sink_immediate(void* user, const rsx_dispatch* r,
+                           const float (*verts)[RSX_DSP_NUM_VERTEX_ATTR][4], u32 count)
+{
+    (void)user; (void)r;
+    static int off = -1;
+    if (off < 0) off = getenv("RSX_NO_IMMEDIATE") ? 1 : 0;
+    if (off || !verts || !count) return;
+    dc.imm = verts;
+    dc.imm_count = count;
+    dc.n_packets++;
+    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    dc.arr[dc.n_arr].first = 0;
+    dc.arr[dc.n_arr].count = count;
     dc.n_arr++;
 }
 
@@ -1673,6 +1699,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.draw_arrays      = sink_draw_arrays;
     sink.draw_index_array = sink_draw_index;
     sink.inline_array     = sink_inline_array;
+    sink.immediate        = sink_immediate;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
