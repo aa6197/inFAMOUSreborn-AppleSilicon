@@ -21,6 +21,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 
+# iOS / iPadOS (Apple port): set by -DCMAKE_SYSTEM_NAME=iOS. SDL3 replaces
+# SDL2 for pads and audio, UIKit replaces AppKit, and the command-line
+# harnesses below are skipped (an iOS binary must be an app bundle).
+set(PS3RECOMP_IOS OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(PS3RECOMP_IOS ON)
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
@@ -177,6 +185,16 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+elseif(PS3RECOMP_IOS)
+    # iOS: SDL3 built from source (static). cellPad and cellAudio take their
+    # SDL3 backends; the app shell (the game's) owns SDL_Init and the events.
+    find_package(SDL3 CONFIG REQUIRED)
+    target_link_libraries(ps3recomp_runtime PUBLIC SDL3::SDL3-static)
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        PS3RECOMP_AUDIO_USE_SDL3=1 PS3RECOMP_PAD_USE_SDL3=1)
+    message(STATUS "  SDL3:         ${SDL3_VERSION} (iOS: input + audio backends)")
+    find_package(Threads REQUIRED)
+    target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
@@ -209,11 +227,17 @@ if(APPLE)
         "-framework Metal"
         "-framework QuartzCore"
         "-framework Foundation"
-        "-framework AppKit"
     )
+    if(PS3RECOMP_IOS)
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
+    else()
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework AppKit")
+    endif()
+    # LANGUAGE pinned: once a parent project enables OBJCXX too (the iOS app
+    # shell is .mm), CMake's Xcode generator otherwise files .m as ObjC++.
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc" LANGUAGE OBJC)
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
@@ -399,7 +423,7 @@ endif()
 # run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
 # headless software path everywhere else, so Linux -- which has no real backend
 # yet -- can still run the whole guest command stream end to end in CI.
-if(UNIX)
+if(UNIX AND NOT PS3RECOMP_IOS)
     add_executable(ps3recomp_host
         runtime/host/host_posix.c
         runtime/host/host_stubs.c
@@ -453,7 +477,7 @@ endif()
 #
 # The HLE NID table is generated exactly as a port generates it, so the smoke
 # title's firmware imports resolve through the same bridge a game's do.
-if(UNIX)
+if(UNIX AND NOT PS3RECOMP_IOS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(NOT Python3_Interpreter_FOUND)
         message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")
