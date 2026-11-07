@@ -141,6 +141,12 @@ static struct {
     /* This draw's shadow-compare units, as the D3D12 backend keys them: bits
      * 0-3 the units, bits 4-15 a 3-bit zfunc per unit. */
     u32 shkey;
+    /* This draw's TEX_XF modes: 2 bits per unit 0-7 (bit0 bx2, bit1 sRGB). */
+    u32 texk;
+    /* This draw tests depth bounds: a depth snapshot sits on ENG_DBT_UNIT. */
+    u32 dbt;
+    /* The bound pipeline's pixel-shader HLSL hash (the shader-dump name). */
+    u64 ps_hash;
     eng_texture textures[ENG_MAX_TEXTURES];
     u32 n_textures;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
@@ -916,6 +922,179 @@ static int eng_fp_shadow_rewrite(char* hlsl, size_t cap, u32 shkey)
     return patched;
 }
 
+/* Every occurrence of find in buf replaced with repl, while it fits. */
+static void eng_hlsl_replace_all(char* buf, size_t cap, const char* find, const char* repl)
+{
+    const size_t fl = strlen(find), rl = strlen(repl);
+    if (!fl) return;
+    char* at = buf;
+    while ((at = strstr(at, find)) != NULL) {
+        const size_t used = strlen(buf) + 1;
+        if (used + rl - fl > cap) return;
+        memmove(at + rl, at + fl, used - (size_t)(at - buf) - fl);
+        memcpy(at, repl, rl);
+        at += rl;
+    }
+}
+
+/* The D3D12 backend's v170 SUN_NDL_CLAMP (default 1; 0 = off). inFamous' sun-
+ * cascade light FPs compute shadow * dot(N,-L) with N.L not clamped, and rely
+ * on a back-facing surface comparing as shadowed. The shadow compare here is
+ * biased toward lit (the same v92/v148 biases), so a wall facing away from the
+ * sun got a negative sun term: navy walls. max(N.L,0) gives the shadowed result
+ * there and changes nothing on sun-facing surfaces. Called only for draws with
+ * shadow units, as D3D12 does. */
+static void eng_fp_sun_ndl_clamp(char* hlsl, size_t cap)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SUN_NDL_CLAMP"); on = (e && *e == '0') ? 0 : 1; }
+    static const char from[] = "(((r[2]).xyzw) * ((h[0]).xyzw)); h[4].w = _v.w;";
+    static const char to[]   = "(((r[2]).xyzw) * max((h[0]).xyzw, 0.0)); h[4].w = _v.w;";
+    if (!on || !strstr(hlsl, from) || !strstr(hlsl, "dot(((h[4]).xyzw).xyz, (-(")) return;
+    eng_hlsl_replace_all(hlsl, cap, from, to);
+    static u32 logs = 0;
+    if (logs < 8) { logs++; fprintf(stderr, "[rsx engine] SUN_NDL_CLAMP: sun term clamped to shadow * max(N.L,0)\n"); }
+}
+
+/* ---- depth bounds ---------------------------------------------------------- */
+
+/* The D3D12 backend's v35 DEPTH_BOUNDS (default 1; 0 = ignore the guest's test).
+ * DEPTH_BOUNDS_TEST_ENABLE (0x0380) passes a fragment only where the depth
+ * ALREADY STORED at its pixel lies in [DEPTH_BOUNDS_MIN, MAX] (0x0384/0x0388).
+ * inFamous' deferred point lights rely on it: each light volume is limited to
+ * the depth slice the light reaches. D3D12 has the test in hardware
+ * (OMSetDepthBounds); Metal has none, so a draw that enables it gets a snapshot
+ * of its zeta on a spare unit and the fragment program discards outside the
+ * bounds, which ride in fp_alpha.y/z. */
+#define ENG_DBT_UNIT 15u
+static int eng_dbt_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("DEPTH_BOUNDS");
+        v = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[rsx engine] depth bounds test %s (DEPTH_BOUNDS)\n", v ? "ON" : "off");
+    }
+    return v;
+}
+
+/* The test as the first statement of main. 0 = done, -1 = no room / no main. */
+static int eng_fp_dbt_rewrite(char* hlsl, size_t cap, u32 cube_mask)
+{
+    if ((cube_mask >> ENG_DBT_UNIT) & 1u) return -1;
+    char* m = strstr(hlsl, " main(PSInput input)");
+    if (!m) return -1;
+    char* body = strchr(m, '{');
+    if (!body) return -1;
+    body++;
+    if (*body == '\n') body++;
+    char ins[192];
+    snprintf(ins, sizeof ins,
+             "    { float _rsx_dz = %s%u%s.Load(int3(int2(input.position.xy), 0)).r;"
+             " if (_rsx_dz < fp_alpha.y || _rsx_dz > fp_alpha.z) discard; }\n",
+             cube_mask ? "rsx_tex" : "rsx_tex[", ENG_DBT_UNIT, cube_mask ? "" : "]");
+    const size_t il = strlen(ins), used = strlen(hlsl);
+    if (used + il + 1 > cap) return -1;
+    memmove(body + il, body, used + 1 - (size_t)(body - hlsl));
+    memcpy(body, ins, il);
+    return 0;
+}
+
+/* ---- texture value transforms -------------------------------------------- */
+
+/* The D3D12 backend's v89 TEX_XF (rsx_d3d12_backend.c s_txf_fn,
+ * fp_txf_rewrite, d3d12_bind_texture), same switch, same default (on).
+ * TEXTURE_ADDRESS bits 12-15 unsigned_remap (1 = BIASED: texel * 2 - 1 on
+ * RGB, the "_bx2" expand inFamous' deferred lights use for G-buffer normals)
+ * and bits 20-23 gamma (sRGB -> linear on RGB). Without them albedo is read
+ * as linear: a washed-out, too-bright, desaturated scene. Per draw, a 2-bit
+ * mode per unit 0-7 (bit0 expand, bit1 sRGB) is part of the pipeline key. */
+static int eng_tex_xf_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = eng_env_flag("TEX_XF", 1);
+        fprintf(stderr, "[rsx engine] texture unsigned-remap (bx2) + gamma (sRGB) %s (TEX_XF)\n",
+                v ? "ON" : "off");
+    }
+    return v;
+}
+
+/* One unit's mode from its TEXTURE_ADDRESS word; depth compares never. */
+static u32 eng_tex_xf_mode(u32 unit, const rsx_dsp_texture* t)
+{
+    if (!eng_tex_xf_on()) return 0;
+    const u32 base_fmt = t->format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM & ~(u32)RSX_TEX_FMT_LINEAR;
+    const u32 ur = (t->wrap >> 12) & 0xFu, ga = (t->wrap >> 20) & 0xFu, sr = (t->wrap >> 24) & 0xFu;
+    u32 m = (ur == 1u ? 1u : 0u) | (ga ? 2u : 0u);
+    if (base_fmt >= RSX_TEX_FMT_DEPTH24_D8 && base_fmt <= RSX_TEX_FMT_DEPTH24_D8 + 3u) m = 0;
+    if (ur || ga || sr) {
+        static u32 seen[48]; static int ns = 0;
+        const u32 key = (unit << 24) | (base_fmt << 16) | (ur << 8) | (ga << 4) | sr;
+        int known = 0;
+        for (int i = 0; i < ns; i++) if (seen[i] == key) known = 1;
+        if (!known && ns < 48) {
+            seen[ns++] = key;
+            fprintf(stderr, "[rsx engine] TEX_XF unit %u fmt 0x%02X %ux%u: unsigned_remap %u gamma 0x%X"
+                            " signed_remap 0x%X (address 0x%08X) -> mode %u\n",
+                    unit, base_fmt, t->width, t->height, ur, ga, sr, t->wrap, m);
+        }
+    }
+    return m;
+}
+
+static const char s_eng_txf_fn[] =
+    "float4 rsx_txf(float4 c, int m) {\n"
+    "  if (m & 2) c.rgb = (c.rgb <= 0.04045) ? c.rgb / 12.92 : pow(max((c.rgb + 0.055) / 1.055, 0.0), 2.4);\n"
+    "  if (m & 1) c.rgb = c.rgb * 2.0 - 1.0;\n"
+    "  return c;\n}\n";
+
+/* Every Sample / SampleBias / SampleLevel of a unit with a mode becomes
+ * rsx_txf(<sample>, mode). Returns how many it wrapped, or -1 when the
+ * program would not fit. */
+static int eng_fp_txf_rewrite(char* hlsl, size_t cap, u32 texk)
+{
+    int patched = 0;
+    static const char* const meth[3] = { "Sample(", "SampleBias(", "SampleLevel(" };
+    for (int u = 0; u < 8; u++) {
+        const int m = (int)((texk >> (2 * u)) & 3u);
+        if (!m) continue;
+        for (int form = 0; form < 2; form++)
+        for (int mi = 0; mi < 3; mi++) {
+            char nd[48];
+            snprintf(nd, sizeof nd, form ? "rsx_tex%d.%s" : "rsx_tex[%d].%s", u, meth[mi]);
+            char* from = hlsl;
+            for (;;) {
+                char* at = strstr(from, nd);
+                if (!at) break;
+                /* rsx_tex1 never matches rsx_tex10..15: the needle ends in '.' */
+                char* q = at + strlen(nd) - 1;              /* the '(' */
+                int dep = 0;
+                for (; *q; q++) { if (*q == '(') dep++; else if (*q == ')') { if (--dep == 0) break; } }
+                if (!*q) break;
+                char* end = q + 1;
+                char trail[16];
+                snprintf(trail, sizeof trail, ", %d)", m);
+                const size_t hl = 8 /* "rsx_txf(" */, tl = strlen(trail), used = strlen(hlsl);
+                if (used + hl + tl + 1 > cap) return -1;
+                memmove(end + tl, end, strlen(end) + 1);
+                memcpy(end, trail, tl);
+                memmove(at + hl, at, strlen(at) + 1);
+                memcpy(at, "rsx_txf(", hl);
+                from = end + hl + tl;
+                patched++;
+            }
+        }
+    }
+    if (patched) {
+        const size_t fl = sizeof(s_eng_txf_fn) - 1, used = strlen(hlsl);
+        if (used + fl + 1 > cap) return -1;
+        memmove(hlsl + fl, hlsl, used + 1);
+        memcpy(hlsl, s_eng_txf_fn, fl);
+    }
+    return patched;
+}
+
 /* ---- textures ------------------------------------------------------------ */
 
 static rsx_be_format eng_texfmt(rsx_texfmt f)
@@ -1273,6 +1452,14 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             if (((g.shkey >> u) & 1u) && ((used >> u) & 1u))
                 shkey |= (1u << u) | (g.shkey & (7u << (4 + 3 * u)));
     }
+    u32 texk = 0;
+    if (!fixed && g.texk) {
+        const u32 used = rsx_fp_texture_mask(fp_uc, fp_size);
+        for (u32 u = 0; u < 8; u++)
+            if ((used >> u) & 1u) texk |= g.texk & (3u << (2 * u));
+    }
+
+    const u32 dbt = (!fixed && g.dbt) ? 1u : 0u;
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1296,6 +1483,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
         if (shkey) key = eng_fnv1a(&shkey, sizeof shkey, key);
+        if (dbt) {
+            const u32 tag = 0x44425400u;        /* "TBD" */
+            key = eng_fnv1a(&tag, sizeof tag, key);
+        }
+        if (texk) {
+            const u32 tag = 0x54584600u | 1u;   /* "TXF" */
+            key = eng_fnv1a(&tag, sizeof tag, key);
+            key = eng_fnv1a(&texk, sizeof texk, key);
+        }
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1329,9 +1525,29 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
             fi = -1;
+        if (fi > 0 && shkey) eng_fp_sun_ndl_clamp(s_ps_hlsl, sizeof s_ps_hlsl);
         if (fi > 0 && shkey &&
             eng_fp_shadow_rewrite(s_ps_hlsl, sizeof s_ps_hlsl, shkey) < 0)
             fi = -1;
+        if (fi > 0 && texk) {
+            const int nx = eng_fp_txf_rewrite(s_ps_hlsl, sizeof s_ps_hlsl, texk);
+            if (nx < 0) fi = -1;
+            static u32 logs = 0;
+            if (logs < 12 || nx < 0) {
+                logs++;
+                fprintf(stderr, "[rsx engine] TEX_XF: %d sample(s) wrapped (unit modes 0x%04X)\n", nx, texk);
+            }
+        }
+        /* A failed insert keeps the draw, untested, as before this switch. */
+        if (fi > 0 && dbt) {
+            const int r = eng_fp_dbt_rewrite(s_ps_hlsl, sizeof s_ps_hlsl, cube_mask);
+            static u32 logs = 0;
+            if (logs < 6 || r < 0) {
+                logs++;
+                fprintf(stderr, "[rsx engine] DEPTH_BOUNDS: test %s in the fragment program\n",
+                        r < 0 ? "NOT inserted" : "inserted");
+            }
+        }
     }
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
@@ -1528,6 +1744,14 @@ static char s_tex_kind[RSX_BE_MAX_TEXTURES];   /* 'S' surface, 'Z' depth, 'T' te
 static u32  s_tex_src[RSX_BE_MAX_TEXTURES];    /* surface slot or guest offset          */
 static u32  s_tex_fmt[RSX_BE_MAX_TEXTURES];    /* SET_TEXTURE_FORMAT byte               */
 
+/* A float register (depth bounds and the like) as the guest wrote it. */
+static float eng_reg_f32(u32 method)
+{
+    const u32 bits = rsx_dsp_reg(&g.rsx, method);
+    float f; memcpy(&f, &bits, 4);
+    return f;
+}
+
 static float eng_half(u16 h)
 {
     const u32 s = (u32)(h >> 15) << 31, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -1721,6 +1945,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
 {
     u32 mask = 0;
     g.shkey = 0;
+    g.texk = 0;
     s_bind_serial++;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
@@ -1729,6 +1954,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         mask |= 1u << u;
         s_tex_kind[u] = 'T'; s_tex_src[u] = t.offset; s_tex_fmt[u] = t.format;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
+        /* From the register, whatever the unit ends up reading (guest upload,
+         * live target, copy), as the D3D12 backend sets it at bind time. */
+        if (u < 8) g.texk |= eng_tex_xf_mode(u, &t) << (2 * u);
 
         /* The depth target at this address (zc), and the same if this draw
          * is not testing against it (zi). */
@@ -1898,8 +2126,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
-    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
-                                            textures, samplers);
+    u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+                                      textures, samplers);
+    /* Depth bounds: the zeta as stored before this draw, on the spare unit. */
+    g.dbt = 0;
+    if (eng_dbt_on() && (rsx_dsp_reg(&g.rsx, 0x0380u) & 1u) && zslot != ENG_INVALID &&
+        !((tex_mask >> ENG_DBT_UNIT) & 1u)) {
+        const u32 snap = eng_zdepth_snapshot(zslot, sf.clip_w, sf.clip_h);
+        if (snap) {
+            textures[ENG_DBT_UNIT] = snap; s_tex_kind[ENG_DBT_UNIT] = 'D'; s_tex_src[ENG_DBT_UNIT] = zslot;
+            tex_mask |= 1u << ENG_DBT_UNIT;
+            g.dbt = 1;
+        }
+    }
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
 
@@ -1958,7 +2197,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
-      alpha[1] = alpha[2] = alpha[3] = 0.0f; }
+      alpha[1] = alpha[2] = alpha[3] = 0.0f;
+      if (g.dbt) { alpha[1] = eng_reg_f32(0x0384u); alpha[2] = eng_reg_f32(0x0388u); } }
 
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
