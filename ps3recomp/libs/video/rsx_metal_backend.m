@@ -2975,37 +2975,112 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
 
 /* ---- replay -------------------------------------------------------------- */
 
+/* What the current encoder already has bound. A draw used to set all of it
+ * again -- 16 textures and 16 samplers even when unused, ~45 calls -- and a
+ * gameplay frame has thousands of draws. Reset with every new encoder. */
+typedef struct {
+    const void* pso; const void* ds; int ds_set;
+    int cull, wind;
+    u32 sref; int sref_set;
+    MTLViewport vp; int vp_set;
+    MTLScissorRect sc; int sc_set;
+    int vb_set, vcb_set, fcb_set;
+    u32 vb_off, vcb_off, fcb_off;
+    const void* ftex[RSX_BE_MAX_TEXTURES];
+    const void* fsamp[RSX_BE_MAX_TEXTURES];
+    const void* vtex[RSX_BE_MAX_VERTEX_TEXTURES];
+    const void* vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
+} EngEncState;
+
+static void eng_enc_state_reset(EngEncState* st)
+{
+    memset(st, 0, sizeof *st);
+    st->cull = st->wind = -1;
+}
+
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
-                            id<MTLBuffer> stage)
+                            id<MTLBuffer> stage, EngEncState* st)
 {
     if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso) return;
-    [enc setRenderPipelineState:p->pso];
-    [enc setDepthStencilState:p->ds];
-    [enc setCullMode:p->cull];
-    [enc setFrontFacingWinding:p->winding];
-    [enc setStencilReferenceValue:r->stencil_ref];
+    const void* pso = (__bridge const void*)p->pso;
+    if (st->pso != pso) { [enc setRenderPipelineState:p->pso]; st->pso = pso; }
+    const void* ds = (__bridge const void*)p->ds;
+    if (!st->ds_set || st->ds != ds) {
+        [enc setDepthStencilState:p->ds]; st->ds = ds; st->ds_set = 1;
+    }
+    if (st->cull != (int)p->cull) { [enc setCullMode:p->cull]; st->cull = (int)p->cull; }
+    if (st->wind != (int)p->winding) {
+        [enc setFrontFacingWinding:p->winding]; st->wind = (int)p->winding;
+    }
+    if (!st->sref_set || st->sref != r->stencil_ref) {
+        [enc setStencilReferenceValue:r->stencil_ref];
+        st->sref = r->stencil_ref; st->sref_set = 1;
+    }
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
-    [enc setViewport:vp];
-    if (r->sc[2] && r->sc[3])
-        [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
-    [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
-    if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
-    if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+    if (!st->vp_set || memcmp(&st->vp, &vp, sizeof vp) != 0) {
+        [enc setViewport:vp]; st->vp = vp; st->vp_set = 1;
+    }
+    if (r->sc[2] && r->sc[3]) {
+        MTLScissorRect sc = { r->sc[0], r->sc[1], r->sc[2], r->sc[3] };
+        if (!st->sc_set || memcmp(&st->sc, &sc, sizeof sc) != 0) {
+            [enc setScissorRect:sc]; st->sc = sc; st->sc_set = 1;
+        }
+    }
+    /* One staging buffer per encoder: bind it once, then move the offset. */
+    if (!st->vb_set) {
+        [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+        st->vb_set = 1; st->vb_off = r->vb_off;
+    } else if (st->vb_off != r->vb_off) {
+        [enc setVertexBufferOffset:r->vb_off atIndex:MTL_VB_INDEX];
+        st->vb_off = r->vb_off;
+    }
+    if (r->vs_cb_bytes) {
+        if (!st->vcb_set) {
+            [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+            st->vcb_set = 1; st->vcb_off = r->vs_cb_off;
+        } else if (st->vcb_off != r->vs_cb_off) {
+            [enc setVertexBufferOffset:r->vs_cb_off atIndex:0];
+            st->vcb_off = r->vs_cb_off;
+        }
+    }
+    if (r->ps_cb_bytes) {
+        if (!st->fcb_set) {
+            [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+            st->fcb_set = 1; st->fcb_off = r->ps_cb_off;
+        } else if (st->fcb_off != r->ps_cb_off) {
+            [enc setFragmentBufferOffset:r->ps_cb_off atIndex:1];
+            st->fcb_off = r->ps_cb_off;
+        }
+    }
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->tex[u]);
-        [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
-        [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-                                                      : s_default_sampler)
-                             atIndex:(NSUInteger)u];
+        if (!t) t = s_null_tex;
+        const void* tp = (__bridge const void*)t;
+        if (st->ftex[u] != tp) {
+            [enc setFragmentTexture:t atIndex:(NSUInteger)u]; st->ftex[u] = tp;
+        }
+        id<MTLSamplerState> sm = r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
+                                                 : s_default_sampler;
+        const void* sp = (__bridge const void*)sm;
+        if (st->fsamp[u] != sp) {
+            [enc setFragmentSamplerState:sm atIndex:(NSUInteger)u]; st->fsamp[u] = sp;
+        }
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         id<MTLTexture> t = eng_obj(r->vtex[u]);
-        [enc setVertexTexture:(t ? t : s_null_tex) atIndex:MTL_VTEX_INDEX(u)];
-        [enc setVertexSamplerState:(r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-                                                     : s_default_sampler)
-                           atIndex:MTL_VSAMP_INDEX(u)];
+        if (!t) t = s_null_tex;
+        const void* tp = (__bridge const void*)t;
+        if (st->vtex[u] != tp) {
+            [enc setVertexTexture:t atIndex:MTL_VTEX_INDEX(u)]; st->vtex[u] = tp;
+        }
+        id<MTLSamplerState> sm = r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
+                                                  : s_default_sampler;
+        const void* sp = (__bridge const void*)sm;
+        if (st->vsamp[u] != sp) {
+            [enc setVertexSamplerState:sm atIndex:MTL_VSAMP_INDEX(u)]; st->vsamp[u] = sp;
+        }
     }
     /* An indexed draw is really indexed here: the index buffer is what keeps a
      * strip's shared vertices from being fetched and uploaded per triangle.
@@ -3039,14 +3114,18 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
     u32 i = 0;
     while (i < s_eng_rec_count) {
         if (s_eng_rec[i].kind == ENG_REC_COPY) {
-            const EngRecord* r = &s_eng_rec[i++];
-            id<MTLTexture> src = eng_obj(r->copy_src);
-            id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst) continue;
-            id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-            if (!b) continue;
-            [b copyFromTexture:src toTexture:dst];
-            [b endEncoding];
+            /* Back-to-back copies share one blit encoder. */
+            id<MTLBlitCommandEncoder> b = nil;
+            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_COPY) {
+                const EngRecord* r = &s_eng_rec[i++];
+                id<MTLTexture> src = eng_obj(r->copy_src);
+                id<MTLTexture> dst = eng_obj(r->resolve_dst);
+                if (!src || !dst) continue;
+                if (!b) b = [cb blitCommandEncoder];
+                if (!b) break;
+                [b copyFromTexture:src toTexture:dst];
+            }
+            if (b) [b endEncoding];
             continue;
         }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
@@ -3196,11 +3275,13 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                    eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
             continue;
         }
+        EngEncState st;
+        eng_enc_state_reset(&st);
         while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
                 (!s_eng_rec[i].depth && zbuf == s_depth))) {
-            eng_encode_draw(enc, &s_eng_rec[i], stage);
+            eng_encode_draw(enc, &s_eng_rec[i], stage, &st);
             i++;
         }
         [enc endEncoding];
