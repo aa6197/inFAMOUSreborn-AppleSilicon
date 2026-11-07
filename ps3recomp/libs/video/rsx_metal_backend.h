@@ -36,6 +36,19 @@ int  rsx_metal_backend_pump_messages(void);
  * RSX clear method, then hand it to the compositor. */
 void rsx_metal_backend_present(void);
 
+/* --- iOS app hooks (Apple port) ------------------------------------------- */
+
+/* Present into this CAMetalLayer (the app's own view, made on the main
+ * thread) instead of rendering headless. Call before rsx_metal_backend_init.
+ * NULL, the default, keeps iOS headless. The app owns the layer's size; the
+ * game image is letterboxed into it. Unused on macOS. */
+void rsx_metal_backend_set_layer(void* ca_metal_layer);
+
+/* Block until every command buffer committed so far has completed. The iOS
+ * app calls it on the way to the background, once the RSX thread has stopped
+ * submitting: iOS stops an app that runs GPU work in the background. */
+void rsx_metal_backend_wait_idle(void);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the

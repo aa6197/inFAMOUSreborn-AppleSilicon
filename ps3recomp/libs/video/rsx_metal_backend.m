@@ -62,6 +62,7 @@
 #include "rsx_texture_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 
@@ -72,7 +73,11 @@ static id<MTLCommandQueue> s_queue;
 static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+#if !TARGET_OS_IPHONE
 static NSWindow*           s_window;
+#else
+static CAMetalLayer*       s_ext_layer;  /* iOS: the app's view layer (rsx_metal_backend_set_layer) */
+#endif
 static int                 s_headless;
 static int                 s_eng_hl_sync;  /* engine: headless presents wait (eng_init) */
 static int                 s_closed;
@@ -362,7 +367,10 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     u32 w = state->surface_clip_w, h = state->surface_clip_h;
     if (!w || !h || (w == s_width && h == s_height)) return;
     s_width = w; s_height = h;
+#if !TARGET_OS_IPHONE
+    /* On iOS the drawable follows the app's view; the present letterboxes. */
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+#endif
     if (s_depth && create_depth() != 0)
         fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
                         "the old buffer stays bound\n", w, h);
@@ -2180,6 +2188,7 @@ static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
 static id<MTLRenderPipelineState> s_eng_zcolor_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
+static id<MTLSamplerState>        s_eng_linear_sampler;   /* letterboxed present (a screen of another size) */
 
 static NSString* const kEngHelperMSL = @
 "#include <metal_stdlib>\n"
@@ -2421,7 +2430,10 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
     s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
-    return s_eng_point_sampler ? 0 : -1;
+    sd.minFilter = MTLSamplerMinMagFilterLinear;
+    sd.magFilter = MTLSamplerMinMagFilterLinear;
+    s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    return (s_eng_point_sampler && s_eng_linear_sampler) ? 0 : -1;
 }
 
 static void eng_shutdown(void* user)
@@ -2459,6 +2471,7 @@ static void eng_shutdown(void* user)
     s_eng_depth_pso = nil;
     s_eng_zcolor_pso = nil;
     s_eng_point_sampler = nil;
+    s_eng_linear_sampler = nil;
     s_eng_active = 0;
 }
 
@@ -3362,6 +3375,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window. */
+
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
 {
@@ -3380,15 +3394,38 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         }
         s_eng_blit_pso_fmt = [dst pixelFormat];
     }
+    /* Aspect-fit: a drawable whose shape differs from the game surface (an
+     * iOS view: phone or iPad screen) gets the image centred with black bars
+     * instead of stretched. Same shape (headless, a game-sized window) keeps
+     * the full-target blit exactly as before. */
+    const double sw = (double)[src width], sh = (double)[src height];
+    const double dw = (double)[dst width], dh = (double)[dst height];
+    MTLViewport vp = { 0.0, 0.0, dw, dh, 0.0, 1.0 };
+    int letterbox = 0;
+    if (sw > 0 && sh > 0 && dw > 0 && dh > 0 && fabs(sw / sh - dw / dh) > 0.01) {
+        letterbox = 1;
+        if (dw / dh > sw / sh) { vp.width = floor(dh * sw / sh); vp.originX = floor((dw - vp.width) / 2); }
+        else                   { vp.height = floor(dw * sh / sw); vp.originY = floor((dh - vp.height) / 2); }
+    }
+    /* The letterboxed image is scaled to a size of its own, with linear
+     * filtering. The full-target blit keeps its sampler. */
+    id<MTLTexture>      img  = src;
+    id<MTLSamplerState> samp = s_eng_point_sampler;
+    if (letterbox) {
+        if ((double)[img width] != vp.width || (double)[img height] != vp.height)
+            samp = s_eng_linear_sampler;
+    }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = dst;
-    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].loadAction  = letterbox ? MTLLoadActionClear : MTLLoadActionDontCare;
+    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
+    if (letterbox) [e setViewport:vp];
     [e setRenderPipelineState:s_eng_blit_pso];
-    [e setFragmentTexture:src atIndex:0];
-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    [e setFragmentTexture:img atIndex:0];
+    [e setFragmentSamplerState:samp atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
@@ -3417,8 +3454,8 @@ static void eng_stage_next(void)
  * (the old headless behaviour; a frame dump fences on its own). Every other
  * present is paced by the in-flight semaphore instead, the same bound the
  * vtable path uses, because waiting on every frame is the one pattern where
- * a driver cannot hide its encoding work. Headless runs (and iOS, which is
- * always headless here) pipeline like a window does. */
+ * a driver cannot hide its encoding work. Headless runs pipeline like a
+ * window does. */
 static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
 {
     @autoreleasepool {
@@ -3613,8 +3650,16 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         int rc;
 #if TARGET_OS_IPHONE
-        s_headless = 1;
-        rc = create_offscreen();
+        /* The app hands over its view's layer (rsx_metal_backend_set_layer).
+         * Without one, or with PS3RECOMP_METAL_HEADLESS=1, render offscreen. */
+        if (!s_ext_layer) s_headless = 1;
+        if (s_headless) {
+            rc = create_offscreen();
+        } else {
+            s_layer = s_ext_layer;
+            if (s_layer.device != s_dev) s_layer.device = s_dev;
+            rc = 0;
+        }
 #else
         rc = s_headless ? create_offscreen() : create_window(title);
 #endif
@@ -3680,6 +3725,26 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                 s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"),
                 s_eng_active ? "register-file draw engine" : "vtable");
         return 0;
+    }
+}
+
+void rsx_metal_backend_set_layer(void* ca_metal_layer)
+{
+#if TARGET_OS_IPHONE
+    s_ext_layer = (__bridge CAMetalLayer*)ca_metal_layer;
+#else
+    (void)ca_metal_layer;
+#endif
+}
+
+void rsx_metal_backend_wait_idle(void)
+{
+    if (!s_queue) return;
+    @autoreleasepool {
+        /* One queue, so its last command buffer completes after all earlier ones. */
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        [cb commit];
+        [cb waitUntilCompleted];
     }
 }
 
