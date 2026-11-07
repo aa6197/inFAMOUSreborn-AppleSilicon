@@ -62,6 +62,7 @@
 #include "rsx_texture_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
@@ -73,6 +74,7 @@ static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
 static NSWindow*           s_window;
 static int                 s_headless;
+static int                 s_eng_hl_sync;  /* engine: headless presents wait (eng_init) */
 static int                 s_closed;
 static int                 s_ready;
 static u32                 s_width  = 1280;
@@ -2061,6 +2063,30 @@ static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
 static u32 s_eng_obj_free_count;
 static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
 
+/* Presents do not wait for the GPU, so a frame can still be running while
+ * the next one is recorded. replaceRegion writes a texture at once, which
+ * would change what that earlier frame samples. Every commit carries a
+ * serial, every object the serial of the last commit that encoded it, and
+ * an upload into an object an unfinished commit reads waits for that commit
+ * first. Commits on the one queue finish in order. */
+#define ENG_FLIGHT 8u
+static u32 s_eng_obj_use[ENG_MAX_OBJECTS];
+static u32 s_eng_serial = 1;              /* the commit being recorded */
+static _Atomic u32 s_eng_done_serial;     /* last commit known finished */
+static id<MTLCommandBuffer> s_eng_flight_cb[ENG_FLIGHT];
+static u32 s_eng_flight_serial[ENG_FLIGHT];
+static int s_eng_encoding;
+
+/* Completion handlers can run after a later waited commit returned. */
+static void eng_note_done(u32 serial)
+{
+    u32 cur = atomic_load_explicit(&s_eng_done_serial, memory_order_relaxed);
+    while (cur < serial &&
+           !atomic_compare_exchange_weak_explicit(&s_eng_done_serial, &cur, serial,
+                                                  memory_order_release,
+                                                  memory_order_relaxed)) {}
+}
+
 typedef struct {
     id<MTLRenderPipelineState> pso;
     id<MTLDepthStencilState>   ds;
@@ -2123,6 +2149,19 @@ static EngRecord s_eng_rec[ENG_MAX_RECORDS];
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
 
+/* Staging arena: s_eng_stage points into the contents of a persistent shared
+ * MTLBuffer from a small ring, so a commit binds it as it is instead of
+ * copying the whole arena into a new buffer (newBufferWithBytes was ~8% of
+ * the RSX thread). A slot is only reused once the last command buffer that
+ * read it has completed; a waited commit keeps its slot. */
+#define ENG_STAGE_RING 4u
+typedef struct {
+    id<MTLBuffer>        buf;
+    id<MTLCommandBuffer> last_cb;
+    u32                  cap;
+} EngStageSlot;
+static EngStageSlot s_eng_ring[ENG_STAGE_RING];
+static u32 s_eng_ring_cur;
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
 
@@ -2179,12 +2218,32 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    s_eng_obj_use[slot] = 0;
     return slot + 1;
 }
 
 static id<MTLTexture> eng_obj(u32 handle)
 {
-    return (handle && handle <= s_eng_obj_count) ? s_eng_obj[handle - 1] : nil;
+    if (!handle || handle > s_eng_obj_count) return nil;
+    if (s_eng_encoding) s_eng_obj_use[handle - 1] = s_eng_serial;
+    return s_eng_obj[handle - 1];
+}
+
+/* Wait until no unfinished commit reads this object. */
+static void eng_obj_wait_idle(u32 handle)
+{
+    if (!handle || handle > s_eng_obj_count) return;
+    const u32 use = s_eng_obj_use[handle - 1];
+    if (!use || use >= s_eng_serial ||
+        use <= atomic_load_explicit(&s_eng_done_serial, memory_order_acquire)) return;
+    const u32 i = use % ENG_FLIGHT;
+    if (s_eng_flight_cb[i] && s_eng_flight_serial[i] == use) {
+        static u32 n;
+        if (n++ < 3)
+            fprintf(stderr, "[rsx engine/metal] upload into a texture frame %u still reads:"
+                            " waiting\n", use);
+        [s_eng_flight_cb[i] waitUntilCompleted];
+    }
 }
 
 /* Recorded commands resolve numeric handles during encoding. Do not recycle
@@ -2265,11 +2324,18 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         return eng_stage_reserve(bytes, out_off);
     }
     if (start + bytes > s_eng_stage_cap) {
+        /* Grow the current slot: nothing committed has read it since it was
+         * made current, so the old buffer can go once its bytes are copied. */
+        EngStageSlot* sl = &s_eng_ring[s_eng_ring_cur];
         u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
         while (start + bytes > cap) cap *= 2u;
-        u8* n = (u8*)realloc(s_eng_stage, cap);
-        if (!n) return 0;
-        s_eng_stage = n;
+        id<MTLBuffer> nb = [s_dev newBufferWithLength:cap
+                                              options:MTLResourceStorageModeShared];
+        if (!nb) return 0;
+        if (s_eng_stage_used) memcpy([nb contents], s_eng_stage, s_eng_stage_used);
+        sl->buf = nb;
+        sl->cap = cap;
+        s_eng_stage = (u8*)[nb contents];
         s_eng_stage_cap = cap;
     }
     *out_off = start;
@@ -2291,6 +2357,12 @@ static int eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
     if (!s_dev) return -1;
+    {   /* Headless presents pipeline like windowed ones unless asked to wait
+         * for the GPU every frame (PS3RECOMP_METAL_HEADLESS_SYNC=1, the old
+         * behaviour). Frame dumps fence either way. */
+        const char* e = getenv("PS3RECOMP_METAL_HEADLESS_SYNC");
+        s_eng_hl_sync = (e && *e && *e != '0');
+    }
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
     if (!s_eng_helper_lib) {
@@ -2321,7 +2393,20 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
-    free(s_eng_stage); s_eng_stage = NULL;
+    for (u32 i = 0; i < ENG_STAGE_RING; i++) {
+        if (s_eng_ring[i].last_cb) [s_eng_ring[i].last_cb waitUntilCompleted];
+        s_eng_ring[i].last_cb = nil;
+        s_eng_ring[i].buf = nil;
+        s_eng_ring[i].cap = 0;
+    }
+    for (u32 i = 0; i < ENG_FLIGHT; i++) {
+        if (s_eng_flight_cb[i]) [s_eng_flight_cb[i] waitUntilCompleted];
+        s_eng_flight_cb[i] = nil;
+        s_eng_flight_serial[i] = 0;
+    }
+    memset(s_eng_obj_use, 0, sizeof s_eng_obj_use);
+    s_eng_ring_cur = 0;
+    s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
@@ -2368,6 +2453,7 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
     (void)user; (void)rows;
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
+    eng_obj_wait_idle(handle);
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
          mipmapLevel:mip
                slice:face
@@ -2759,16 +2845,37 @@ static void eng_bind_targets(void* user, const u32* surfaces, u32 count,
 static void eng_bind_pipeline(void* user, u32 pipeline)
 { (void)user; s_eng_pending.pipeline = pipeline; }
 
+/* The constants are the first thing a draw stages, so a full record stream
+ * is submitted here: submitting later, in eng_draw, recycles the arena under
+ * offsets this draw already holds. */
 static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    (void)eng_rec_room();
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
+    s_eng_pending.vs_cb_bytes = bytes;
+}
+
+static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
+                                        const void* b, u32 b_bytes)
+{
+    (void)user;
+    (void)eng_rec_room();
+    u32 off = 0, bytes = a_bytes + b_bytes;
+    if (bytes && eng_stage_reserve(bytes, &off)) {
+        memcpy(s_eng_stage + off, a, a_bytes);
+        memcpy(s_eng_stage + off + a_bytes, b, b_bytes);
+    } else {
+        bytes = 0;
+    }
+    s_eng_pending.vs_cb_off = off;
     s_eng_pending.vs_cb_bytes = bytes;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
+    (void)eng_rec_room();
     if (!eng_stage_copy(data, bytes, &s_eng_pending.ps_cb_off)) bytes = 0;
     s_eng_pending.ps_cb_bytes = bytes;
 }
@@ -3134,23 +3241,39 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     [e endEncoding];
 }
 
+/* Make the next ring slot current, waiting only if the GPU still reads it. */
+static void eng_stage_next(void)
+{
+    s_eng_ring_cur = (s_eng_ring_cur + 1u) % ENG_STAGE_RING;
+    EngStageSlot* sl = &s_eng_ring[s_eng_ring_cur];
+    if (sl->last_cb) {
+        if ([sl->last_cb status] < MTLCommandBufferStatusCompleted)
+            [sl->last_cb waitUntilCompleted];
+        sl->last_cb = nil;
+    }
+    s_eng_stage = sl->buf ? (u8*)[sl->buf contents] : NULL;
+    s_eng_stage_cap = sl->cap;
+}
+
 /* Encode everything recorded so far and commit it.
  *
- * The staging arena is recycled the moment this returns, which is safe
- * without a wait: newBufferWithBytes COPIES, so what the GPU reads is the
- * MTLBuffer and not the arena, and a command buffer retains every resource it
- * uses. So only headless waits, where the readback has to observe a finished
- * frame -- there the stall is the point. A windowed present is paced by the
- * in-flight semaphore instead, the same bound the vtable path uses, because
- * waiting on every frame is the one pattern where a driver cannot hide its
- * encoding work. */
+ * The command buffer binds the current staging slot directly. A waited commit
+ * (mid-frame submits, a headless present under HEADLESS_SYNC) has
+ * finished with it, so the slot is reused; any other present moves on to the
+ * next slot, which eng_stage_next only hands out once its last reader
+ * completed. Only PS3RECOMP_METAL_HEADLESS_SYNC=1 waits on every present
+ * (the old headless behaviour; a frame dump fences on its own). Every other
+ * present is paced by the in-flight semaphore instead, the same bound the
+ * vtable path uses, because waiting on every frame is the one pattern where
+ * a driver cannot hide its encoding work. Headless runs (and iOS, which is
+ * always headless here) pipeline like a window does. */
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
-        const int windowed_present = (present_dst && !s_headless);
-        if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+        const int pipelined = present_dst && (!s_headless || !s_eng_hl_sync);
+        if (pipelined) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
         if (present_dst) {
             if (s_headless) {
                 dst = s_offscreen;
@@ -3164,24 +3287,32 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
         }
 
-        id<MTLBuffer> stage = nil;
-        if (s_eng_stage_used)
-            stage = [s_dev newBufferWithBytes:s_eng_stage length:s_eng_stage_used
-                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stage = s_eng_stage_used ? s_eng_ring[s_eng_ring_cur].buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        s_eng_encoding = 1;
         eng_encode_records(cb, stage);
+        s_eng_encoding = 0;
+        const u32 serial = s_eng_serial++;
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
-        if (windowed_present) {
+        if (pipelined) {
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                 (void)_unused;
+                eng_note_done(serial);
                 dispatch_semaphore_signal(sem);
             }];
+            s_eng_flight_cb[serial % ENG_FLIGHT] = cb;
+            s_eng_flight_serial[serial % ENG_FLIGHT] = serial;
             [cb commit];
         } else {
             [cb commit];
             [cb waitUntilCompleted];
+            eng_note_done(serial);
+        }
+        if (stage && pipelined) {
+            s_eng_ring[s_eng_ring_cur].last_cb = cb;
+            eng_stage_next();
         }
 
         if (s_eng_dropped) {
@@ -3196,7 +3327,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
- * Headless submits have completed; windowed captures fence the same queue.
+ * A capture fences the queue first unless every present already waited
+ * (PS3RECOMP_METAL_HEADLESS_SYNC=1).
  *   PS3RECOMP_METAL_FRAME_DUMP=<path>      binary PPM; a printf field in the path ("%u", "%06u") takes the
  *                                          frame number (one file per capture), otherwise the file is overwritten.
  *   PS3RECOMP_METAL_FRAME_DUMP_EVERY=<n>   capture every n-th presented frame (default 120). */
@@ -3222,7 +3354,7 @@ static void eng_dump_frame(id<MTLTexture> src)
     if (!w || !h || w > 16384 || h > 16384) return;
     unsigned char* rgba = malloc(w * h * 4);
     if (!rgba) return;
-    if (!s_headless) {
+    if (!s_headless || !s_eng_hl_sync) {
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         [fence commit];
         [fence waitUntilCompleted];
@@ -3260,6 +3392,11 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     id<MTLTexture> t = eng_obj(surface);
     if (!t || !out || !out_pitch || !w || !h) return;
     if (x + w > [t width] || y + h > [t height]) return;
+    {   /* Presents may still be in flight: let the queue drain first. */
+        id<MTLCommandBuffer> fence = [s_queue commandBuffer];
+        [fence commit];
+        [fence waitUntilCompleted];
+    }
     [t getBytes:out bytesPerRow:out_pitch
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
 }
@@ -3286,6 +3423,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_pipeline        = eng_bind_pipeline,
     .bind_vs_constants    = eng_bind_vs_constants,
     .bind_ps_constants    = eng_bind_ps_constants,
+    .bind_vs_constants_split = eng_bind_vs_constants_split,
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,
     .set_viewport         = eng_set_viewport,
