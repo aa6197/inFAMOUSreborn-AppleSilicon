@@ -109,6 +109,12 @@ static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
 #endif
 
+/* PAD_FILE state (v219). Outside the XInput block: PAD_FILE / PAD_SCRIPT run on every backend. */
+/* stick hold (bench driver): lx, ly, rx, ry */
+static unsigned char g_pf_stick[4] = {128, 128, 128, 128};
+volatile unsigned g_pad_file_held = 0;   /* v219: PAD_FILE mask being held (rsx_ui_overlay.c dialogs/menu) */
+static int g_pf_stick_on = 0;
+
 /* ---------------------------------------------------------------------------
  * XInput backend
  * -----------------------------------------------------------------------*/
@@ -152,10 +158,6 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
  * so a title that reads the stick instead is playable too. */
-/* v219 PAD_FILE stick hold (bench driver): lx, ly, rx, ry */
-static unsigned char g_pf_stick[4] = {128, 128, 128, 128};
-volatile unsigned g_pad_file_held = 0;   /* v219: PAD_FILE mask being held (rsx_ui_overlay.c dialogs/menu) */
-static int g_pf_stick_on = 0;
 
 #ifdef _WIN32
 static int pad_host_window_focused(void)

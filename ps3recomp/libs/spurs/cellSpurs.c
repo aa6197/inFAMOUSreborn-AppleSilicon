@@ -3790,6 +3790,7 @@ static void w16p_begin(int wid)
 }
 static inline void w16p_end(void) { if (s_w16p_mode > 0 && g_active_ctx && g_active_ctx->thread_id == 1) s_w16p_open = 0; }
 #else
+static const int s_w16p_mode = 0;   /* W16PROF sampler is Windows-only */
 static inline void w16p_begin(int wid) { (void)wid; }
 static inline void w16p_end(void) {}
 #endif
