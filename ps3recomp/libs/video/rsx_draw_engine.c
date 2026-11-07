@@ -1128,24 +1128,71 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
     return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
 }
 
-/* One hash per cached texture per presented frame. Word-at-a-time FNV over
- * the whole span is deliberately cheap: this is a mutation detector, not a
- * content id (rsx_live_draw.c:2002-2026). */
-static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
-                                    int* readable)
+/* One check per cached texture per presented frame -- a mutation detector, not
+ * a content id (rsx_live_draw.c:2002-2026).
+ *
+ * Default: the D3D12 backend's sampled checksum (rsx_d3d12_backend.c tex_csum /
+ * tex_csum_dense / tex_csum_faces, the path inFamous ships on): ~1024 words of
+ * level 0, of every face for a cube, and 16x denser for 8-bit planes (Bink
+ * Y/U/V video frames). M7 profile: hashing every byte of every bound texture
+ * every frame was ~10% of the render thread.
+ * PS3RECOMP_ENGINE_TEX_FULLHASH=1: the old word-at-a-time FNV over the whole
+ * span (all levels, all faces), for chasing a stale texture. */
+static u32 eng_csum_step(const u8* base, u32 nbytes, u32 step)
+{
+    u32 h = 2166136261u, i = 0;
+    for (; i + 3 < nbytes; i += step) {
+        u32 w32; memcpy(&w32, base + i, sizeof w32);
+        h ^= w32; h *= 16777619u;
+    }
+    return h;
+}
+static u32 eng_csum(const u8* base, u32 nbytes)
+{
+    return eng_csum_step(base, nbytes, nbytes > 4096u ? nbytes / 1024u : 4u);
+}
+static u32 eng_csum_dense(const u8* base, u32 nbytes)
+{
+    u32 step = nbytes > 65536u ? (nbytes / 16384u) & ~3u : 4u;
+    if (!step) step = 4u;
+    return eng_csum_step(base, nbytes, step);
+}
+static u64 eng_texture_content_hash(u32 location, u32 offset, u32 fmt, u32 w,
+                                    u32 h, u32 levels, u32 pitch, int cube,
+                                    u32 span, int* readable)
 {
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
+    static int full = -1;
+    if (full < 0) {
+        const char* e = getenv("PS3RECOMP_ENGINE_TEX_FULLHASH");
+        full = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (full) {
+        u64 hash = 1469598103934665603ull;
+        u32 i = 0;
+        for (; i + 8 <= span; i += 8) {
+            u64 word;
+            memcpy(&word, src + i, sizeof(word));
+            hash ^= word;
+            hash *= 1099511628211ull;
+        }
+        for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
+        return hash;
+    }
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
+    u32 nb = n ? lv[0].tl.face_bytes : span;
+    if (nb > span) nb = span;
+    if ((fmt & 0x9Fu) == 0x81u) return eng_csum_dense(src, nb);     /* B8 */
+    u32 hash = eng_csum(src, nb);
+    if (cube) {
+        const u32 fs = rsx_texture_cube_face_stride(fmt, w, h, levels, pitch);
+        for (u32 f = 1; f < 6; f++)
+            if ((u64)f * fs + nb <= span)
+                hash = (hash ^ eng_csum(src + (size_t)f * fs, nb)) * 16777619u;
+    }
     return hash;
 }
 
@@ -1196,6 +1243,37 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     return handle;
 }
 
+#define ENG_TEX_ASSOC_SETS 4096u
+#define ENG_TEX_ASSOC_WAYS 4
+static int s_eng_tex_assoc[ENG_TEX_ASSOC_SETS][ENG_TEX_ASSOC_WAYS];   /* slot + 1, 0 = empty */
+static inline u32 eng_tex_bucket(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                 u32 pitch, u32 remap, int cube)
+{
+    u32 x = (offset * 2654435761u) ^ (w * 40503u) ^ (h * 2246822519u) ^
+            (fmt * 3266489917u) ^ (pitch * 668265263u) ^ (remap * 374761393u) ^
+            (location << 7) ^ (u32)(cube != 0);
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13;
+    return x & (ENG_TEX_ASSOC_SETS - 1u);
+}
+static inline int eng_tex_same(const eng_texture* e, u32 location, u32 offset,
+                               u32 fmt, u32 w, u32 h, u32 pitch, u32 remap, int cube)
+{
+    return e->location == location && e->offset == offset &&
+           e->format == fmt && e->width == w && e->height == h &&
+           e->pitch == pitch && e->remap == remap &&
+           e->cubemap == (u32)(cube != 0);
+}
+/* Move (or insert) slot i to the front of its bucket. */
+static inline void eng_tex_assoc_note(u32 hb, int i)
+{
+    int* ways = s_eng_tex_assoc[hb];
+    const int v = i + 1;
+    int k = 0;
+    while (k < ENG_TEX_ASSOC_WAYS - 1 && ways[k] != v) k++;
+    for (; k > 0; k--) ways[k] = ways[k - 1];
+    ways[0] = v;
+}
+
 /* The cache slot for a texture unit's bytes, keyed on where they are and what
  * the registers say they are. An already-cached entry is re-hashed at most
  * once per presented frame and re-decoded when the guest changed it, which is
@@ -1210,17 +1288,31 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
     if (!span) return 0;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
-        if (e->location != location || e->offset != offset ||
-            e->format != fmt || e->width != w || e->height != h ||
-            e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0))
-            continue;
+    /* Hashed hints first (the D3D12 backend's TEX_ASSOC, rsx_d3d12_backend.c
+     * v227A): four recent slots per bucket, each verified against the full
+     * identity; a miss still does the authoritative scan. Only a lookup
+     * accelerator -- cache contents and uploads are unchanged. M7 profile: the
+     * linear scan over up to 1024 entries per bound unit per draw was ~18% of
+     * the render thread. */
+    const u32 hb = eng_tex_bucket(location, offset, fmt, w, h, pitch, remap, cube);
+    int found = -1;
+    for (int way = 0; way < ENG_TEX_ASSOC_WAYS && found < 0; way++) {
+        const int i = s_eng_tex_assoc[hb][way] - 1;
+        if (i >= 0 && (u32)i < g.n_textures &&
+            eng_tex_same(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
+            found = i;
+    }
+    for (u32 i = 0; found < 0 && i < g.n_textures; i++)
+        if (eng_tex_same(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
+            found = (int)i;
+    if (found >= 0) {
+        eng_tex_assoc_note(hb, found);
+        eng_texture* e = &g.textures[found];
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
-            const u64 hash = eng_texture_content_hash(location, offset, span,
-                                                      &readable);
+            const u64 hash = eng_texture_content_hash(location, offset, fmt,
+                                                      w, h, levels, pitch,
+                                                      cube, span, &readable);
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
@@ -1256,11 +1348,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
-      e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+      e.content_hash = eng_texture_content_hash(location, offset, fmt, w, h,
+                                                levels, pitch, cube, span,
+                                                &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle || !evicted) { g.textures[index] = e; eng_tex_assoc_note(hb, (int)index); }
     return e.handle;
 }
 
