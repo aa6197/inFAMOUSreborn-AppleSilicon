@@ -228,6 +228,24 @@ if(APPLE)
         "-framework QuartzCore"
         "-framework Foundation"
     )
+    # MetalFX: METALFX upscaling of the letterboxed present. The iOS Simulator
+    # SDK has no MetalFX; the backend compiles it out there (__has_include).
+    if(CMAKE_OSX_SYSROOT)
+        execute_process(COMMAND xcrun --sdk "${CMAKE_OSX_SYSROOT}" --show-sdk-path
+            OUTPUT_VARIABLE _ps3r_sdk OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    else()
+        execute_process(COMMAND xcrun --show-sdk-path
+            OUTPUT_VARIABLE _ps3r_sdk OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(IS_DIRECTORY "${CMAKE_OSX_SYSROOT}")
+        set(_ps3r_sdk "${CMAKE_OSX_SYSROOT}")
+    endif()
+    if(EXISTS "${_ps3r_sdk}/System/Library/Frameworks/MetalFX.framework")
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework MetalFX")
+        message(STATUS "  MetalFX:      linked (METALFX upscaling)")
+    else()
+        message(STATUS "  MetalFX:      not in this SDK, upscaling compiled out")
+    endif()
     if(PS3RECOMP_IOS)
         target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
     else()

@@ -48,6 +48,12 @@
  */
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#if __has_include(<MetalFX/MetalFX.h>)
+#import <MetalFX/MetalFX.h>
+#define PS3RECOMP_HAVE_METALFX 1
+#else
+#define PS3RECOMP_HAVE_METALFX 0
+#endif
 #if !TARGET_OS_IPHONE
 #  import <AppKit/AppKit.h>
 #endif
@@ -65,6 +71,7 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <strings.h>
 
 /* ------------------------------------------------------------------------- */
 
@@ -2308,6 +2315,11 @@ static id<MTLRenderPipelineState> s_eng_depth_pso;
 static id<MTLRenderPipelineState> s_eng_zcolor_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
 static id<MTLSamplerState>        s_eng_linear_sampler;   /* letterboxed present (a screen of another size) */
+#if PS3RECOMP_HAVE_METALFX
+static id<MTLFXSpatialScaler>     s_mfx;                  /* METALFX: game image -> screen size */
+static id<MTLTexture>             s_mfx_out;
+static int                        s_mfx_on = -1;
+#endif
 
 static NSString* const kEngHelperMSL = @
 "#include <metal_stdlib>\n"
@@ -2592,6 +2604,10 @@ static void eng_shutdown(void* user)
     s_eng_zcolor_pso = nil;
     s_eng_point_sampler = nil;
     s_eng_linear_sampler = nil;
+#if PS3RECOMP_HAVE_METALFX
+    s_mfx = nil;
+    s_mfx_out = nil;
+#endif
     s_eng_active = 0;
 }
 
@@ -3509,6 +3525,80 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window. */
+#if PS3RECOMP_HAVE_METALFX
+/* METALFX (Apple port): MetalFX spatial upscaling of the finished game image
+ * to the size it is shown at, for a screen much larger than the game surface
+ * (an iPhone or iPad: 720p shown at 1200-1600 lines). The Windows build's
+ * equivalent is FSR / DLSS upscaling (UPSCALER in settings.ini). Only the
+ * letterboxed present uses it, so a game-sized window or headless output is
+ * unchanged. METALFX=1/0 wins; else UPSCALER=off turns it off and any other
+ * UPSCALER value on; else it is on for iOS and off for macOS. */
+static int eng_metalfx_on(void)
+{
+    if (s_mfx_on >= 0) return s_mfx_on;
+    const char* e = getenv("METALFX");
+    const char* u = getenv("UPSCALER");
+    if (e && *e)      s_mfx_on = (*e != '0');
+    else if (u && *u) s_mfx_on = (strcasecmp(u, "off") != 0);
+    else              s_mfx_on = TARGET_OS_IPHONE ? 1 : 0;
+    if (s_mfx_on && ![MTLFXSpatialScalerDescriptor supportsDevice:s_dev]) {
+        fprintf(stderr, "[metalfx] spatial scaler not supported on this GPU; plain scaling\n");
+        s_mfx_on = 0;
+    }
+    return s_mfx_on;
+}
+
+/* Upscale src towards ow x oh; returns the scaled image, or nil to fall back
+ * to the plain blit. Kept within 2x per axis (the final blit, linear, scales
+ * whatever is left). */
+static id<MTLTexture> eng_metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+                                          NSUInteger ow, NSUInteger oh)
+{
+    const NSUInteger iw = [src width], ih = [src height];
+    if (ow > iw * 2) { oh = oh * iw * 2 / ow; ow = iw * 2; }
+    if (oh > ih * 2) { ow = ow * ih * 2 / oh; oh = ih * 2; }
+    if (ow <= iw || oh <= ih) return nil;
+    if (!s_mfx || s_mfx.inputWidth != iw || s_mfx.inputHeight != ih ||
+        s_mfx.outputWidth != ow || s_mfx.outputHeight != oh ||
+        s_mfx.colorTextureFormat != [src pixelFormat]) {
+        MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
+        d.inputWidth  = iw; d.inputHeight  = ih;
+        d.outputWidth = ow; d.outputHeight = oh;
+        d.colorTextureFormat  = [src pixelFormat];
+        d.outputTextureFormat = [src pixelFormat];
+        d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        s_mfx = [d newSpatialScalerWithDevice:s_dev];
+        s_mfx_out = nil;
+        if (s_mfx) {
+            MTLTextureDescriptor* td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:[src pixelFormat] width:ow height:oh mipmapped:NO];
+            td.usage = s_mfx.outputTextureUsage | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            s_mfx_out = [s_dev newTextureWithDescriptor:td];
+        }
+        if (!s_mfx || !s_mfx_out) {
+            fprintf(stderr, "[metalfx] could not make a %lux%lu -> %lux%lu scaler (format %lu); plain scaling\n",
+                    (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh,
+                    (unsigned long)[src pixelFormat]);
+            s_mfx = nil; s_mfx_on = 0;
+            return nil;
+        }
+        fprintf(stderr, "[metalfx] spatial upscaling %lux%lu -> %lux%lu\n",
+                (unsigned long)iw, (unsigned long)ih, (unsigned long)ow, (unsigned long)oh);
+    }
+    if (([src usage] & s_mfx.colorTextureUsage) != s_mfx.colorTextureUsage) {
+        fprintf(stderr, "[metalfx] game surface lacks the usage the scaler needs; plain scaling\n");
+        s_mfx = nil; s_mfx_out = nil; s_mfx_on = 0;
+        return nil;
+    }
+    s_mfx.colorTexture  = src;
+    s_mfx.outputTexture = s_mfx_out;
+    s_mfx.inputContentWidth  = iw;
+    s_mfx.inputContentHeight = ih;
+    [s_mfx encodeToCommandBuffer:cb];
+    return s_mfx_out;
+}
+#endif
 
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                 id<MTLTexture> dst)
@@ -3541,11 +3631,17 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         if (dw / dh > sw / sh) { vp.width = floor(dh * sw / sh); vp.originX = floor((dw - vp.width) / 2); }
         else                   { vp.height = floor(dw * sh / sw); vp.originY = floor((dh - vp.height) / 2); }
     }
-    /* The letterboxed image is scaled to a size of its own, with linear
-     * filtering. The full-target blit keeps its sampler. */
+    /* The letterboxed image is scaled to a size of its own: MetalFX when on,
+     * linear filtering for the rest. The full-target blit keeps its sampler. */
     id<MTLTexture>      img  = src;
     id<MTLSamplerState> samp = s_eng_point_sampler;
     if (letterbox) {
+#if PS3RECOMP_HAVE_METALFX
+        if (vp.width > sw && vp.height > sh && eng_metalfx_on()) {
+            id<MTLTexture> up = eng_metalfx_upscale(cb, src, (NSUInteger)vp.width, (NSUInteger)vp.height);
+            if (up) img = up;
+        }
+#endif
         if ((double)[img width] != vp.width || (double)[img height] != vp.height)
             samp = s_eng_linear_sampler;
     }
