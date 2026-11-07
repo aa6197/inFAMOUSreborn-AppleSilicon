@@ -8,6 +8,7 @@
  * Backend selection:
  *   - Windows default: WASAPI (via mmdeviceapi)
  *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
+ *   - If PS3RECOMP_AUDIO_USE_SDL3 is defined: SDL3 audio stream (the iOS build)
  *
  * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
  */
@@ -35,7 +36,12 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
+#if defined(PS3RECOMP_AUDIO_USE_SDL3)
+  /* Apple port: iOS has no SDL2. Same queue model as the SDL2 backend below. */
+  #define AUDIO_BACKEND_SDL3    1
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  0
+#elif defined(PS3RECOMP_AUDIO_USE_SDL2)
   #define AUDIO_BACKEND_SDL2    1
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
@@ -44,6 +50,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 #else
   #define AUDIO_BACKEND_SDL2    1
   #define AUDIO_BACKEND_WASAPI  0
+#endif
+#ifndef AUDIO_BACKEND_SDL3
+  #define AUDIO_BACKEND_SDL3    0
 #endif
 
 #if AUDIO_BACKEND_WASAPI
@@ -93,6 +102,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 
 #if AUDIO_BACKEND_SDL2
   #include <SDL2/SDL.h>
+#endif
+#if AUDIO_BACKEND_SDL3
+  #include <SDL3/SDL.h>
 #endif
 
 /* Portable threading */
@@ -170,9 +182,15 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * Host audio output backend
  * -----------------------------------------------------------------------*/
 
-#if AUDIO_BACKEND_SDL2
+#if AUDIO_BACKEND_SDL2 || AUDIO_BACKEND_SDL3
 
+#if AUDIO_BACKEND_SDL3
+/* An SDL3 device stream stands in for the SDL2 queued device: put = SDL_QueueAudio, queued = SDL_GetQueuedAudioSize
+ * (both count bytes the device has not pulled yet). The handle keeps the SDL2 name so the helpers below are shared. */
+static SDL_AudioStream* s_sdl_audio_dev = NULL;
+#else
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+#endif
 
 #if defined(__APPLE__)
 /* AUDIO_WAV=<path> (default off): also write every block sent to the device to
@@ -214,6 +232,55 @@ static void wav_write(const float* stereo, u32 n)
 }
 #endif
 
+#if AUDIO_BACKEND_SDL3
+static int audio_backend_init(void)
+{
+    if (SDL_WasInit(SDL_INIT_AUDIO) == 0 && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        printf("[cellAudio] SDL3 audio init failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    /* The SDL2 path asks for a CELL_AUDIO_BLOCK_SAMPLES device buffer (want.samples); SDL3 takes it as a hint. */
+    char frames[16];
+    snprintf(frames, sizeof frames, "%d", CELL_AUDIO_BLOCK_SAMPLES);
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
+    const SDL_AudioSpec spec = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
+    s_sdl_audio_dev = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!s_sdl_audio_dev) {
+        printf("[cellAudio] SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    SDL_AudioSpec have; int have_frames = 0;
+    SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s_sdl_audio_dev), &have, &have_frames);
+    printf("[cellAudio] SDL3 audio open: device %d Hz, %d ch, %d frames (driver %s)\n",
+           have.freq, have.channels, have_frames,
+           SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
+    SDL_ResumeAudioStreamDevice(s_sdl_audio_dev);
+    return 0;
+}
+
+static void audio_backend_shutdown(void)
+{
+    if (s_sdl_audio_dev) {
+        SDL_DestroyAudioStream(s_sdl_audio_dev);
+        s_sdl_audio_dev = NULL;
+    }
+}
+
+static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+{
+    if (s_sdl_audio_dev) {
+        SDL_PutAudioStreamData(s_sdl_audio_dev, stereo_samples, (int)(num_samples * 2 * sizeof(float)));
+        wav_write(stereo_samples, num_samples);
+    }
+}
+
+static u32 sdl_queued_bytes(void)
+{
+    const int q = SDL_GetAudioStreamQueued(s_sdl_audio_dev);
+    return q > 0 ? (u32)q : 0u;
+}
+#define SDL_GetQueuedAudioSize(dev) sdl_queued_bytes()
+#else /* AUDIO_BACKEND_SDL2 */
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
@@ -264,6 +331,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 #endif
     }
 }
+#endif /* AUDIO_BACKEND_SDL3 / SDL2 */
 
 /* SDL queues without bound: keep about four blocks ahead of the device. */
 static int audio_backend_room(void)
@@ -289,7 +357,7 @@ static int audio_backend_queued(void)
     return (int)(SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)));
 }
 
-#endif /* AUDIO_BACKEND_SDL2 */
+#endif /* AUDIO_BACKEND_SDL2 || AUDIO_BACKEND_SDL3 */
 
 #if AUDIO_BACKEND_WASAPI
 

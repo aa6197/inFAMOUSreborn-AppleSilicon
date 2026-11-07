@@ -6,6 +6,7 @@
  * Backend selection:
  *   - Windows default: XInput (no extra dependencies)
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
+ *   - If PS3RECOMP_PAD_USE_SDL3 is defined: SDL3 gamepads (the iOS build)
  *
  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
  */
@@ -27,7 +28,12 @@
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_PAD_USE_SDL2)
+#if defined(PS3RECOMP_PAD_USE_SDL3)
+  /* Apple port: iOS has no SDL2. Reads SDL3 gamepads the same way the SDL2 backend reads controllers. */
+  #define PAD_BACKEND_SDL3  1
+  #define PAD_BACKEND_SDL2  0
+  #define PAD_BACKEND_XINPUT 0
+#elif defined(PS3RECOMP_PAD_USE_SDL2)
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
 #elif defined(_WIN32)
@@ -36,6 +42,9 @@
 #else
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
+#endif
+#ifndef PAD_BACKEND_SDL3
+  #define PAD_BACKEND_SDL3  0
 #endif
 
 #if PAD_BACKEND_XINPUT
@@ -49,6 +58,9 @@
 
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
+#endif
+#if PAD_BACKEND_SDL3
+  #include <SDL3/SDL.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -107,6 +119,9 @@ static volatile long s_latch[PAD_MAX_HOST_PORTS];
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
+#endif
+#if PAD_BACKEND_SDL3
+static SDL_Gamepad* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 #endif
 
 /* PAD_FILE state (v219). Outside the XInput block: PAD_FILE / PAD_SCRIPT run on every backend. */
@@ -925,6 +940,137 @@ static void pad_shutdown_backend(void)
 #endif /* PAD_BACKEND_SDL2 */
 
 /* ---------------------------------------------------------------------------
+ * SDL3 backend (Apple port, iOS)
+ *
+ * Mirrors the SDL2 backend above. SDL3 numbers gamepads by joystick ID, not by
+ * device index, so new pads are found with SDL_GetGamepads (twice a second)
+ * and take the first free host port. Pad state is not pumped here: the app's
+ * event loop (infamous-recomp/ios/ios_shell.mm) runs SDL on the main thread,
+ * which keeps the gamepads current; SDL3's gamepad getters lock internally.
+ * -----------------------------------------------------------------------*/
+
+#if PAD_BACKEND_SDL3
+
+static u8 pad_sdl_axis_to_u8(int raw)
+{
+    int val = ((raw + 32768) * 255) / 65535;
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+    return (u8)val;
+}
+
+static u8 pad_sdl_trigger_to_u8(int raw)
+{
+    int val = (raw * 255) / 32767;
+    if (val < 0) val = 0;
+    if (val > 255) val = 255;
+    return (u8)val;
+}
+
+static void pad_sdl3_open_new(void)
+{
+    int n = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    if (!ids) return;
+    for (int k = 0; k < n; k++) {
+        int open = 0, free_port = -1;
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            if (s_sdl_controllers[i] && SDL_GetGamepadID(s_sdl_controllers[i]) == ids[k]) open = 1;
+            if (!s_sdl_controllers[i] && free_port < 0) free_port = i;
+        }
+        if (open || free_port < 0) continue;
+        s_sdl_controllers[free_port] = SDL_OpenGamepad(ids[k]);
+        if (s_sdl_controllers[free_port])
+            printf("[cellPad] SDL3 gamepad on port %d: %s\n", free_port,
+                   SDL_GetGamepadName(s_sdl_controllers[free_port]) ? SDL_GetGamepadName(s_sdl_controllers[free_port]) : "?");
+    }
+    SDL_free(ids);
+}
+
+static void pad_poll_sdl3(void)
+{
+    static unsigned long long s_next_scan = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now >= s_next_scan) { s_next_scan = now + 500; pad_sdl3_open_new(); }
+
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        SDL_Gamepad* gc = s_sdl_controllers[i];
+        if (!gc || !SDL_GamepadConnected(gc)) {
+            s_host_state[i].connected = 0;
+            if (gc) {
+                SDL_CloseGamepad(gc);
+                s_sdl_controllers[i] = NULL;
+            }
+            continue;
+        }
+
+        s_host_state[i].connected = 1;
+
+        u16 btns = 0;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_BACK))           btns |= CELL_PAD_CTRL_SELECT;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_LEFT_STICK))     btns |= CELL_PAD_CTRL_L3;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_RIGHT_STICK))    btns |= CELL_PAD_CTRL_R3;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_START))          btns |= CELL_PAD_CTRL_START;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_DPAD_UP))        btns |= CELL_PAD_CTRL_UP;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_DPAD_RIGHT))     btns |= CELL_PAD_CTRL_RIGHT;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_DPAD_DOWN))      btns |= CELL_PAD_CTRL_DOWN;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_DPAD_LEFT))      btns |= CELL_PAD_CTRL_LEFT;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER))  btns |= CELL_PAD_CTRL_L1;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) btns |= CELL_PAD_CTRL_R1;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_NORTH))          btns |= CELL_PAD_CTRL_TRIANGLE;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_EAST))           btns |= CELL_PAD_CTRL_CIRCLE;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_SOUTH))          btns |= CELL_PAD_CTRL_CROSS;
+        if (SDL_GetGamepadButton(gc, SDL_GAMEPAD_BUTTON_WEST))           btns |= CELL_PAD_CTRL_SQUARE;
+
+        int lt = SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+        int rt = SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
+        if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
+
+        s_host_state[i].buttons = btns;
+
+        s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_LEFTX));
+        s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_LEFTY));
+        s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHTX));
+        s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GetGamepadAxis(gc, SDL_GAMEPAD_AXIS_RIGHTY));
+
+        s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
+        s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
+
+        s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+        s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+        s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+        s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+        s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+        s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+        s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+        s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+        s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+        s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+    }
+}
+
+static void pad_init_backend(void)
+{
+    if (SDL_WasInit(SDL_INIT_GAMEPAD) == 0 && !SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+        printf("[cellPad] SDL3 gamepad init failed: %s\n", SDL_GetError());
+    memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
+    pad_sdl3_open_new();
+}
+
+static void pad_shutdown_backend(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        if (s_sdl_controllers[i]) {
+            SDL_CloseGamepad(s_sdl_controllers[i]);
+            s_sdl_controllers[i] = NULL;
+        }
+    }
+}
+
+#endif /* PAD_BACKEND_SDL3 */
+
+/* ---------------------------------------------------------------------------
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
 
@@ -994,6 +1140,8 @@ static void pad_poll_backend_do(void)
 #endif
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
+#elif PAD_BACKEND_SDL3
+    pad_poll_sdl3();
 #endif
 #ifdef _WIN32
     if (cost) QueryPerformanceCounter(&t1);
@@ -2105,6 +2253,16 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 #if PAD_BACKEND_SDL2
     if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
         SDL_GameControllerRumble(
+            s_sdl_controllers[port_no],
+            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
+            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
+            100 /* duration ms */
+        );
+    }
+#endif
+#if PAD_BACKEND_SDL3
+    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
+        SDL_RumbleGamepad(
             s_sdl_controllers[port_no],
             (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
             (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
