@@ -190,6 +190,9 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
+    /* Attributes with the same frequency and divider mode share one element
+     * range, so each distinct range is scanned once (same result). */
+    u32 memo_key[4], memo_first[4], memo_last[4], n_memo = 0;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -225,15 +228,30 @@ void rsx_vertex_fetch_plan_prepare(
         if (!plan->guest_ptr)
             continue;
 
+        const u32 freq = fetch->desc.frequency;
+        const u32 mod = (plan->divider_mask >> attr) & 1u;
+        const u32 key = freq <= 1 ? 0u : ((freq << 1) | mod);
         u32 first = UINT_MAX;
         u32 last = 0;
-        for (u32 i = 0; i < count; i++) {
-            const u32 element = rsx_vertex_element_index(
-                refs[i].vertex_id, refs[i].base_index,
-                fetch->desc.frequency,
-                (plan->divider_mask >> attr) & 1u);
-            if (element < first) first = element;
-            if (element > last) last = element;
+        u32 m = 0;
+        while (m < n_memo && memo_key[m] != key)
+            m++;
+        if (m < n_memo) {
+            first = memo_first[m];
+            last = memo_last[m];
+        } else {
+            for (u32 i = 0; i < count; i++) {
+                const u32 element = rsx_vertex_element_index(
+                    refs[i].vertex_id, refs[i].base_index, freq, mod);
+                if (element < first) first = element;
+                if (element > last) last = element;
+            }
+            if (n_memo < 4) {
+                memo_key[n_memo] = key;
+                memo_first[n_memo] = first;
+                memo_last[n_memo] = last;
+                n_memo++;
+            }
         }
 
         const u64 prefix =
