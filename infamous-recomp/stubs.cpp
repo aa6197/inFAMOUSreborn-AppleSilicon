@@ -25,6 +25,9 @@ extern "C" { volatile float g_v237_lodf = 1.0f; }
 #include "trainer.h"   /* F10 trainer */
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#ifndef _WIN32
+#include "win32_compat.h"   /* GetTickCount64, VirtualQuery (Windows declares its own below) */
+#endif
 extern "C" uint8_t* vm_base;   /* C linkage: defined in main.cpp */
 
 extern "C" {
@@ -120,7 +123,9 @@ static void infamous_hangdump_start(void)
 // v194: "is the game paused?" for the settings-menu hint (rsx_ui_overlay.c): the world clock (base+4) stands still
 // while the real clock (base+0x24) keeps running -- that is the pause menu (SIM-FROZEN in infamous_clock_probe.h).
 extern "C" int (*volatile g_uiov_paused_fn)(void);
+#ifdef _WIN32
 extern "C" __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+#endif
 static int infamous_paused_probe(void)
 {
     using infamous_clock_probe::word; using infamous_clock_probe::base;
@@ -157,7 +162,19 @@ extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 extern "C" volatile int g_uiov_request;   /* rsx_ui_overlay.c */
 extern "C" volatile unsigned long long g_pause_menu_built_ms;   /* rsx_ui_overlay.c: pause watermark */
 struct inf_mbi { void* base; void* abase; unsigned long aprot; unsigned short part; size_t size; unsigned long state, prot, type; };
+#ifdef _WIN32
 extern "C" __declspec(dllimport) size_t __stdcall VirtualQuery(const void*, inf_mbi*, size_t);
+#else
+/* The runtime's VirtualQuery shim (win32_compat.h) reports the same MEM_COMMIT / PAGE_* values. */
+static size_t VirtualQuery(const void* p, inf_mbi* m, size_t)
+{
+    MEMORY_BASIC_INFORMATION b;
+    if (!VirtualQuery(p, &b, sizeof b)) return 0;
+    m->base = b.BaseAddress; m->abase = b.AllocationBase; m->aprot = b.AllocationProtect; m->part = 0;
+    m->size = b.RegionSize; m->state = b.State; m->prot = b.Protect; m->type = b.Type;
+    return sizeof *m;
+}
+#endif
 
 static const uint32_t PM_FN_SETTINGS = 0x00FF0000u, PM_FN_QUIT = 0x00FF0010u, PM_FN_TRIM = 0x00FF0020u;
 static const uint32_t PM_TOC = 0x0078BFC0u;

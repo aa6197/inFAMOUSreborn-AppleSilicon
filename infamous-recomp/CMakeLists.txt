@@ -389,6 +389,27 @@ if(PORT_CPU_AUTO AND WIN32 AND NOT CMAKE_CROSSCOMPILING AND NOT DEFINED CACHE{PO
         message(STATUS "CPU compat:      v242 CPU probe gave no answer (built=${_v242_cpu_built} run=${_v242_cpu_run}) -> default build")
     endif()
 endif()
+# Apple port: an arm64 target has none of the x86 codegen options below (-mavx2/-mfma/-mbmi2/-msse4.1 are errors
+# there). Same target test as the toolkit's PS3RECOMP_TARGET_X86. Non-x86 targets force PORT_SPU_AVX2/PORT_PPU_AVX2
+# off the way PORT_CPU_COMPAT does; the SIMD code they select falls back to the portable / sse2neon paths
+# (include/ps3emu/host_simd.h). x86 targets (every Windows build) are unchanged.
+set(PORT_TARGET_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|i[3-6]86|x86)$")
+    set(PORT_TARGET_X86 ON)
+endif()
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+        set(PORT_TARGET_X86 ON)
+    else()
+        set(PORT_TARGET_X86 OFF)
+    endif()
+endif()
+if(NOT PORT_TARGET_X86)
+    set(PORT_SPU_AVX2 OFF)
+    set(PORT_PPU_AVX2 OFF)
+    set(PORT_CPU_COMPAT OFF)   # the pre-AVX2 x86 exe; its spu_xfk.h copy step is x86-only
+    message(STATUS "Target:          ${CMAKE_SYSTEM_PROCESSOR} (not x86) -> no x86 codegen options")
+endif()
 option(PORT_CPU_COMPAT "Compatibility build without AVX2/FMA/BMI2 (inFamousRecomp_sse4.exe, v242B)" OFF)
 if(PORT_CPU_COMPAT)
     set(PORT_SPU_AVX2 OFF)
@@ -510,6 +531,11 @@ if(PORT_SPU_AVX2 AND (NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
         -mavx2 -mfma -mbmi2 "${_host_glue_fp}")
     message(STATUS "Host game glue:   AVX2/FMA/BMI2 codegen (FP contraction off)")
 endif()
+# Apple port: arm64 has FMA in the base ISA and clang contracts a*b+c by default there, which an x86 build of the
+# game glue never does without -mfma. Keep it off, as the AVX2 build above does.
+if(NOT PORT_TARGET_X86 AND NOT MSVC)
+    set_property(SOURCE ${PORT_GAME_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
 
 # The lifted SPU sources use bare #include "spu_context.h". Scope that include
 # directory (and their flags) to those TUs alone: adding it to the whole target
@@ -532,6 +558,10 @@ if(SPU_SOURCES)
         # bit-identical (both single-rounding). PORT_SPU_AVX2=OFF for older CPUs.
         if(PORT_SPU_AVX2)
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1;-mavx2;-mfma;-mbmi2")
+        elseif(NOT PORT_TARGET_X86)
+            # Apple port (arm64): no x86 ISA flags. FP contraction stays at clang's default (on), which is what
+            # the Windows AVX2 build of these TUs uses too (see the PORT_CPU_COMPAT notes on spu_fi below).
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
         else()
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1")
         endif()
@@ -546,6 +576,12 @@ if(SPU_SOURCES)
                 get_source_file_property(_o "${_f}" COMPILE_OPTIONS)
                 set_source_files_properties("${_f}" PROPERTIES COMPILE_OPTIONS "${_o};${_c_no_tlsg}")
             endforeach()
+        endif()
+        # Apple port: the plugin lift (tools/plug_lift.py) includes <windows.h> under _WIN32 only, for its [plug]
+        # stats (Interlocked*, GetTickCount64). Off Windows the same names come from the runtime's Win32 shim.
+        if(NOT WIN32 AND EXISTS "${SPU_DIR}/wwsplug/spu_recomp.c")
+            set_property(SOURCE "${SPU_DIR}/wwsplug/spu_recomp.c" APPEND PROPERTY COMPILE_OPTIONS
+                -include "${PS3RECOMP_DIR}/runtime/platform/win32_compat.h")
         endif()
         # v177: the lifted WWS job modules (post-processed by ps3recomp/tools/spu_ibfast.py) build with -w --
         # clang-cl's -Wall is -Weverything and the generated code's warnings were ~800 MB of build_rc.log.
