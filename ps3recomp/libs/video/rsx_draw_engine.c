@@ -117,7 +117,7 @@ typedef struct {
     u64 last_use_serial;
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; } eng_pipeline;
+typedef struct { u64 key; u32 handle; u8 fixed; u64 ps_hash; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -1504,6 +1504,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 i = 0; i < g.n_pipelines; i++)
         if (g.pipelines[i].key == key) {
             *out_fixed = g.pipelines[i].fixed;
+            g.ps_hash = g.pipelines[i].ps_hash;
             return g.pipelines[i].handle;
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
@@ -1561,6 +1562,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    g.pipelines[g.n_pipelines].ps_hash = g.ps_hash =
+        eng_fnv1a(s_ps_hlsl, (u32)strlen(s_ps_hlsl), 1469598103934665603ull);
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -2253,18 +2256,41 @@ static void sink_end(void* user, const rsx_dispatch* r)
         if (zslot != ENG_INVALID)
             snprintf(zbuf, sizeof zbuf, "(%08X %ux%u)", g.zdepths[zslot].offset,
                      g.zdepths[zslot].w, g.zdepths[zslot].h);
-        char tx[512]; int o = 0; tx[0] = 0;
+        char tx[1536]; int o = 0; tx[0] = 0;
         for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && o < (int)sizeof tx - 32; u++)
             if (tex_mask & (1u << u))
+            {
                 o += snprintf(tx + o, sizeof tx - o, " u%u=%c%X/%02X%s", u, s_tex_kind[u],
                               s_tex_src[u], s_tex_fmt[u] & 0xFFu, textures[u] ? "" : "(none)");
+                /* A guest texture: where it is, its size, its first texels. */
+                rsx_dsp_texture t;
+                rsx_dsp_get_texture(&g.rsx, u, &t);
+                if (s_tex_kind[u] == 'T' && o < (int)sizeof tx - 64) {
+                    const u8* gp = eng_guest_ptr(NULL, t.location, t.offset, 16);
+                    o += snprintf(tx + o, sizeof tx - o, "[L%u %ux%u p%u", t.location,
+                                  t.width, t.height, t.pitch);
+                    if (gp) o += snprintf(tx + o, sizeof tx - o, " %02X%02X%02X%02X %02X%02X%02X%02X",
+                                          gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7]);
+                    o += snprintf(tx + o, sizeof tx - o, "]");
+                }
+            }
+        /* A short program's inline constants (x of each), for tone/LUT passes. */
+        if (g.fp_constants.count && g.fp_constants.count <= 8 && o < (int)sizeof tx - 160) {
+            o += snprintf(tx + o, sizeof tx - o, " c=");
+            for (u32 k = 0; k < g.fp_constants.count; k++) {
+                float f[4]; memcpy(f, g.fp_constants.values[k], 16);
+                o += snprintf(tx + o, sizeof tx - o, "%s%.4g/%.4g/%.4g", k ? "," : "", f[0], f[1], f[2]);
+            }
+        }
         fprintf(stderr, "[eng-trace] f%u draw prim=%u n=%u tgt=s%u(%08X %ux%u fmt%d)x%u z=%s%s"
-                        " blend=%d dt=%d dw=%d cmask=%X fixed=%d sh=%X%s\n",
+                        " blend=%d dt=%d dw=%d cmask=%X fixed=%d sh=%X db=%u[%.5f,%.5f] st=%u pk=%X ps=%016llx%s\n",
                 g.frames, prim, n_draw, target, g.surfaces[target].offset,
                 g.surfaces[target].w, g.surfaces[target].h, (int)g.surfaces[target].fmt,
                 n_targets, depth_handle ? "y" : "n", zbuf,
                 (int)rs.blend_enable, (int)rs.depth_test, (int)rs.depth_write,
-                (unsigned)rs.color_mask, pipeline_is_fixed, g.shkey, tx);
+                (unsigned)rs.color_mask, pipeline_is_fixed, g.shkey,
+                rsx_dsp_reg(&g.rsx, 0x0380u) & 1u, eng_reg_f32(0x0384u), eng_reg_f32(0x0388u),
+                (unsigned)rs.stencil_enable, rsx_dsp_reg(&g.rsx, 0x1FECu), (unsigned long long)g.ps_hash, tx);
     }
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
