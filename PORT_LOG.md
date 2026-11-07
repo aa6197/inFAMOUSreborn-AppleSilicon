@@ -4,7 +4,7 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M3 done**. Next: **M4** (main menu renders via Metal; `PAD_FILE` navigates it).
+- Milestone: **M4 done**. Next: **M5** (gameplay renders close to references; audio plays).
 - Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
@@ -13,6 +13,88 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M4: menu
+
+### Result
+
+M4 check passes. The menu is the **pause menu**: there is no save, so
+START at the title starts a new game (no main menu with Continue).
+
+| Check | Result |
+|---|---|
+| Title screen | lit and correct after the fixes below |
+| START at title | new-game cinematic, then the first tutorial ("look up at the chopper") |
+| Gameplay | renders; no dropped draws |
+| START in gameplay | pause menu: Powers, Controls, Options, Saved Data, Settings, Quit Game |
+| DOWN | highlight moves one row each press (Controls ... Settings) |
+| CROSS on Settings | game calls the port hook (`[pausemenu] Settings`); see open items |
+| CIRCLE | closes the menu, gameplay resumes |
+| Crashes / drops | 0 in 420 s |
+
+- All input was through `PAD_FILE`, no window.
+- Engine unit test (`test_rsx_draw_engine`): 77 checks, all pass.
+
+Logs: `$WORK_DIR/runs/20261107-140056-menu4/` (key frames in `keep/`),
+title fix in `$WORK_DIR/runs/20261107-134801-trace7/`.
+
+### What was wrong, and the fixes
+
+Each fix copies what `rsx_d3d12_backend.c` does.
+
+- **Dark 3D frames.** Two reads fell through to guest memory:
+  - a depth buffer read as A8R8G8B8. Fix: a colour copy of depth and
+    stencil, same byte order as D3D12 `zs_convert`.
+  - a draw reading its own target. Fix: a copy per draw, like D3D12's
+    feedback path.
+  - Title screen mean went from 0.011 to 0.232.
+- **Black gameplay frames.** The Metal engine dropped ~1,150 draws a frame
+  past its 8,192 record cap. Fix: cap 32,768, and a full stream submits
+  mid-frame instead of dropping.
+- **Immediate-mode draws.** Vertices written with `SET_VERTEX_DATA*_M`
+  were ignored. Now passed to the engine, as `rsx_commands.c` does for D3D12.
+- **Shadows.** Shadow compare per texture unit, keyed like D3D12.
+
+### What changed
+
+- Commits on `apple-port`:
+  - `metal: numbered frame dumps`
+  - `engine: immediate-mode vertices`
+  - `metal: submit mid-frame when the record stream is full`
+  - `engine: read render targets as the D3D12 backend does, plus a frame trace`
+  - `metal: depth colour copy and surface copy hooks`
+- New switches (default on, as in D3D12): `FEEDBACK_COPY`, `ZCONV`.
+- New debug: `PS3RECOMP_ENGINE_TRACE_AT=<frame>|<secs>s`,
+  `PS3RECOMP_ENGINE_SURFACE_DUMP=<dir>`, `PS3RECOMP_METAL_FRAME_DUMP_EVERY`.
+- Tools (outside the repo): `$WORK_DIR/tools/pad_at.sh` (timed presses),
+  `$WORK_DIR/tools/press.sh` (one press, then save the next frame).
+- the port notes "Run and observe" lists all of the above.
+- No Windows code or generated code touched. New backend hooks are
+  optional; D3D12 does not use the Metal engine.
+
+### Open items
+
+- **Settings and Quit Game do nothing on Mac.** They open a host overlay
+  (`rsx_ui_overlay.c`) that is D3D12-only; the non-Windows build is a
+  stub. Needs a Metal version. The README promises Settings in the menu.
+- **No reference frames yet.** RPCS3 needs PS3 firmware. Checks so far are
+  by eye only. Ask the user once (capture the golden set, or allow the
+  firmware download).
+- **Speed:** about 9 flips/s in gameplay with frame dumps on (M7).
+- **Not verified:**
+  - yellow frame right after START at the title (effect or bug?);
+  - stencil channel in the colour copy (`.r`; try `.g` if it reads 0);
+  - a SIGBUS seen once on the vtable path early in M4.
+- `DIAGNOSTICS.md` generator misses `eng_env_flag` switches, and a regen
+  adds ~575 unrelated knobs. Not regenerated.
+- **Disk:** `$WORK_DIR/runs` is 5.8 GB (PPM dumps); the disk is 94% full.
+
+### Next step
+
+- M5: compare gameplay with references, check audio plays.
+- Get the golden set first.
 
 ---
 
