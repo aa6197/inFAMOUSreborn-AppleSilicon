@@ -2086,7 +2086,8 @@ static EngView s_eng_view[ENG_MAX_VIEWS];
 static u32 s_eng_view_count;
 
 typedef enum {
-    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE
+    ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
+    ENG_REC_COPY
 } EngRecKind;
 
 typedef struct {
@@ -2114,6 +2115,8 @@ typedef struct {
     float clear_depth;
     u8    clear_stencil;
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
+    u32   resolve_color;        /* 1: the A8R8G8B8 colour copy, not R32F */
+    u32   copy_src;             /* ENG_REC_COPY: copy_src -> resolve_dst */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -2131,6 +2134,7 @@ static id<MTLLibrary>             s_eng_helper_lib;
 static id<MTLRenderPipelineState> s_eng_blit_pso;
 static MTLPixelFormat             s_eng_blit_pso_fmt;
 static id<MTLRenderPipelineState> s_eng_depth_pso;
+static id<MTLRenderPipelineState> s_eng_zcolor_pso;
 static id<MTLSamplerState>        s_eng_point_sampler;
 
 static NSString* const kEngHelperMSL = @
@@ -2151,7 +2155,17 @@ static NSString* const kEngHelperMSL = @
 "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
 "                            depth2d<float> src [[texture(0)]],\n"
 "                            sampler s [[sampler(0)]]) {\n"
-"    return src.sample(s, i.uv);\n"
+"    return src.read(uint2(i.pos.xy));\n"   /* texel for texel: a smaller copy is the top-left region */
+"}\n"
+/* The D3D12 backend's zconv_ps: the bytes an A8R8G8B8 fetch of a D24S8 word
+ * returns, A = depth[23:16], R = depth[15:8], G = depth[7:0], B = stencil. */
+"fragment float4 eng_zcolor_fs(BOut i [[stage_in]],\n"
+"                              depth2d<float> z [[texture(0)]],\n"
+"                              texture2d<uint> st [[texture(1)]]) {\n"
+"    uint2 p = uint2(i.pos.xy);\n"
+"    uint v = uint(rint(saturate(z.read(p)) * 16777215.0));\n"
+"    float s = float(st.read(p).r & 255u);\n"
+"    return float4(float((v >> 8) & 255u), float(v & 255u), s, float((v >> 16) & 255u)) / 255.0;\n"
 "}\n";
 
 static u32 eng_obj_add(id<MTLTexture> t)
@@ -2312,6 +2326,7 @@ static void eng_shutdown(void* user)
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
+    s_eng_zcolor_pso = nil;
     s_eng_point_sampler = nil;
     s_eng_active = 0;
 }
@@ -2422,7 +2437,8 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
                                                        mipmapped:NO];
     /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
      * pass that samples this as a depth2d, so it cannot be write-only. */
-    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+                     MTLTextureUsagePixelFormatView;   /* the X32_Stencil8 view of the colour copy */
     td.storageMode = MTLStorageModePrivate;
     return eng_obj_add([s_dev newTextureWithDescriptor:td]);
 }
@@ -2460,6 +2476,76 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_DEPTH_RESOLVE;
     r->depth = depth;
+    r->resolve_dst = dst;
+    return dst;
+}
+
+/* The A8R8G8B8 colour copy of a depth target (depth and stencil), recorded
+ * like the snapshot above. RGBA8 with a view-capable usage, because the unit
+ * sampling it wears its crossbar as a view swizzle like any colour target. */
+static u32 eng_depth_color_copy(void* user, u32 depth, u32 w, u32 h)
+{
+    (void)user;
+    if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
+    if (!eng_rec_room()) { s_eng_dropped++; return 0; }
+    if (!s_eng_zcolor_pso) {
+        MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+        pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_zcolor_fs"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        NSError* err = nil;
+        s_eng_zcolor_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!s_eng_zcolor_pso) {
+            fprintf(stderr, "[rsx engine/metal] depth colour copy pipeline failed: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            return 0;
+        }
+    }
+    MTLTextureDescriptor* td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:w height:h
+                                                       mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
+               MTLTextureUsagePixelFormatView;
+    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (!dst) return 0;
+
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_DEPTH_RESOLVE;
+    r->depth = depth;
+    r->resolve_dst = dst;
+    r->resolve_color = 1;
+    return dst;
+}
+
+/* A colour target's copy, for a draw that samples what it writes. `dst` is
+ * reused while it still matches, so a run of such draws costs one texture;
+ * Metal's hazard tracking orders each copy after the reads of the last. */
+static u32 eng_surface_copy(void* user, u32 surface, u32 dst)
+{
+    (void)user;
+    id<MTLTexture> src = eng_obj(surface);
+    if (!src) return 0;
+    if (!eng_rec_room()) { s_eng_dropped++; return 0; }
+    id<MTLTexture> d = eng_obj(dst);
+    if (!d || [d width] != [src width] || [d height] != [src height] ||
+        [d pixelFormat] != [src pixelFormat]) {
+        MTLTextureDescriptor* td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
+                                                               width:[src width]
+                                                              height:[src height]
+                                                           mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        td.storageMode = MTLStorageModePrivate;
+        if (dst) eng_obj_release(NULL, dst);
+        dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+        if (!dst) return 0;
+    }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_COPY;
+    r->copy_src = surface;
     r->resolve_dst = dst;
     return dst;
 }
@@ -2845,19 +2931,35 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
     while (i < s_eng_rec_count) {
+        if (s_eng_rec[i].kind == ENG_REC_COPY) {
+            const EngRecord* r = &s_eng_rec[i++];
+            id<MTLTexture> src = eng_obj(r->copy_src);
+            id<MTLTexture> dst = eng_obj(r->resolve_dst);
+            if (!src || !dst) continue;
+            id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+            if (!b) continue;
+            [b copyFromTexture:src toTexture:dst];
+            [b endEncoding];
+            continue;
+        }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
-            if (!src || !dst || !s_eng_depth_pso) continue;
+            id<MTLRenderPipelineState> pso = r->resolve_color ? s_eng_zcolor_pso : s_eng_depth_pso;
+            if (!src || !dst || !pso) continue;
+            id<MTLTexture> sv = r->resolve_color
+                ? [src newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8] : nil;
+            if (r->resolve_color && !sv) continue;
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
-            [e setRenderPipelineState:s_eng_depth_pso];
+            [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
+            if (sv) [e setFragmentTexture:sv atIndex:1];
             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [e endEncoding];
@@ -2875,8 +2977,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u32 cd = 0, ds_flags = 0;
         float cdepth = 1.0f;
         u8 cstencil = 0;
-        while (i < s_eng_rec_count && s_eng_rec[i].kind != ENG_REC_DRAW &&
-               s_eng_rec[i].kind != ENG_REC_DEPTH_RESOLVE) {
+        while (i < s_eng_rec_count && (s_eng_rec[i].kind == ENG_REC_CLEAR_COLOR ||
+                                       s_eng_rec[i].kind == ENG_REC_CLEAR_DS)) {
             const EngRecord* r = &s_eng_rec[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -3176,6 +3278,8 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_create  = eng_depth_target_create,
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
+    .depth_color_copy     = eng_depth_color_copy,
+    .surface_copy         = eng_surface_copy,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
     .bind_targets         = eng_bind_targets,
