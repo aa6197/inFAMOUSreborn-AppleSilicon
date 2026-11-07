@@ -4,8 +4,15 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M7 done** (~33 flips/s on the Mac, was ~9.6).
-  Next: **M8** (iOS Simulator app boots to the menu).
+- Milestone: **M8 done**. M9 and M10 are **done in the Simulator**
+  (iPad Pro 11, iPhone 17, iPhone 18 Pro: gameplay + pause menu).
+  **M9 on the real iPad is blocked**: Apple wants the new Program License
+  Agreement accepted for my team before it signs anything new
+  (re-checked 22:56, still blocked). Only the user can do it
+  (developer.apple.com → Account). Then: `$WORK_DIR/tools/ios_device.sh`
+  `check`, `build`, `install`, `copy-game`, `run 180 ipad1`.
+- M10 (iPhone) = iPhone Simulator only. **Never use the physical iPhone.**
+- The iPad may be busy with another task: run `ios_device.sh check` first.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
   Open items are in the M5 entry below.
@@ -19,6 +26,128 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M9 / M10: Simulator coverage, low-thread rule
+
+### Result
+
+- **iPad Pro 11 (M5) Simulator** (2420x1668): title → START → gameplay
+  → pause menu → DOWN moves to "Commandes". 285 s, no crash, 28.1 flips/s.
+  Touch pad on (`TOUCH_PAD=1`). On the 4:3 screen the pad sits over
+  the edges of the game image (it is see-through).
+- **iPhone 17 Simulator** (2622x1206): same script, same result.
+  283 s, no crash, 28.8 flips/s.
+- **Real iPad: still blocked** on the PLA (signing says
+  `PLA Update available`). The iPad was free (unlocked, no apps running).
+- **Low-thread (lean) mode:** on iOS by default, off on the Mac.
+  - Windows turns it on when fewer than 17 CPUs are in the affinity mask.
+    Apple has no affinity masks, so it counts online CPUs.
+  - Mac A/B (15 CPUs, 2 pairs, 300 s, static scene, flips/s 150–290 s):
+
+    | | run 1 | run 2 |
+    |---|---|---|
+    | lean off | 34.8 | 35.3 |
+    | lean on | 35.2 | 33.6 |
+
+    No gain, so the Mac keeps the old default (off).
+  - iOS: on when fewer than 17 CPUs (iPhone 6, iPad 9–10).
+    Not measured on a real device yet.
+  - `V242A_NCPU=6` on the Mac applies the rule as if it had 6 CPUs
+    (checked: `6 logical CPUs -> lean ON`).
+  - `PS3_NCPU=<n>` now overrides the host CPU count off Windows too.
+
+### What changed
+
+- `cellSpurs.c`: Apple branch of the lean auto rule (commit a11eb72).
+  Windows code is untouched.
+- `ppu_loader.cpp`: non-Windows `ps3_host_ncpu` reads `PS3_NCPU`.
+- Tools: `$WORK_DIR/tools/ab_lean.sh` (Mac lean A/B),
+  `$WORK_DIR/tools/flips.sh <run> [from] [to]` (flips/s from `[flip]` lines),
+  `$WORK_DIR/tools/ios_device.sh` (iPad steps).
+
+### What failed
+
+- First A/B: 0 flips, endless `GCM control spin`. Not a bug: the script
+  left out `PS3RECOMP_METAL_HEADLESS=1`. Mac runs from a shell need it
+  (and `PAD_FILE`), as the M5 entry says.
+
+### Next
+
+- User: accept the PLA. Then M9 on the iPad: memory headroom, the 4 GB
+  reserve, MetalFX, lean on vs off, controller and touch.
+
+---
+
+## 2026-11-07 — M8: iOS Simulator
+
+### Result
+
+- **M8 done.** The app runs in the iPhone 18 Pro Simulator (iOS 27.2):
+  - Title screen at 2622x1206, letterboxed to 16:9, French text.
+  - `PAD_SCRIPT` START → blast cutscene → gameplay tutorial (~200 s)
+    → START = pause menu → DOWN moves the cursor. 330 s, no crash.
+  - About 28 flips/s in the Simulator (not real device speed).
+- **Lifecycle:** going to the background parks the frame clock and drains
+  the GPU (`[ios] background: frame clock parked after 755 ms, GPU idle`).
+  Back in front it resumes and keeps rendering.
+- **Touch pad** draws over the game (all 16 buttons, two sticks). Shown when
+  no gamepad is connected (`TOUCH_PAD=1` forces it). The Simulator reports
+  one gamepad, so by default it hides itself there.
+  Not yet checked with real taps.
+- Device build (`iphoneos`) compiles, links and signs (wildcard profile,
+  no extra entitlements). The same app is for iPad and iPhone (family 1,2).
+
+### What changed
+
+- iOS deps built from source, static arm64, for both SDKs:
+  `$WORK_DIR/deps/<sdk>` (SDL3, glslang, SPIRV-Tools, SPIRV-Cross) by
+  `$WORK_DIR/tools/build_ios_deps.sh`.
+- `$WORK_DIR/tools/ios_configure.sh [iphonesimulator|iphoneos] [cmake args]`
+  → Xcode project in `build-ios-sim` or `build-ios`.
+  Re-run it when a source file is added (ZERO_CHECK misses new files).
+- `$WORK_DIR/tools/ios_sim_run.sh <secs> <tag> [VAR=val ...]`: installs,
+  launches with the host game path, screenshots every 10 s.
+- Toolkit (commits on `apple-port`):
+  - `vm_region_64` on iOS (no `mach_vm_region` in the iOS SDK).
+  - SDL3 audio and pad backends (iOS has no SDL2).
+  - CMake iOS branch (UIKit, SDL3, host tools skipped).
+  - Metal: app-owned `CAMetalLayer`, 16:9 letterbox, `wait_idle`.
+  - Metal: **BC1–3 CPU decode** when the GPU can't sample BC. The Simulator
+    GPU can't (`MTLPixelFormatBC3` invalid → crash). It asks the GPU at
+    run time (`supportsBCTextureCompression`), so it stays off where BC works.
+    `PS3RECOMP_METAL_BC_DECODE=0/1` forces it.
+  - Metal: **MetalFX** spatial upscaling of the letterboxed image
+    (perceptual, at most 2x per axis). Like Windows `UPSCALER`:
+    `METALFX=1/0` wins, else `UPSCALER=off` turns it off, else on for iOS,
+    off for macOS. The Simulator SDK has no MetalFX, so it is compiled out
+    there. **Not yet run on hardware.**
+- Game layer:
+  - `ios/ios_shell.mm`: SDL3 owns the UIKit main thread, game main on a
+    64 MB thread, lifecycle, `[ios-mem]` log every 5 s, logs to
+    Documents/play.err.log on device.
+  - `ios/touch_pad.mm`: on-screen controller.
+  - Bundle has `launch.env` (from `[launch] env`), never game data.
+    Device: game goes in Documents/BCES00220 (`UIFileSharingEnabled`).
+  - `PORT_IOS_ENTITLEMENTS` (default ON): extended-virtual-addressing and
+    increased-memory-limit. OFF = wildcard profile (works without the PLA).
+
+### What failed
+
+- iPad install: `0xe8008012 This provisioning profile cannot be installed
+  on this device`. The wildcard profile only lists the iPhone. The iPad is
+  already registered with the team (other profiles have it), but Xcode
+  can't refresh the profile: `PLA Update available`. Blocked on the user.
+- `os_proc_available_memory()` is 0 in the Simulator (no limit there).
+- Lifecycle events arrive twice (SDL event watch). Harmless.
+
+### Next
+
+- User: accept the PLA. Then M9 on the iPad (check it is free first):
+  memory headroom, whether the 4 GB reserve works, MetalFX, controller
+  and touch.
+- M10: iPhone Simulator runs (done for M8 on iPhone 18 Pro; add iPhone 17).
 
 ---
 
