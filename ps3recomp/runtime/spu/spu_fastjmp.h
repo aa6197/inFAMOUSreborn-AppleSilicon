@@ -33,11 +33,23 @@ typedef struct spu_fjbuf { uint64_t q[32]; } spu_fjbuf;   /* 256 bytes (= MSVC x
 #elif defined(__clang__) && defined(__x86_64__) && defined(SPU_FASTJMP_TEST_MSABI)
 #  define SPU_HAVE_FASTJMP 1
 #  define SPU_FJ_ABI __attribute__((ms_abi))
+#elif defined(__APPLE__)
+/* Apple: libc setjmp/longjmp save and restore the signal mask -- a sigprocmask syscall on every set and
+ * every jump, plus sigaltstack + sigreturn on the jump (M7 profile: ~35% of the SPURS kernel thread).
+ * _setjmp/_longjmp are the same register pair without the mask. Nothing on these paths changes the
+ * signal mask, so behaviour is unchanged. Macros, not functions: the set must run in the caller's frame. */
+#  define SPU_HAVE_FASTJMP 1
+#  define SPU_FASTJMP_LIBC 1
 #else
 #  define SPU_HAVE_FASTJMP 0
 #endif
 
-#if SPU_HAVE_FASTJMP
+#if SPU_HAVE_FASTJMP && defined(SPU_FASTJMP_LIBC)
+#include <setjmp.h>
+typedef char spu_fj_jmpbuf_fits[(sizeof(jmp_buf) <= sizeof(spu_fjbuf)) ? 1 : -1];
+#define spu_fj_set(b)     _setjmp(*(jmp_buf*)(void*)(b)->q)
+#define spu_fj_jump(b, v) _longjmp(*(jmp_buf*)(void*)(b)->q, (v))
+#elif SPU_HAVE_FASTJMP
 #ifdef __cplusplus
 extern "C" {
 #endif
