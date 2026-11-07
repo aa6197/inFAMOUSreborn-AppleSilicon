@@ -2043,7 +2043,7 @@ static void release_surfaces(void)
 
 #define ENG_MAX_OBJECTS  4096
 #define ENG_MAX_PIPES    4096
-#define ENG_MAX_RECORDS  8192
+#define ENG_MAX_RECORDS  32768
 #define ENG_MAX_VIEWS    256
 #define ENG_MAX_FUNCS    4096
 #define ENG_MAX_SAMPLERS 256
@@ -2225,6 +2225,21 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 /* ---- staging ------------------------------------------------------------- */
 
 static void eng_encode_and_commit(id<MTLTexture> present_dst);
+
+/* Room for one more record. A full stream is submitted (and waited on) rather
+ * than dropping the rest of the frame, as eng_stage_reserve does for the
+ * staging arena: a city frame in gameplay records more than any fixed cap,
+ * and every record dropped was a draw missing from it. Call it before
+ * staging anything for the record, since a submit recycles the arena. */
+static int eng_rec_room(void)
+{
+    if (s_eng_rec_count < ENG_MAX_RECORDS) return 1;
+    { static int n = 0; if ((n < 4 && n++ < 4))
+        fprintf(stderr, "[rsx engine/metal] record stream full (%d): submitting mid-frame\n",
+                ENG_MAX_RECORDS); }
+    eng_encode_and_commit(nil);
+    return s_eng_rec_count < ENG_MAX_RECORDS;
+}
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
@@ -2419,7 +2434,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     (void)user;
     if (!eng_obj(depth) || !s_eng_helper_lib) return 0;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
+    if (!eng_rec_room()) { s_eng_dropped++; return 0; }
     if (!s_eng_depth_pso) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -2715,7 +2730,7 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
 {
     (void)user;
     if (!vertex_count || !stride) return;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (!eng_rec_room()) { s_eng_dropped++; return; }
     u32 vb_off = 0, ib_off = 0;
     if (!eng_stage_copy(vertices, vertex_count * stride, &vb_off)) return;
     if (indices && index_count &&
@@ -2742,7 +2757,7 @@ static void eng_clear_color(void* user, u32 surface, const float rgba[4])
                    ((u32)(rgba[0] * 255.0f + 0.5f) << 16) |
                    ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
                     (u32)(rgba[2] * 255.0f + 0.5f);
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (!eng_rec_room()) { s_eng_dropped++; return; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind  = ENG_REC_CLEAR_COLOR;
@@ -2755,7 +2770,7 @@ static void eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                     float depth_value, u8 stencil)
 {
     (void)user;
-    if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return; }
+    if (!eng_rec_room()) { s_eng_dropped++; return; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
     r->kind = ENG_REC_CLEAR_DS;
