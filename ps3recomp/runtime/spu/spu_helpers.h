@@ -64,8 +64,15 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
  * lifted job modules' quadword ops (every unaligned scalar load), and cwd/cbd
  * (every scalar store) rebuilt a 16-byte control in a loop. Bit-exact vs the
  * reference for every shift / position (exhaustive test). */
-#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__)
+#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__) || (defined(__aarch64__) && defined(__ARM_NEON))
+#if defined(__aarch64__) && !defined(__SSSE3__)
+/* Apple/arm64: the same control tables through NEON tbl. Every table byte is 0x00-0x0F or 0x80, and
+ * tbl returns 0 for an out-of-range index exactly where pshufb zeroes a bit-7 lane. */
+#include <arm_neon.h>
+#define SPU__NEON 1
+#else
 #include <tmmintrin.h>
+#endif
 #define SPU__SIMD 1
 #if defined(_MSC_VER) && !defined(__clang__)
 #define SPU__ALIGN16 __declspec(align(16))
@@ -198,11 +205,19 @@ static const SPU__ALIGN16 uint8_t spu__t_cdd[16][16] = {
     {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04},
     {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04},
 };
+#if defined(SPU__NEON)
+static inline u128 spu__pshufb(u128 a, const uint8_t* ctl) {
+    uint8x16_t A; memcpy(&A, &a, 16);
+    uint8x16_t r = vqtbl1q_u8(A, vld1q_u8(ctl));
+    u128 o; memcpy(&o, &r, 16); return o;
+}
+#else
 static inline u128 spu__pshufb(u128 a, const uint8_t* ctl) {
     __m128i A; memcpy(&A, &a, 16);
     __m128i r = _mm_shuffle_epi8(A, _mm_load_si128((const __m128i*)ctl));
     u128 o; memcpy(&o, &r, 16); return o;
 }
+#endif
 static inline u128 spu__ldtbl(const uint8_t* t) { u128 o; memcpy(&o, t, 16); return o; }
 #else
 #define SPU__SIMD 0
@@ -305,7 +320,10 @@ static inline u128 spu_xori(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r
 /* ---- count leading zeros / population count per byte ---- */
 static inline u128 spu_clz(u128 a)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)spu_clz32(a._u32[i]); return r; }
 static inline u128 spu_cntb_ref(u128 a) { u128 r; for(int i=0;i<16;i++){ uint8_t v=a._u8[i],c=0; while(v){c+=v&1;v>>=1;} r._u8[i]=c; } return r; }
-#if SPU__SIMD
+#if SPU__SIMD && defined(SPU__NEON)
+static inline u128 spu_cntb(u128 a){ uint8x16_t A; memcpy(&A,&a,16);
+    uint8x16_t r=vcntq_u8(A); u128 o; memcpy(&o,&r,16); return o; }
+#elif SPU__SIMD
 static inline u128 spu_cntb(u128 a){ __m128i A; memcpy(&A,&a,16);
     const __m128i lut=_mm_setr_epi8(0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4), m=_mm_set1_epi8(0x0F);
     __m128i r=_mm_add_epi8(_mm_shuffle_epi8(lut,_mm_and_si128(A,m)), _mm_shuffle_epi8(lut,_mm_and_si128(_mm_srli_epi16(A,4),m)));
@@ -359,6 +377,45 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, i), _mm_shuffle_epi8(B, i), _mm_slli_epi16(C, 3));
     const __m128i lut = _mm_setr_epi8(0,0,0,0, 0,0,0,0, 0,0,0,0, (char)0xFF,(char)0xFF,(char)0x80,(char)0x80);
     r = _mm_or_si128(r, _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F))));
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
+static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+     * control, and the result) through SPU_W so a control supplied as an immediate
+     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+     * SPU-byte-order selectors to match. */
+    uint8_t cat[32];
+    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+    u128 r;
+    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+        uint8_t v;
+        if      ((s & 0xE0)==0xE0) v=0x80;
+        else if ((s & 0xC0)==0xC0) v=0xFF;
+        else if ((s & 0xC0)==0x80) v=0x00;
+        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+        r._u8[SPU_W(t)] = v;
+    }
+    return r;
+}
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+/* NEON version of the v131 shufb above. Host result byte h is decided by control host byte h, and SPU
+ * byte j of a register is host byte j^3, so idx = (c ^ 3) & 0x9F: bits 0-3 index a/b after ^3, bit 4
+ * picks b (tbl2 indexes the 32-byte {a,b} pair), bit 7 kept so every special selector (0x80-0xFF) is
+ * out of range and reads 0. The high-nibble LUT then ORs in 0x00 / 0xFF / 0x80. Same result as
+ * spu_shufb_ref for every control byte (tests/test_spu_shufb.c). */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    uint8x16x2_t t; uint8x16_t C;
+    memcpy(&t.val[0], &a, 16); memcpy(&t.val[1], &b, 16); memcpy(&C, &c, 16);
+    const uint8x16_t idx = vandq_u8(veorq_u8(C, vdupq_n_u8(0x03)), vdupq_n_u8(0x9F));
+    uint8x16_t r = vqtbl2q_u8(t, idx);
+    static const uint8_t lutb[16] = {0,0,0,0, 0,0,0,0, 0,0,0,0, 0xFF,0xFF,0x80,0x80};
+    r = vorrq_u8(r, vqtbl1q_u8(vld1q_u8(lutb), vshrq_n_u8(C, 4)));
     u128 out; memcpy(&out, &r, 16); return out;
 }
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
