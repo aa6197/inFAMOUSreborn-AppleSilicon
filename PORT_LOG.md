@@ -70,7 +70,9 @@ Read the colour columns and the pictures, not RMSE alone.
 - RPCS3 config: fullscreen off, "Show capture hints" off (older shots have a
   "Screenshot saved" box top-left; mask `0,0 560,56`).
 - The port ignores SIGINT and SIGTERM; stop it with KILL.
-- Disk: 94% full (58 GB free). `$WORK_DIR/runs` is about 6 GB of frame dumps.
+- Disk: was 94% full. Deleted all `frames/*.ppm` dumps in `$WORK_DIR/runs`
+  (7.6 GB); logs and `keep/` PNGs stay. Now 64 GB free, runs = 168 MB.
+  Delete a run's `frames/` once its key frames are in `keep/`.
 
 ---
 
