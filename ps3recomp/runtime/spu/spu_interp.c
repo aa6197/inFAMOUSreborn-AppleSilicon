@@ -6,7 +6,11 @@
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
 #include "../../libs/video/rsx_getenv_cache.h"   /* cached getenv(): SPU hot paths called getenv per PM run (2026-10-04) */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "../../include/ps3emu/host_simd.h"   /* _mm_getcsr/_mm_setcsr -> FPCR, __rdtsc (sse2neon) */
+#else
 #include <xmmintrin.h>
+#endif
 #include "spu_interp.h"
 #include "spu_helpers.h"
 /* v98f: the whole-register SSE/AVX2 forms of the integer helpers (v95, tested bit-identical to
@@ -570,7 +574,7 @@ static uint32_t spu_interp_run_until_fast(spu_context* ctx, uint32_t start_lsa, 
 }
 
 static uint64_t spu_diff_now(void) {
-#if defined(_MSC_VER) && !defined(__clang__)
+#if (defined(_MSC_VER) && !defined(__clang__)) || defined(__aarch64__) || defined(_M_ARM64)
     return __rdtsc();
 #else
     return __builtin_ia32_rdtsc();

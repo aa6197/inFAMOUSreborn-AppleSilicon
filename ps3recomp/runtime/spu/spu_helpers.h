@@ -571,7 +571,11 @@ static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b)
 /* SPU DP is IEEE round-to-nearest with denormals; SPU SP runs with MXCSR =
  * truncate + FTZ/DAZ (SPU_FLOAT_MODE). Switch per DP op HERE so lifted code and
  * the interpreter agree (2026-10-04: lifted WWS jobs call these directly). */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "../../include/ps3emu/host_simd.h"   /* _mm_getcsr/_mm_setcsr -> FPCR (sse2neon) */
+#else
 #include <xmmintrin.h>
+#endif
 #define SPU__DP_BEGIN { unsigned _spu_dpc = _mm_getcsr(); _mm_setcsr(_spu_dpc & ~0xE040u);
 #define SPU__DP_END   _mm_setcsr(_spu_dpc); }
 static inline double spu__dget(u128 r, int i) {

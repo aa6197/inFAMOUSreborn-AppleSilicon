@@ -6,11 +6,7 @@
 #ifndef PS3EMU_HZ_STATS_H
 #define PS3EMU_HZ_STATS_H
 #include <stdint.h>
-#if defined(_MSC_VER) || defined(_WIN32)
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
+#include "host_simd.h"   /* __rdtsc: x86 intrinsics, or the arm64 generic timer */
 #ifdef __cplusplus
 extern "C" {
 #endif

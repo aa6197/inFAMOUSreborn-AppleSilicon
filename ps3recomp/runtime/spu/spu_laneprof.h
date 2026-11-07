@@ -11,11 +11,7 @@
 #ifndef SPU_LANEPROF_H
 #define SPU_LANEPROF_H
 #include <stdint.h>
-#if defined(_MSC_VER)
-#  include <intrin.h>
-#else
-#  include <x86intrin.h>
-#endif
+#include "../../include/ps3emu/host_simd.h"   /* __rdtsc: x86 intrinsics, or the arm64 generic timer */
 
 enum { LP_DMA = 0, LP_ATOM, LP_RDCH, LP_WRCH, LP_INTERP, LP_BACKOFF, LP_HALT, LP_NCAT };
 

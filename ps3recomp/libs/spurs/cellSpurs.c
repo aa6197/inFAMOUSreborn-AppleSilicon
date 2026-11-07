@@ -2304,11 +2304,7 @@ static inline void v242a_twsig(u32 wid)   /* v242A V242A_TWSIG: mid-quantum wake
 /* v96a [LANEPROF] lane-pool timing (spurs_policy.c prints it): [wid] = {wake ticks, wakes, join-wait ticks, joins} */
 extern volatile long long g_lp_pool[16][4];
 extern int spu_laneprof_on(void);
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <x86intrin.h>
-#endif
+#include "../../include/ps3emu/host_simd.h"   /* __rdtsc, _mm_pause (sse2neon on arm64) */
 #ifndef _WIN32
 #include <unistd.h>   /* sysconf (v96a) */
 #endif

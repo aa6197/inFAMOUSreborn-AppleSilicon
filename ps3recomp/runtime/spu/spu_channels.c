@@ -29,7 +29,11 @@
 #ifndef _WIN32
 #include <pthread.h>
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "../../include/ps3emu/host_simd.h"   /* _mm_getcsr/_mm_setcsr -> FPCR (sse2neon) */
+#else
 #include <xmmintrin.h>
+#endif
 #ifndef SPU_PM_TLS
 #ifdef _MSC_VER
 #define SPU_PM_TLS __declspec(thread)
