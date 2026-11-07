@@ -122,6 +122,9 @@ int rsx_fp_decompile_buffered_ex(
  * success or -1 for an unterminated/truncated/oversized program. */
 int rsx_fp_collect_constants(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
+/* Same result, but only count and values[0..count) are written. */
+int rsx_fp_collect_constants_lean(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
 
 /* Canonical structural fragment-program hash. Instruction bytes and their
  * order are hashed; inline CONST payload bytes are skipped. Returns zero for

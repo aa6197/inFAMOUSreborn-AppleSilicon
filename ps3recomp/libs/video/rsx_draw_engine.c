@@ -1461,8 +1461,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     const u32 dbt = (!fixed && g.dbt) ? 1u : 0u;
 
-    memset(&g.fp_constants, 0, sizeof g.fp_constants);
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    /* Every reader stops at count, so only count is reset (the block is
+     * 32 KB, and clearing it twice a draw was ~6% of this thread). */
+    g.fp_constants.count = 0;
+    if (!fixed && rsx_fp_collect_constants_lean(fp_uc, fp_size, &g.fp_constants) < 0)
         return 0;
 
     /* Identity: the vertex program's own bytes, the fragment program's

@@ -210,6 +210,41 @@ int rsx_fp_collect_constants(
     return -1;
 }
 
+/* rsx_fp_collect_constants without clearing the whole 32 KB block first:
+ * only count and values[0..count) are written, and the rest is left as it
+ * was. For callers that read nothing past count (the Metal draw engine
+ * zeroed the block twice per draw, ~6% of its FIFO thread). */
+int rsx_fp_collect_constants_lean(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
+{
+    if (!ucode || !out)
+        return -1;
+    out->count = 0;
+
+    u32 off = 0;
+    while (off + 16 <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        if (fp_instruction_has_constant(w1, w2, w3)) {
+            if (off + 16 > max_bytes ||
+                out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
+                return -1;
+            for (u32 component = 0; component < 4; ++component)
+                out->values[out->count][component] =
+                    rsx_fp_sanitize_constant_word(
+                        rsx_fp_read_word(ucode + off + component * 4));
+            out->count++;
+            off += 16;
+        }
+        if (w0 & FP_END)
+            return (int)out->count;
+    }
+    return -1;
+}
+
 static u64 fp_hash_bytes(const void* data, u32 size, u64 hash)
 {
     const u8* bytes = (const u8*)data;
