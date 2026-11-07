@@ -4,13 +4,63 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M0 done**. Next: **M1** (installer on Mac).
-- Game: ISO on an external drive (path in the local notes). Must be plugged in.
+- Milestone: **M1 done**. Next: **M2** (link `inFamousRecomp` for arm64).
+- Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
+  The ISO on an external drive is only needed to re-extract.
   - BCES00220, inFamous, Europe. PARAM.SFO VERSION 01.01, APP_VER 01.00.
-  - Decrypted image: data in the "encrypted" regions is in the clear
-    (EBOOT.BIN reads `SCE\0`). The installer's detect_encryption handles this. No .dkey.
-  - EBOOT.BIN is a retail SELF, so M1 needs RPCS3 to decrypt it to EBOOT.elf.
-    Then check its sha256 against `eboot_sha256` in installer/infamous.toml.
+  - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
+- Generated sources are in place in the repo (git-ignored). Don't regenerate
+  unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M1: generate on Mac
+
+### Result
+
+M1 check passes.
+
+| Check | Result |
+|---|---|
+| `EBOOT.elf` sha256 vs `eboot_sha256` | match |
+| `install --no-build --regen -y` | exit 0, all 19 steps ran |
+| Hash check vs `generated.lock` | 156 / 156 files at the final hash |
+| Patches | 51 patched, 105 already right, 0 created, 0 removed |
+
+Logs: `$WORK_DIR/runs/m1-install-20261107-123619/`, `$WORK_DIR/logs/m1-*.log`.
+
+### Setup found on the way
+
+- **Python:** `/usr/bin/python3` is 3.9. `doctor` flags it. Pass
+  `--python /opt/homebrew/bin/python3.12`.
+- **ISO:** `infamous-installer extract-iso` worked as is.
+- **RPCS3:** Homebrew has no cask. Used the official build
+  (v0.0.43-20570, github.com/RPCS3/rpcs3-binaries-mac-arm64), digest checked,
+  unpacked into `$WORK_DIR/tools/rpcs3`. Only used for `--decrypt`.
+  `RPCS3_CONFIG_DIR` / `RPCS3_CACHE_DIR` keep it out of ~/Library.
+
+### What changed
+
+- **installer `apply_lock`: line endings.** The lock was made on Windows.
+  Python text mode writes CRLF there and LF on macOS, so 33 generated files
+  "differed" on Mac. Now: if a file's hash doesn't match the patch base, try
+  the CRLF and LF versions; if one hashes to the base exactly, write that and
+  go on. Hash-checked, so nothing else can slip through.
+  Windows: its files already match the base, so this path never runs there.
+
+### Open items
+
+- **Optional step `kbm-icons-build` fails.** `tools/make_kbm_icons.py` reads
+  `infamous-recomp/_xfer/bak_v189/font_icons_l0.bin`, a dev-only file that is
+  not in the repo. A fresh Windows checkout fails the same way. The step is
+  optional, so the keyboard/mouse icon set just stays off. Not a port issue.
+- **Lock not re-made.** `generated.lock` still holds the Windows (CRLF) base
+  hashes. That's fine with the fix above. Don't re-lock on Mac.
+
+### Next step
+
+- M2: configure `infamous-recomp` with CMake + Ninja for arm64, x86-only
+  options off, and get `inFamousRecomp` to link.
 
 ---
 
