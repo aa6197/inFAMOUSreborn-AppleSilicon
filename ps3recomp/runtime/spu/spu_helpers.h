@@ -463,8 +463,14 @@ static inline u128 spu_xfv(u128 a) { if (g_spu_xfloat) for (int i = 0; i < 4; i+
  * loop (+ a branchy per-lane xfloat clamp). Bit-identical: same IEEE ops, same MXCSR, the
  * xfloat clamp is the same mask/blend; fma/fms/fnms use vfmadd/vfmsub/vfnmadd (single
  * rounding, exactly fmaf) when the TU has FMA (lifted SPU sources: -mfma), else fmaf. */
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__SSE2__)
+/* arm64: the same SSE2 ops through sse2neon (IEEE-exact add/sub/mul/compare). No __FMA__ / __SSE4_1__ here, so
+ * fma/fms/fnms take the fmaf path and spu__xfq the SSE2 mask/blend form below -- both bit-identical by design. */
+#include "../../include/ps3emu/host_simd.h"
+#else
 #include <emmintrin.h>
+#endif
 #if defined(__FMA__)
 #include <immintrin.h>
 #endif

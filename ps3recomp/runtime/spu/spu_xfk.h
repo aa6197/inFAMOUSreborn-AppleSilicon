@@ -12,7 +12,19 @@
 #define spu_fa_k(a, b, m)      spu__fst(_mm_add_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b))))
 #define spu_fs_k(a, b, m)      spu__fst(_mm_sub_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b))))
 #define spu_fm_k(a, b, m)      spu__fst(_mm_mul_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b))))
+#if defined(__aarch64__)
+/* arm64: sse2neon has no FMA intrinsics (and infamous-recomp's PORT_CPU_COMPAT copy step keys on the x86 FMA macro
+ * name, so it is not spelt in this file). NEON's fused multiply-add rounds once and honours FPCR (rounding, FZ),
+ * exactly like vfmadd/vfmsub/vfnmadd: fma = a*b+c, fms = a*b-c, fnms = c-a*b (signed zeros included). */
+static inline __m128 spu__xfk_fmadd (__m128 a, __m128 b, __m128 c) { return vfmaq_f32(c, a, b); }
+static inline __m128 spu__xfk_fmsub (__m128 a, __m128 b, __m128 c) { return vfmaq_f32(vnegq_f32(c), a, b); }
+static inline __m128 spu__xfk_fnmadd(__m128 a, __m128 b, __m128 c) { return vfmsq_f32(c, a, b); }
+#define spu_fma_k(a, b, c, m)  spu__fst(spu__xfk_fmadd (SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#define spu_fms_k(a, b, c, m)  spu__fst(spu__xfk_fmsub (SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#define spu_fnms_k(a, b, c, m) spu__fst(spu__xfk_fnmadd(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#else
 #define spu_fma_k(a, b, c, m)  spu__fst(_mm_fmadd_ps (SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
 #define spu_fms_k(a, b, c, m)  spu__fst(_mm_fmsub_ps (SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
 #define spu_fnms_k(a, b, c, m) spu__fst(_mm_fnmadd_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#endif
 #endif
