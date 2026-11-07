@@ -143,7 +143,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (!c) return (int32_t)CELL_ESRCH;
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
     if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
-    if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+    if (LV2_PEEK(m->owner_tid) != ctx->thread_id || LV2_PEEK(m->lock_count) <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
     struct sys_cond_waiter waiter = {NULL, 0};
@@ -151,8 +151,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     while (*tail) tail = &(*tail)->next;
     *tail = &waiter;
     int depth = m->lock_count;
-    m->owner_tid = 0;
-    m->lock_count = 0;
+    LV2_POKE(m->owner_tid, 0);
+    LV2_POKE(m->lock_count, 0);
     for (int i = 0; i < depth; ++i) guest_unlock(m);
 
     int32_t result = CELL_OK;
@@ -196,8 +196,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     *link = waiter.next;
     cond_unlock(c);
     for (int i = 0; i < depth; ++i) guest_lock(m);
-    m->owner_tid = ctx->thread_id;
-    m->lock_count = depth;
+    LV2_POKE(m->owner_tid, ctx->thread_id);
+    LV2_POKE(m->lock_count, depth);
     return result;
 }
 

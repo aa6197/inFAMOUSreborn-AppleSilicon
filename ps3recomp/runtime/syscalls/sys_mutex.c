@@ -191,7 +191,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     uint64_t caller_tid = ctx->thread_id;
 
     /* Check for deadlock on non-recursive mutex */
-    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+    if (!m->recursive && LV2_PEEK(m->owner_tid) == caller_tid && LV2_PEEK(m->lock_count) > 0) {
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
@@ -235,8 +235,8 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     }
 #endif
 
-    m->owner_tid = caller_tid;
-    m->lock_count++;
+    LV2_POKE(m->owner_tid, caller_tid);
+    LV2_POKE(m->lock_count, m->lock_count + 1);
     return CELL_OK;
 }
 
@@ -267,7 +267,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
      * the CS and causes random forever-blocks on later Enters).
      * EnterCriticalSection by the current owner is itself recursive and
      * never blocks, so this is safe and cheap. */
-    if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+    if (m->recursive && LV2_PEEK(m->owner_tid) == caller_tid && LV2_PEEK(m->lock_count) > 0) {
 #ifdef _WIN32
         EnterCriticalSection(&m->cs);
 #else
@@ -281,7 +281,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
          * while the guest still believed it held the mutex. */
         pthread_mutex_lock(&m->mtx);
 #endif
-        m->lock_count++;
+        LV2_POKE(m->lock_count, m->lock_count + 1);
         return CELL_OK;
     }
 
@@ -296,8 +296,8 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
     }
 #endif
 
-    m->owner_tid = caller_tid;
-    m->lock_count++;
+    LV2_POKE(m->owner_tid, caller_tid);
+    LV2_POKE(m->lock_count, m->lock_count + 1);
     return CELL_OK;
 }
 
@@ -319,7 +319,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    if (m->owner_tid != caller_tid) {
+    if (LV2_PEEK(m->owner_tid) != caller_tid) {
         /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
          * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
          * "if (it.owner != cpu.id) return CELL_EPERM;"), not a made up
@@ -328,9 +328,9 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EPERM;
     }
 
-    m->lock_count--;
+    LV2_POKE(m->lock_count, m->lock_count - 1);
     if (m->lock_count == 0) {
-        m->owner_tid = 0;
+        LV2_POKE(m->owner_tid, 0);
     }
 
 #ifdef _WIN32

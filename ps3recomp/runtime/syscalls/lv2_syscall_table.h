@@ -323,6 +323,27 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
 #define LV2_ARG_S64(ctx, n)  ((int64_t)(ctx)->gpr[3 + (n)])
 #define LV2_ARG_PTR(ctx, n)  ((uint32_t)(ctx)->gpr[3 + (n)])  /* guest address */
 
+/* ---------------------------------------------------------------------------
+ * Lock-free peeks at sync-object state
+ *
+ * Some handlers read a field without its lock as a fast-path hint (mutex
+ * owner pre-checks, "queue empty?" before a wait) or bump a log counter.
+ * The field's writers hold the lock; the peek does not. Off Windows those
+ * plain accesses are C data races (ThreadSanitizer flags them, and a weakly
+ * ordered CPU is allowed to tear or cache them), so they become relaxed
+ * atomics there. On arm64 a relaxed load/store is the same single ldr/str.
+ * Windows keeps the plain access, so its build is unchanged.
+ * -----------------------------------------------------------------------*/
+#if defined(_WIN32)
+#define LV2_PEEK(x)        (x)
+#define LV2_POKE(x, v)     ((x) = (v))
+#define LV2_BUMP(x)        ((x)++)
+#else
+#define LV2_PEEK(x)        __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define LV2_POKE(x, v)     __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
+#define LV2_BUMP(x)        __atomic_fetch_add(&(x), 1, __ATOMIC_RELAXED)
+#endif
+
 /* Convenience: register a syscall handler with a cleaner syntax */
 #define LV2_REGISTER_SYSCALL(num, func) \
     lv2_syscall_register(&g_lv2_syscalls, (num), (lv2_syscall_fn)(func))

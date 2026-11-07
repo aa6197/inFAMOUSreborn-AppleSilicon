@@ -503,12 +503,11 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
-    { static int _n=0; if (getenv("SEMTID") && _n < 60000)
+    { static int _n=0; int n_ = LV2_BUMP(_n); if (getenv("SEMTID") && n_ < 60000)
         fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
                 (unsigned long long)ctx->thread_id, sem_id, count);
-      else if (!getenv("SEMTID") && _n < 40)
-        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
-      _n++; }
+      else if (!getenv("SEMTID") && n_ < 40)
+        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count); }
     /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
      * loading thread starves on) -- reveals which thread/loop produces it. */
     if (getenv("SEMCHAIN") && sem_id == 3) {

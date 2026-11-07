@@ -403,7 +403,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * then reaches CreateTaskset and the running policy dispatches the cri task.
      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
     if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
-            && timeout_us == 0 && q->count == 0) {
+            && timeout_us == 0 && LV2_PEEK(q->count) == 0) {
         static int s_fire[8] = {0};
         if (s_fire[queue_id] < 64) {
             s_fire[queue_id]++;
@@ -428,7 +428,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * main thread times out after 30s and the title tears down. Synthesize a
      * completion so the wait returns -> see whether the game then advances to
      * asset load + menu draw (content). Returns immediately with a zero event. */
-    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && LV2_PEEK(q->count) == 0) {
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
@@ -438,7 +438,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
-    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && LV2_PEEK(q->count) == 0) {
         static int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
@@ -479,7 +479,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * ponytail: one attempt per receive, then fall through to the normal wait --
      * no retry loop, so a worker that genuinely produces nothing still blocks
      * rather than spinning. */
-    if (q->count == 0 && timeout_us == 0) {
+    if (LV2_PEEK(q->count) == 0 && timeout_us == 0) {
         extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
         spu_dispatch_frame_by_queue(queue_id, 0);
     }
@@ -530,7 +530,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
-    q->count--;
+    LV2_POKE(q->count, q->count - 1);
 
     LeaveCriticalSection(&q->lock);
 #else
@@ -569,7 +569,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
-    q->count--;
+    LV2_POKE(q->count, q->count - 1);
 
     pthread_mutex_unlock(&q->lock);
 #endif
@@ -617,7 +617,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                     queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
                     (unsigned long long)evt.data1, (unsigned long long)evt.data2,
-                    (unsigned long long)evt.data3, q->count);
+                    (unsigned long long)evt.data3, LV2_PEEK(q->count));
     } }
 
     return CELL_OK;
@@ -650,7 +650,7 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
     while (received < max_count && q->count > 0) {
         sys_event_t evt = q->buffer[q->head];
         q->head = (q->head + 1) % q->capacity;
-        q->count--;
+        LV2_POKE(q->count, q->count - 1);
 
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr + (uint32_t)(received * 32));
@@ -690,13 +690,13 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
     EnterCriticalSection(&q->lock);
     q->head = 0;
     q->tail = 0;
-    q->count = 0;
+    LV2_POKE(q->count, 0);
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
     q->head = 0;
     q->tail = 0;
-    q->count = 0;
+    LV2_POKE(q->count, 0);
     pthread_mutex_unlock(&q->lock);
 #endif
 
@@ -721,12 +721,14 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
      * producer). Those need opposite fixes, and nothing else distinguishes
      * them. */
     { static int s_es = -1;
-      if (s_es < 0) { const char* e = getenv("PS3_EVQSTAT");
-                      s_es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
-      if (s_es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
+      int es = LV2_PEEK(s_es);
+      if (es < 0) { const char* e = getenv("PS3_EVQSTAT");
+                    es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0;
+                    LV2_POKE(s_es, es); }
+      if (es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
           const unsigned qi = (unsigned)(q - g_sys_event_queues) + 1u;
           if (qi <= SYS_EVENT_QUEUE_MAX) np[qi]++;
-          if ((++n % (unsigned long long)s_es) == 0) {
+          if ((++n % (unsigned long long)es) == 0) {
               fprintf(stderr, "[evqstat] %llu pushes;", n);
               for (unsigned k = 1; k <= SYS_EVENT_QUEUE_MAX; k++)
                   if (np[k] || g_sys_event_queues[k - 1].count)
@@ -751,7 +753,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
-    q->count++;
+    LV2_POKE(q->count, q->count + 1);
 
 #ifdef _WIN32
     WakeConditionVariable(&q->not_empty);
@@ -784,7 +786,7 @@ int sys_event_queue_receive_host(uint32_t queue_id, sys_event_t* out, uint32_t t
     if (q->count == 0 || !q->active) { LeaveCriticalSection(&q->lock); return -1; }
     *out = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
-    q->count--;
+    LV2_POKE(q->count, q->count - 1);
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
@@ -806,7 +808,7 @@ int sys_event_queue_receive_host(uint32_t queue_id, sys_event_t* out, uint32_t t
     if (q->count == 0 || !q->active) { pthread_mutex_unlock(&q->lock); return -1; }
     *out = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
-    q->count--;
+    LV2_POKE(q->count, q->count - 1);
     pthread_mutex_unlock(&q->lock);
 #endif
     return 0;
