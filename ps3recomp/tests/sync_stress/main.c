@@ -208,7 +208,11 @@ static void fail(const char* test, const char* fmt, ...)
     fflush(stderr);
 }
 
-static ULONGLONG now_ms(void) { return GetTickCount64(); }
+/* Milliseconds since the test started (never 0). The watchdogs keep these in
+ * 32-bit LONGs, and raw GetTickCount64 (ms since boot) passes 2^31 after 24.8
+ * days of uptime, which wrapped the stored value and fired a false stall. */
+static ULONGLONG s_ms_base;
+static ULONGLONG now_ms(void) { return GetTickCount64() - s_ms_base; }
 
 /* =========================================================================
  * TEST 1 -- No lost wakeup
@@ -1431,6 +1435,7 @@ static int test5_rwlock_ownership(void)
  * ========================================================================= */
 int main(int argc, char** argv)
 {
+    s_ms_base = GetTickCount64() - 1;
     g_seed = 0;
     if (argc > 1) {
         g_seed = (uint32_t)strtoul(argv[1], NULL, 10);

@@ -55,3 +55,8 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  * never read back. */
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
+/* sys_event_port_send now hands the event over through these (spu_interp.c)
+ * instead of writing the globals above. Same story: never read back here. */
+void spu_interp_set_pending_event(uint32_t d1, uint32_t d2, uint32_t d3)
+{ g_spu_pending_evt[0] = d1; g_spu_pending_evt[1] = d2; g_spu_pending_evt[2] = d3; g_spu_pending_evt_valid = 1; }
+void spu_interp_clear_pending_event(void) { g_spu_pending_evt_valid = 0; }
