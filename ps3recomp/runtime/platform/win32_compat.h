@@ -744,6 +744,24 @@ static inline DWORD GetCurrentThreadId(void)
 static inline DWORD  GetCurrentProcessId(void) { return (DWORD)getpid(); }
 static inline HANDLE GetCurrentProcess(void)   { return (HANDLE)(intptr_t)-1; }   /* pseudo-handle */
 static inline HANDLE GetCurrentThread(void)    { return (HANDLE)(intptr_t)-2; }   /* pseudo-handle */
+/* TerminateProcess: only the current process is supported. Like Win32, no atexit handlers or destructors run. */
+static inline BOOL TerminateProcess(HANDLE process, UINT exit_code)
+{
+    if (process == GetCurrentProcess() || process == (HANDLE)(intptr_t)getpid())
+        _exit((int)exit_code);
+    errno = ESRCH;
+    return FALSE;
+}
+/* _putenv_s: an empty value removes the variable, as the MSVC CRT does. Returns 0 or an errno value.
+ * msvc_compat.h has one too; the shared guard lets a file include both. */
+#ifndef PS3RECOMP_HAVE_PUTENV_S
+#define PS3RECOMP_HAVE_PUTENV_S
+static inline int _putenv_s(const char* name, const char* value)
+{
+    int r = (value && *value) ? setenv(name, value, 1) : unsetenv(name);
+    return r == 0 ? 0 : errno;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Waitable handles: events, semaphores, threads, waitable timers

@@ -924,6 +924,7 @@ static void test_msvc_compat(void)
     char env[16];
     CHECK(GetEnvironmentVariableA("PS3_COMPAT_TEST", env, sizeof env) == 1 && strcmp(env, "1") == 0);
     CHECK(GetEnvironmentVariableA("PS3_COMPAT_TEST_MISSING", env, sizeof env) == 0);
+    CHECK(_putenv_s("PS3_COMPAT_TEST", "") == 0 && getenv("PS3_COMPAT_TEST") == NULL);   /* empty removes it, as on MSVC */
     time_t now = time(NULL); struct tm tmv;
     CHECK(localtime_s(&tmv, &now) == 0 && tmv.tm_year > 100);
     void* al = _aligned_malloc(100, 64);

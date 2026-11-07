@@ -198,8 +198,14 @@ static inline errno_t fopen_s(FILE** f, const char* name, const char* mode)
 #define _S_IFREG    S_IFREG
 
 /* --- CRT: environment and time --------------------------------------------- */
-static inline errno_t _putenv_s(const char* name, const char* value)
-{ return setenv(name, value ? value : "", 1) == 0 ? 0 : errno; }
+#ifndef PS3RECOMP_HAVE_PUTENV_S   /* win32_compat.h has one too: whichever comes first defines it */
+#define PS3RECOMP_HAVE_PUTENV_S
+static inline int _putenv_s(const char* name, const char* value)   /* empty value removes it, as the MSVC CRT does */
+{
+    int r = (value && *value) ? setenv(name, value, 1) : unsetenv(name);
+    return r == 0 ? 0 : errno;
+}
+#endif
 static inline int _putenv(char* s) { return putenv(s); }
 static inline errno_t localtime_s(struct tm* out, const time_t* t) { return localtime_r(t, out) ? 0 : EINVAL; }
 static inline errno_t gmtime_s(struct tm* out, const time_t* t)    { return gmtime_r(t, out) ? 0 : EINVAL; }
