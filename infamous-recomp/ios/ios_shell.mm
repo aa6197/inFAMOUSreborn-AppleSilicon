@@ -13,6 +13,8 @@
  *     queue: iOS stops an app that runs GPU work in the background.
  *   - It logs os_proc_available_memory() every few seconds: iOS kills an app
  *     that runs out without warning.
+ *   - It puts an on-screen controller over the game (touch_pad.mm), shown
+ *     while no gamepad is connected.
  *
  * Game data is never in the bundle. The ELF path comes from the first launch
  * argument (Simulator: a host path) or from Documents/BCES00220 (main.cpp
@@ -40,6 +42,17 @@ extern "C" void port_app_set_paused(int paused);         /* main.cpp */
 extern "C" int  port_app_rsx_parked(void);               /* main.cpp */
 extern "C" void rsx_metal_backend_set_layer(void* ca_metal_layer);
 extern "C" void rsx_metal_backend_wait_idle(void);
+extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
+extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
+
+static void update_touch_pad(void)
+{
+    int n = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    SDL_free(ids);
+    dispatch_async(dispatch_get_main_queue(), ^{ port_touch_pad_gamepads(n); });
+}
+
 static int    s_game_argc;
 static char** s_game_argv;
 
@@ -121,6 +134,10 @@ static bool SDLCALL app_events(void*, SDL_Event* e)
         port_app_set_paused(0);
         fprintf(stderr, "[ios] foreground: resumed\n");
         break;
+    case SDL_EVENT_GAMEPAD_ADDED:
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        update_touch_pad();
+        break;
     case SDL_EVENT_LOW_MEMORY:
         fprintf(stderr, "[ios-mem] LOW MEMORY warning, available %zu MB\n",
                 os_proc_available_memory() >> 20);
@@ -173,6 +190,12 @@ int main(int argc, char* argv[])
             fprintf(stderr, "[ios] Metal view %dx%d px\n", pw, ph);
         } else {
             fprintf(stderr, "[ios] no Metal view (%s): rendering headless\n", SDL_GetError());
+        }
+        void* uiwin = win ? SDL_GetPointerProperty(SDL_GetWindowProperties(win),
+                                                   SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL) : NULL;
+        if (uiwin) {
+            port_touch_pad_attach(uiwin);
+            update_touch_pad();
         }
 
         pthread_t mt;

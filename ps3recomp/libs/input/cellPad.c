@@ -987,6 +987,61 @@ static void pad_sdl3_open_new(void)
     SDL_free(ids);
 }
 
+/* Touch pad (Apple port, iOS app shell): an on-screen controller. The shell
+ * publishes its state with cellPad_set_touch_state from the UI thread; it is
+ * one 64-bit word so the game thread never sees half an update. It feeds
+ * port 0 alongside a real gamepad: buttons are OR'd, a stick the touch pad
+ * deflects wins over a centred one. The desktop builds have no touch pad. */
+static unsigned long long s_touch_word;   /* bit 63 on | buttons<<32 | lx ly rx ry */
+
+void cellPad_set_touch_state(int on, unsigned buttons, unsigned lx, unsigned ly,
+                             unsigned rx, unsigned ry)
+{
+    const unsigned long long w = on ? ((1ull << 63) | ((unsigned long long)(buttons & 0xFFFFu) << 32) |
+                                       ((lx & 255u) << 24) | ((ly & 255u) << 16) |
+                                       ((rx & 255u) << 8) | (ry & 255u)) : 0ull;
+    __atomic_store_n(&s_touch_word, w, __ATOMIC_RELEASE);
+}
+
+static u8 pad_touch_axis(u8 pad, u8 touch)
+{
+    const int dp = (int)pad - 128, dt = (int)touch - 128;
+    return (dt * dt > dp * dp) ? touch : pad;
+}
+
+static void pad_merge_touch(void)
+{
+    const unsigned long long w = __atomic_load_n(&s_touch_word, __ATOMIC_ACQUIRE);
+    if (!(w >> 63)) return;
+    PadHostState* hs = &s_host_state[0];
+    const u16 tb = (u16)(w >> 32);
+    if (!hs->connected) {
+        hs->connected = 1; hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+        hs->trigger_l2 = hs->trigger_r2 = 0;
+        hs->press_up = hs->press_down = hs->press_left = hs->press_right = 0;
+        hs->press_triangle = hs->press_circle = hs->press_cross = hs->press_square = 0;
+        hs->press_l1 = hs->press_r1 = 0;
+    }
+    hs->buttons |= tb;
+    hs->analog_lx = pad_touch_axis(hs->analog_lx, (u8)(w >> 24));
+    hs->analog_ly = pad_touch_axis(hs->analog_ly, (u8)(w >> 16));
+    hs->analog_rx = pad_touch_axis(hs->analog_rx, (u8)(w >> 8));
+    hs->analog_ry = pad_touch_axis(hs->analog_ry, (u8)w);
+    if (tb & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+    if (tb & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+    if (tb & CELL_PAD_CTRL_UP)       hs->press_up       = 255;
+    if (tb & CELL_PAD_CTRL_DOWN)     hs->press_down     = 255;
+    if (tb & CELL_PAD_CTRL_LEFT)     hs->press_left     = 255;
+    if (tb & CELL_PAD_CTRL_RIGHT)    hs->press_right    = 255;
+    if (tb & CELL_PAD_CTRL_TRIANGLE) hs->press_triangle = 255;
+    if (tb & CELL_PAD_CTRL_CIRCLE)   hs->press_circle   = 255;
+    if (tb & CELL_PAD_CTRL_CROSS)    hs->press_cross    = 255;
+    if (tb & CELL_PAD_CTRL_SQUARE)   hs->press_square   = 255;
+    if (tb & CELL_PAD_CTRL_L1)       hs->press_l1       = 255;
+    if (tb & CELL_PAD_CTRL_R1)       hs->press_r1       = 255;
+}
+
 static void pad_poll_sdl3(void)
 {
     static unsigned long long s_next_scan = 0;
@@ -1048,6 +1103,7 @@ static void pad_poll_sdl3(void)
         s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
         s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
     }
+    pad_merge_touch();
 }
 
 static void pad_init_backend(void)
