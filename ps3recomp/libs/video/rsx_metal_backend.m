@@ -2297,7 +2297,8 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
 
 /* ---- staging ------------------------------------------------------------- */
 
-static void eng_encode_and_commit(id<MTLTexture> present_dst);
+static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait);
+#define eng_encode_and_commit(dst) eng_encode_and_commit_ex((dst), 0)
 
 /* Room for one more record. A full stream is submitted (and waited on) rather
  * than dropping the rest of the frame, as eng_stage_reserve does for the
@@ -2314,6 +2315,36 @@ static int eng_rec_room(void)
     return s_eng_rec_count < ENG_MAX_RECORDS;
 }
 
+/* Size of one ring slot. A gameplay frame stages 150-240 MB (a full
+ * transform constant block per draw, plus its vertices and indices); a ring
+ * of slots that each grow to the largest frame held ~1 GB, plus the buffers
+ * each growth step freed. Instead a frame that fills a slot is split into
+ * several commits (eng_stage_flush_point), so the ring stays at
+ * ENG_STAGE_RING x this. PS3RECOMP_METAL_STAGE_MB=<n> (8-384, default 64). */
+static u32 eng_slot_bytes(void)
+{
+    static u32 bytes;
+    if (!bytes) {
+        const char* e = getenv("PS3RECOMP_METAL_STAGE_MB");
+        long mb = (e && *e) ? strtol(e, NULL, 10) : 64;
+        if (mb < 8) mb = 8;
+        if (mb > (long)(ENG_STAGE_MAX >> 20)) mb = (long)(ENG_STAGE_MAX >> 20);
+        bytes = (u32)mb << 20;
+    }
+    return bytes;
+}
+
+/* Called where a draw starts staging (its transform constants), so nothing
+ * staged so far belongs to the draw being set up. Past three quarters of a
+ * slot, commit what is recorded without waiting and carry on in the next
+ * slot; the ring and the in-flight bound pace it like a present. */
+static void eng_stage_flush_point(void)
+{
+    const u32 slot = eng_slot_bytes();
+    if (s_eng_stage_used >= slot - slot / 4u)
+        eng_encode_and_commit_ex(nil, 1);
+}
+
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
     const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
@@ -2324,11 +2355,20 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
         return eng_stage_reserve(bytes, out_off);
     }
     if (start + bytes > s_eng_stage_cap) {
-        /* Grow the current slot: nothing committed has read it since it was
-         * made current, so the old buffer can go once its bytes are copied. */
+        /* A slot is made at full size on first use. It only grows when one
+         * draw overruns the quarter left past the flush point; nothing
+         * committed has read it since it was made current, so the old buffer
+         * can go once its bytes are copied. */
         EngStageSlot* sl = &s_eng_ring[s_eng_ring_cur];
-        u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
-        while (start + bytes > cap) cap *= 2u;
+        u64 cap64 = eng_slot_bytes();
+        if (cap64 < (u64)start + bytes) {
+            cap64 = (u64)start + bytes;
+            cap64 = (cap64 + (4u << 20) - 1u) & ~(u64)((4u << 20) - 1u);
+            if (cap64 > ENG_STAGE_MAX) cap64 = ENG_STAGE_MAX;
+            fprintf(stderr, "[rsx engine/metal] stage slot %u grows to %u MB for one draw\n",
+                    s_eng_ring_cur, (u32)(cap64 >> 20));
+        }
+        const u32 cap = (u32)cap64;
         id<MTLBuffer> nb = [s_dev newBufferWithLength:cap
                                               options:MTLResourceStorageModeShared];
         if (!nb) return 0;
@@ -2852,6 +2892,7 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     (void)eng_rec_room();
+    eng_stage_flush_point();
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
 }
@@ -2861,6 +2902,7 @@ static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
 {
     (void)user;
     (void)eng_rec_room();
+    eng_stage_flush_point();
     u32 off = 0, bytes = a_bytes + b_bytes;
     if (bytes && eng_stage_reserve(bytes, &off)) {
         memcpy(s_eng_stage + off, a, a_bytes);
@@ -3340,20 +3382,20 @@ static void eng_stage_next(void)
  *
  * The command buffer binds the current staging slot directly. A waited commit
  * (mid-frame submits, a headless present under HEADLESS_SYNC) has
- * finished with it, so the slot is reused; any other present moves on to the
- * next slot, which eng_stage_next only hands out once its last reader
- * completed. Only PS3RECOMP_METAL_HEADLESS_SYNC=1 waits on every present
+ * finished with it, so the slot is reused; any other present, and a nowait
+ * commit of a full slot (eng_stage_flush_point), moves on to the next slot,
+ * which eng_stage_next only hands out once its last reader completed. Only PS3RECOMP_METAL_HEADLESS_SYNC=1 waits on every present
  * (the old headless behaviour; a frame dump fences on its own). Every other
  * present is paced by the in-flight semaphore instead, the same bound the
  * vtable path uses, because waiting on every frame is the one pattern where
  * a driver cannot hide its encoding work. Headless runs (and iOS, which is
  * always headless here) pipeline like a window does. */
-static void eng_encode_and_commit(id<MTLTexture> present_dst)
+static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
 {
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
-        const int pipelined = present_dst && (!s_headless || !s_eng_hl_sync);
+        const int pipelined = (present_dst || nowait) && (!s_headless || !s_eng_hl_sync);
         if (pipelined) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
         if (present_dst) {
             if (s_headless) {
