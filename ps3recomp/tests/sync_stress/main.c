@@ -338,13 +338,13 @@ static unsigned __stdcall t1_watchdog(void* p)
     t1_shared* sh = (t1_shared*)p;
     for (;;) {
         Sleep(100);
-        if (sh->done_producing && sh->produced <= sh->consumed) return 0; /* test finished cleanly */
-        if (sh->produced > sh->consumed) {
-            ULONGLONG stalled_for = now_ms() - (ULONGLONG)sh->last_progress_ms;
+        if (ReadAcquire(&sh->done_producing) && ReadAcquire(&sh->produced) <= ReadAcquire(&sh->consumed)) return 0; /* test finished cleanly */
+        if (ReadAcquire(&sh->produced) > ReadAcquire(&sh->consumed)) {
+            ULONGLONG stalled_for = now_ms() - (ULONGLONG)ReadAcquire(&sh->last_progress_ms);
             if (stalled_for > T1_STALL_MS) {
                 fprintf(stderr, "[FAIL] test1_no_lost_wakeup: STUCK: no consumption progress for "
                         ">%dms with produced=%ld consumed=%ld (possible lost wakeup)\n",
-                        T1_STALL_MS, (long)sh->produced, (long)sh->consumed);
+                        T1_STALL_MS, (long)ReadAcquire(&sh->produced), (long)ReadAcquire(&sh->consumed));
                 fflush(stderr);
                 InterlockedIncrement(&g_fail_count);
                 fflush(stdout);
@@ -408,9 +408,9 @@ static unsigned __stdcall t1b_watchdog(void* p)
     t1b_shared* sh = (t1b_shared*)p;
     for (;;) {
         Sleep(50);
-        if (sh->woke) return 0;
-        if (sh->parked_at_ms != 0) {
-            ULONGLONG since_park = now_ms() - (ULONGLONG)sh->parked_at_ms;
+        if (ReadAcquire(&sh->woke)) return 0;
+        if (ReadAcquire(&sh->parked_at_ms) != 0) {
+            ULONGLONG since_park = now_ms() - (ULONGLONG)ReadAcquire(&sh->parked_at_ms);
             if (since_park > (ULONGLONG)(T1B_PARK_DELAY_MS + T1B_STALL_MS)) {
                 fprintf(stderr, "[FAIL] test1b_rendezvous_park: consumer parked >%dms ago and "
                         "never woke (signal delivered to an already-sleeping waiter was lost)\n",
@@ -750,7 +750,7 @@ static unsigned __stdcall t3_monitor(void* p)
     ppu_context ctx; ctx_init_for_thread(&ctx, tid);
     uint32_t out_addr = guest_alloc(4);
 
-    while (!sh->stop) {
+    while (!ReadAcquire(&sh->stop)) {
         int32_t rc = call2((int64_t(*)(ppu_context*))sys_semaphore_get_value, &ctx, sh->sem_id, out_addr);
         if (rc == CELL_OK) {
             int32_t val = (int32_t)read_be32(out_addr);
@@ -1012,7 +1012,7 @@ static unsigned __stdcall t4b_receiver(void* p)
     LONG total_expected = T4_SOURCES * T4B_PER_SOURCE;
 
     for (;;) {
-        if (sh->total_received >= total_expected) return 0;
+        if (ReadAcquire(&sh->total_received) >= total_expected) return 0;
 
         int32_t rc = call3((int64_t(*)(ppu_context*))sys_event_queue_receive, &ctx, sh->queue_id, event_addr, (uint64_t)1000000 /* 1s */);
         if (rc == (int32_t)CELL_ETIMEDOUT) continue;
