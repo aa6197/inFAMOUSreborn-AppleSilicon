@@ -1039,9 +1039,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         }
         frame_vert_account(state, count);
         ps3_ms("rsx:draw_arrays");
-        if (s_backend && s_backend->draw_arrays)
+        if (s_backend && s_backend->draw_arrays) {
             rsx_stencil_log(state);
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
+        }
         return 0;
     }
 
@@ -1081,10 +1082,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         { static int _d=0; if ((_d < 8 && _d++ < 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         frame_vert_account(state, count);
         ps3_ms("rsx:draw_indexed");
-        if (s_backend && s_backend->draw_indexed)
+        if (s_backend && s_backend->draw_indexed) {
             rsx_stencil_log(state);
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
                                     first, count);
+        }
         return 0;
     }
 
