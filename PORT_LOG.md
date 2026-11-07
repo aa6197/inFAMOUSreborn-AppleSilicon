@@ -4,13 +4,87 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M1 done**. Next: **M2** (link `inFamousRecomp` for arm64).
+- Milestone: **M2 done**. Next: **M3** (boot: guest reaches entry, then `main`; log shows flips).
+- Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
   The ISO on an external drive is only needed to re-extract.
   - BCES00220, inFamous, Europe. PARAM.SFO VERSION 01.01, APP_VER 01.00.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M2: link for arm64
+
+### Result
+
+M2 check passes.
+
+| Check | Result |
+|---|---|
+| `inFamousRecomp` | links: Mach-O 64-bit arm64, 128.7 MB |
+| x86 flags in `build.ninja` | 0 |
+| Toolkit rebuild + ctest | pass, 2 / 2 |
+| `ps3recomp_host --draw` (headless) | pass |
+| `test_win32_compat` | 341 passed, 0 failed |
+| SPU float diff test (arm64 vs scalar) | 144 M cases, 0 differ |
+| x86: AVX2 SPU code (cross-compiled) | byte-identical to before |
+| x86: `PORT_CPU_COMPAT` copy step | still applies, no FMA in output |
+
+Logs: `$WORK_DIR/runs/m2-20261107-124158/`.
+
+### What changed
+
+- **CMake: `PORT_TARGET_X86`.** Off when the target is not x86
+  (arm64 Mac, iOS). Then `PORT_SPU_AVX2`, `PORT_PPU_AVX2` and
+  `PORT_CPU_COMPAT` are forced off, and SPU files get `-O2` with no
+  `-msse4.1`. Windows targets x86, so nothing changes there.
+- **CMake: FP contraction.** Game glue (`main`, `stubs`, `trainer`) gets
+  `-ffp-contract=off` on arm64, like the runtime and PPU code. SPU files
+  keep clang's default (contract on), as the Windows AVX2 build does.
+- **SPU float SIMD on arm64** (`spu_helpers.h`, `spu_xfk.h`). The SSE2 path
+  now builds on arm64 through sse2neon. Fused ops use NEON `vfmaq` /
+  `vfmsq`: one rounding, like x86 FMA. The diff test passed in default mode
+  and in SPU float mode (truncate + FTZ/DAZ).
+  - `spu_xfk.h` must never contain the text `__FMA__`. The
+    `PORT_CPU_COMPAT` copy step keys on it.
+- **`win32_compat.h`:** `TerminateProcess` (own process only) and
+  `_putenv_s`. An empty value removes the variable, like MSVC.
+  `msvc_compat.h` had its own `_putenv_s`; both now share one guard and the
+  same rule, so a file can include both. Test added.
+- **`stubs.cpp`, `infamous_lang.h`:** the `__declspec` lines are behind
+  `_WIN32`. Off Windows they use the shim's `GetTickCount64` /
+  `VirtualQuery` and a weak symbol.
+- **`wwsplug/spu_recomp.c`** (generated, not edited): CMake force-includes
+  `win32_compat.h` for it off Windows.
+- **Non-Windows defaults** for 5 globals the portable code uses:
+  `g_ui_fps_cap`, `g_uiov_paused_fn`, `g_pause_menu_built_ms`,
+  `g_uiov_request` (`rsx_ui_overlay.c`) and `g_lodx_f5_off`
+  (`rsx_d3d12_backend.c`). Same values as on Windows.
+- **Port notes:** build command uses `-O2` (Windows is `/O2`; AppleClang
+  Release would be `-O3`) and Python 3.12.
+
+### Open items
+
+- **ld warning:** `__DATA,__common` alignment cut from 32 KB to 16 KB.
+  The M0 toolkit build shows it too, so it comes from the runtime. Find the
+  symbol if anything odd shows up in M3.
+- **`PPU_INLINE_LOADS`:** the unix lifted-PPU path doesn't define it;
+  Windows does. Perf item for M7.
+- **`test_spu_shufb`** says "built without SSE4.1, nothing to compare" on
+  arm64. The SSE2 shufb path runs there; `test_spu_helpers` (63 / 63) and
+  `test_spu_v131_shufb_xfq` (bad = 0) cover it.
+- **Build cost:** the 5 big PPU files take about 85 s, peak about 3.5 GB
+  RAM each.
+- **Windows build not re-checked** (no Windows box). x86 SPU output was
+  cross-checked as above; everything else is guarded.
+
+### Next step
+
+- M3: run `inFamousRecomp` against `$WORK_DIR/game/BCES00220` under
+  `gtimeout`. Goal: guest reaches entry, then `main`, and the log shows
+  flips.
 
 ---
 
