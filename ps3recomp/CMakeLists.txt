@@ -303,6 +303,20 @@ endif()
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
+# x86 ISA flags (-msse4.1 and friends) are an error on arm64 clang, so they are
+# only passed when the target is x86. Windows is always x86-64 here (AMD64).
+set(PS3RECOMP_TARGET_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|i[3-6]86|x86)$")
+    set(PS3RECOMP_TARGET_X86 ON)
+endif()
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+        set(PS3RECOMP_TARGET_X86 ON)
+    else()
+        set(PS3RECOMP_TARGET_X86 OFF)
+    endif()
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
         -Wall -Wextra -Wno-unused-parameter
@@ -319,8 +333,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
         # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
-        # hottest SPU op in lifted audio code.
-        -msse4.1
+        # hottest SPU op in lifted audio code. x86 only; arm64 uses the
+        # portable fallbacks in spu_helpers*.h.
+        $<$<BOOL:${PS3RECOMP_TARGET_X86}>:-msse4.1>
     )
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
