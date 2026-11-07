@@ -292,6 +292,22 @@ pub fn lock_satisfied(root: &Path, lock: &Lock) -> Result<bool> {
     Ok(true)
 }
 
+/// The file's bytes with every line ending rewritten to CRLF or to LF, whichever hashes to
+/// `want`. None if neither does, or the file has no line breaks.
+fn eol_variant_matching(p: &Path, want: &str) -> Result<Option<Vec<u8>>> {
+    let data = fs::read(p).ctx(|| format!("reading {}", p.display()))?;
+    if diff::dominant_eol(&data).is_none() {
+        return Ok(None);
+    }
+    for eol in [diff::Eol::Crlf, diff::Eol::Lf] {
+        let conv = diff::convert_eol(&data, eol);
+        if conv != data && hash::sha256_hex(&conv) == want {
+            return Ok(Some(conv));
+        }
+    }
+    Ok(None)
+}
+
 pub fn patch_path(installer_dir: &Path, rel: &str) -> PathBuf {
     util::join_slash(&installer_dir.join("patches"), &format!("{rel}.patch"))
 }
@@ -311,9 +327,10 @@ pub fn apply_lock(
     let known: BTreeSet<&str> = lock.files.iter().map(|e| e.path.as_str()).collect();
     let mut problems: Vec<String> = Vec::new();
     let (mut patched, mut created, mut removed, mut same) = (0, 0, 0, 0);
+    let mut eol_fixed = 0;
     for e in &lock.files {
         let p = util::join_slash(root, &e.path);
-        let cur = if p.is_file() {
+        let mut cur = if p.is_file() {
             Some(hash::sha256_file(&p)?)
         } else {
             None
@@ -333,6 +350,22 @@ pub fn apply_lock(
                 if cur.is_none() && base.is_some() && util::any_match(tolerate, &e.path) {
                     util::warn(&format!("skipping {} (its optional step failed)", e.path));
                     continue;
+                }
+                // Python's text mode writes CRLF on Windows and LF elsewhere, and the lock was
+                // made on Windows. Output that differs from the recorded base only in its line
+                // endings is the same output: give it the base's endings (hash-checked) first.
+                let eol_fix = match (&cur, base) {
+                    (Some(c), Some(b)) if c != b => eol_variant_matching(&p, b)?,
+                    _ => None,
+                };
+                if let Some(fixed) = eol_fix {
+                    util::write_file(&p, &fixed)?;
+                    eol_fixed += 1;
+                    cur = base.clone();
+                    if cur.as_deref() == Some(fin.as_str()) {
+                        same += 1;
+                        continue; // the base is already final (file has no patch)
+                    }
                 }
                 if cur != *base {
                     problems.push(match (&cur, base) {
@@ -383,6 +416,11 @@ pub fn apply_lock(
             shown.join("\n      "),
             if problems.len() > 25 { "\n      ..." } else { "" }
         );
+    }
+    if eol_fixed > 0 {
+        util::info(&format!(
+            "{eol_fixed} file(s) differed from the patch set's base only in line endings; converted"
+        ));
     }
     util::info(&format!(
         "{same} file(s) already right, {patched} patched, {created} created, {removed} removed{}",
