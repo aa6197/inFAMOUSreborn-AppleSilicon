@@ -188,6 +188,10 @@ static struct {
     u32 n_refs, cap_refs, n_source_refs;
     int refs_remapped;
     rsx_vertex_remap ref_remap;
+    /* Set by the fast index read when it produced every reference: their
+     * vertex-id range (all share one base index). */
+    int rng_known;
+    u32 rng_lo, rng_hi;
 
     u32* cuts;
     u32 n_cuts, cap_cuts;
@@ -1672,6 +1676,7 @@ static void dc_reset(void)
     dc.n_arr = dc.n_idx = dc.n_packets = 0;
     dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
     dc.refs_remapped = 0;
+    dc.rng_known = 0;
     dc.fetch_ok = 1;
     dc.inl = NULL;
     dc.inl_bytes = 0;
@@ -1719,12 +1724,455 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
+/* ---- fast vertex path ---------------------------------------------------
+ *
+ * Same bytes as rsx_vertex_remap_build + rsx_vertex_fetch_one, done in bulk.
+ * The D3D12 path converts vertices off the FIFO thread and dedupes indexed
+ * draws over the index range (v55 "range" vs "hashed"); this is the range
+ * dedupe and a per-attribute fetch with the type switch hoisted out of the
+ * vertex loop. Profile: fetch + decode + remap were ~40% of sink_end.
+ *   PS3RECOMP_ENGINE_VTX_FAST=0    the per-vertex path, as before
+ *   PS3RECOMP_ENGINE_VTX_VERIFY=1  run both and log any difference */
+static int eng_vtx_fast_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = eng_env_flag("PS3RECOMP_ENGINE_VTX_FAST", 1);
+        if (v && eng_env_flag("PS3RECOMP_ENGINE_VTX_VERIFY", 0)) v = 2;
+        fprintf(stderr, "[rsx engine] vertex fetch: %s (PS3RECOMP_ENGINE_VTX_FAST)\n",
+                v == 2 ? "fast, verified" : v ? "fast" : "per vertex");
+    }
+    return v;
+}
+
+/* Index-range dedupe: when every reference shares one base index and the
+ * vertex ids span a small range, a direct table replaces the hash probe.
+ * First-occurrence order and occurrence_to_unique match the hash version. */
+static u64* s_rng_tab;
+static u32  s_rng_cap, s_rng_gen;
+static int eng_remap_range(rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+                           u32* unique_count, int known, u32 known_lo, u32 known_hi)
+{
+    if (count < 2) return 0;
+    u32 lo = known_lo, hi = known_hi;
+    if (!known) {
+        const u32 base = refs[0].base_index;
+        lo = hi = refs[0].vertex_id;
+        for (u32 i = 1; i < count; i++) {
+            const u32 v = refs[i].vertex_id;
+            if (refs[i].base_index != base) return 0;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    }
+    const u64 range = (u64)hi - lo + 1u;
+    if (range > (u64)count * 4u + 1024u || range > (1u << 22)) return 0;
+    if (count > remap->occurrence_capacity) {
+        u32* occ = (u32*)realloc(remap->occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!occ) return 0;
+        remap->occurrence_to_unique = occ;
+        remap->occurrence_capacity = count;
+    }
+    if (range > s_rng_cap) {
+        u64* t = (u64*)calloc((size_t)range, sizeof(u64));
+        if (!t) return 0;
+        free(s_rng_tab);
+        s_rng_tab = t;
+        s_rng_cap = (u32)range;
+        s_rng_gen = 0;
+    }
+    if (++s_rng_gen == 0) {
+        memset(s_rng_tab, 0, (size_t)s_rng_cap * sizeof(u64));
+        s_rng_gen = 1;
+    }
+    const u64 tag = (u64)s_rng_gen << 32;
+    u32* occ = remap->occurrence_to_unique;
+    u32 unique = 0;
+    for (u32 o = 0; o < count; o++) {
+        const rsx_vertex_ref ref = refs[o];
+        u64* e = &s_rng_tab[ref.vertex_id - lo];
+        if ((u32)(*e >> 32) != s_rng_gen) {
+            *e = tag | unique;
+            refs[unique] = ref;
+            occ[o] = unique++;
+        } else {
+            occ[o] = (u32)*e;
+        }
+    }
+    *unique_count = unique;
+    return 1;
+}
+
+static int eng_remap(rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count, u32* unique_count)
+{
+    const int mode = eng_vtx_fast_mode();
+    if (!mode) return rsx_vertex_remap_build(remap, refs, count, unique_count);
+    if (mode == 1) {
+        if (eng_remap_range(remap, refs, count, unique_count,
+                            dc.rng_known, dc.rng_lo, dc.rng_hi)) return 1;
+        return rsx_vertex_remap_build(remap, refs, count, unique_count);
+    }
+    /* verify: hash on a copy, range on the real list, compare */
+    static rsx_vertex_ref* cp; static u32 cp_cap; static rsx_vertex_remap ref_map;
+    if (count > cp_cap) {
+        rsx_vertex_ref* n = (rsx_vertex_ref*)realloc(cp, (size_t)count * sizeof(*cp));
+        if (!n) return rsx_vertex_remap_build(remap, refs, count, unique_count);
+        cp = n; cp_cap = count;
+    }
+    memcpy(cp, refs, (size_t)count * sizeof(*cp));
+    u32 u_ref = 0;
+    const int ok_ref = rsx_vertex_remap_build(&ref_map, cp, count, &u_ref);
+    if (!eng_remap_range(remap, refs, count, unique_count, 0, 0, 0))
+        return rsx_vertex_remap_build(remap, refs, count, unique_count);
+    if (ok_ref && (u_ref != *unique_count ||
+                   memcmp(cp, refs, (size_t)u_ref * sizeof(*cp)) ||
+                   memcmp(ref_map.occurrence_to_unique, remap->occurrence_to_unique,
+                          (size_t)count * sizeof(u32)))) {
+        static int n = 0;
+        if (n++ < 8) fprintf(stderr, "[rsx engine] VTX_VERIFY: remap differs (count %u, unique %u vs %u)\n",
+                             count, *unique_count, u_ref);
+    }
+    return 1;
+}
+
+/* One attribute of one vertex, exactly as rsx_vertex_fetch_one does it. */
+static int eng_fetch_attr_slow(const rsx_vertex_fetch_plan* plan, u32 attr,
+                               const rsx_vertex_ref* ref, float* value)
+{
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    const u32 element = rsx_vertex_element_index(
+        ref->vertex_id, ref->base_index, fetch->desc.frequency,
+        (plan->divider_mask >> attr) & 1u);
+    const u8* source = NULL;
+    if (fetch->stable_base &&
+        element >= fetch->stable_first && element <= fetch->stable_last) {
+        source = fetch->stable_base + (u64)(element - fetch->stable_first) * fetch->stride;
+    } else if (plan->inline_data) {
+        source = NULL;
+    } else if (plan->guest_ptr) {
+        const u32 offset = plan->base_offset + fetch->desc.offset + element * fetch->stride;
+        source = plan->guest_ptr(plan->guest_user, fetch->desc.location, offset,
+                                 fetch->elem_size);
+    }
+    if (source && rsx_vertex_decode_element(fetch->desc.type, fetch->desc.size, source, value))
+        return 1;
+    if (attr == 0) return 0;
+    memcpy(value, fetch->default_value, 16);
+    return 1;
+}
+
+/* All refs, one attribute at a time. Returns 0 where fetch_one would. */
+static int eng_fetch_batch(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
+                           u32 n, u8* out)
+{
+    const u32 vstride = plan->layout.stride;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+        u8* o = out + slot * 16u;
+        if (plan->imm_verts) {
+            for (u32 i = 0; i < n; i++)
+                memcpy(o + (size_t)i * vstride, refs[i].vertex_id < plan->imm_count
+                           ? plan->imm_verts[refs[i].vertex_id][attr] : f->default_value, 16);
+            continue;
+        }
+        if (!f->desc.type || !f->desc.size) {
+            for (u32 i = 0; i < n; i++) memcpy(o + (size_t)i * vstride, f->default_value, 16);
+            continue;
+        }
+        const u32 type = f->desc.type, sz = f->desc.size < 4u ? f->desc.size : 4u;
+        const u32 freq = f->desc.frequency, mod = (plan->divider_mask >> attr) & 1u;
+        const u8* base = f->stable_base;
+        const u32 first = base ? f->stable_first : 1u, last = base ? f->stable_last : 0u;
+        const size_t stride = f->stride;
+        /* One loop per type (and per size for FLOAT, the common case), so
+         * the type switch is not taken per vertex. Same values bit for bit:
+         * x/y/z default 0, w 1, then the first sz components from guest. */
+#define ENG_VLOOP(...) \
+        for (u32 i = 0; i < n; i++) { \
+            float* v = (float*)(o + (size_t)i * vstride); \
+            const u32 e = freq <= 1u ? ((refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu) \
+                : rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index, freq, mod); \
+            if (e < first || e > last) { \
+                if (!eng_fetch_attr_slow(plan, attr, &refs[i], v)) return 0; \
+                continue; \
+            } \
+            const u8* s = base + (size_t)(e - first) * stride; \
+            __VA_ARGS__ \
+        }
+        switch (type) {
+        case RSX_VTX_TYPE_FLOAT:
+            if (sz == 4) {
+                ENG_VLOOP(u32 w[4]; memcpy(w, s, 16);
+                          w[0] = __builtin_bswap32(w[0]); w[1] = __builtin_bswap32(w[1]);
+                          w[2] = __builtin_bswap32(w[2]); w[3] = __builtin_bswap32(w[3]);
+                          memcpy(v, w, 16);)
+            } else if (sz == 3) {
+                ENG_VLOOP(u32 w[4]; memcpy(w, s, 12);
+                          w[0] = __builtin_bswap32(w[0]); w[1] = __builtin_bswap32(w[1]);
+                          w[2] = __builtin_bswap32(w[2]); w[3] = 0x3F800000u;
+                          memcpy(v, w, 16);)
+            } else if (sz == 2) {
+                ENG_VLOOP(u32 w[4]; memcpy(w, s, 8);
+                          w[0] = __builtin_bswap32(w[0]); w[1] = __builtin_bswap32(w[1]);
+                          w[2] = 0u; w[3] = 0x3F800000u;
+                          memcpy(v, w, 16);)
+            } else {
+                ENG_VLOOP(u32 w[4]; memcpy(w, s, 4);
+                          w[0] = __builtin_bswap32(w[0]); w[1] = 0u; w[2] = 0u;
+                          w[3] = 0x3F800000u;
+                          memcpy(v, w, 16);)
+            }
+            break;
+        case RSX_VTX_TYPE_HALF:
+            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 c = 0; c < sz; c++) {
+                    const u16 h = (u16)((s[c * 2u] << 8) | s[c * 2u + 1u]);
+                    const u32 sign = (u32)(h >> 15) << 31;
+                    const u32 ex = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
+                    const u32 w = ex == 0 ? sign
+                        : ex == 31 ? (sign | 0x7F800000u | (man << 13))
+                        : (sign | ((ex + 112u) << 23) | (man << 13));
+                    memcpy(&v[c], &w, 4);
+                })
+            break;
+        case RSX_VTX_TYPE_UNORM8:
+            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 c = 0; c < sz; c++) v[c] = s[c] / 255.0f;)
+            break;
+        case RSX_VTX_TYPE_UINT8:
+            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 c = 0; c < sz; c++) v[c] = (float)s[c];)
+            break;
+        case RSX_VTX_TYPE_SNORM16:
+            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 c = 0; c < sz; c++)
+                    v[c] = (s16)((s[c * 2u] << 8) | s[c * 2u + 1u]) / 32767.0f;)
+            break;
+        case RSX_VTX_TYPE_SINT16:
+            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 c = 0; c < sz; c++)
+                    v[c] = (float)(s16)((s[c * 2u] << 8) | s[c * 2u + 1u]);)
+            break;
+        case RSX_VTX_TYPE_CMP32:
+            ENG_VLOOP(
+                const u32 w = ((u32)s[0] << 24) | ((u32)s[1] << 16) | ((u32)s[2] << 8) | s[3];
+                s32 x = (s32)(w & 0x7FF), y = (s32)((w >> 11) & 0x7FF), z = (s32)((w >> 22) & 0x3FF);
+                if (x & 0x400) x -= 0x800;
+                if (y & 0x400) y -= 0x800;
+                if (z & 0x200) z -= 0x400;
+                v[0] = (float)x / 1023.0f;
+                v[1] = (float)y / 1023.0f;
+                v[2] = (float)z / 511.0f;
+                v[3] = 1.0f;)
+            break;
+        default:
+            for (u32 i = 0; i < n; i++)
+                if (!eng_fetch_attr_slow(plan, attr, &refs[i],
+                                         (float*)(o + (size_t)i * vstride)))
+                    return 0;
+            break;
+        }
+#undef ENG_VLOOP
+    }
+    return 1;
+}
+
+static int dc_reserve_refs(u64 n)
+{
+    if (n <= dc.cap_refs) return 1;
+    if (n > 0x80000000ull) return 0;
+    u64 next = dc.cap_refs ? dc.cap_refs : 4096u;
+    while (next < n) next *= 2u;
+    rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs, (size_t)next * sizeof(*r));
+    if (!r) return 0;
+    dc.refs = r;
+    dc.cap_refs = (u32)next;
+    return 1;
+}
+
+/* 16-bit index -> (generation << 16) | unique slot, for the fused dedupe. */
+static u32* s_idx16_tab;
+static u32  s_idx16_gen;
+
+/* VTX_FAST: every index batch in one pass, with one reserve and word loads
+ * instead of dc_push_ref per index. Restart cuts land where the per-index
+ * loop puts them. When a 16-bit list starts the reference list and the
+ * topology may share references, the dedupe happens in the same pass on a
+ * direct table, in the first-occurrence order eng_remap_range and
+ * rsx_vertex_remap_build give. Returns 0 (nothing done) when a batch is not
+ * one contiguous guest run: the caller reads index by index, as before;
+ * 1 = references read; 2 = read and deduplicated. */
+static int dc_fetch_indexed_fast(const rsx_dsp_index_array* ia, u32 ia_loc,
+                                 u32 base_index, int restart_en,
+                                 u32 restart_val, int allow_remap)
+{
+    const u32 esz = ia->is_u32 ? 4u : 2u;
+    u64 total = 0;
+    for (u32 b = 0; b < dc.n_idx; b++) {
+        const u32 count = dc.idx[b].count;
+        if (!count) continue;
+        const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz;
+        const u64 bytes = (u64)count * esz;
+        if (start > 0xFFFFFFFFull || bytes > 0xFFFFFFFFull ||
+            start + bytes > 0x100000000ull ||
+            !eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes))
+            return 0;
+        total += count;
+    }
+
+    if (!ia->is_u32 && allow_remap && dc.n_refs == 0 && total > 1) {
+        rsx_vertex_remap* rm = &dc.ref_remap;
+        if (total > 0xFFFFFFFFull) return 0;
+        if (total > rm->occurrence_capacity) {
+            u32* occ = (u32*)realloc(rm->occurrence_to_unique, (size_t)total * sizeof(u32));
+            if (!occ) return 0;
+            rm->occurrence_to_unique = occ;
+            rm->occurrence_capacity = (u32)total;
+        }
+        if (!dc_reserve_refs(total < 65536u ? total : 65536u)) return 0;
+        if (!s_idx16_tab) {
+            s_idx16_tab = (u32*)calloc(65536u, sizeof(u32));
+            if (!s_idx16_tab) return 0;
+            s_idx16_gen = 0;
+        }
+        if (++s_idx16_gen > 0xFFFFu) {
+            memset(s_idx16_tab, 0, 65536u * sizeof(u32));
+            s_idx16_gen = 1;
+        }
+        const u32 gen = s_idx16_gen, tag = gen << 16;
+        u32* tab = s_idx16_tab;
+        u32* occ = rm->occurrence_to_unique;
+        rsx_vertex_ref* refs = dc.refs;
+        u32 n_occ = 0, unique = 0;
+        for (u32 b = 0; b < dc.n_idx; b++) {
+            const u32 count = dc.idx[b].count;
+            if (!count) continue;
+            const u8* run = eng_guest_ptr(NULL, ia_loc,
+                                          ia->offset + dc.idx[b].first * 2u, count * 2u);
+            for (u32 i = 0; i < count; i++) {
+                u16 w;
+                memcpy(&w, run + (size_t)i * 2u, 2);
+                const u32 index = __builtin_bswap16(w);
+                if (restart_en && index == restart_val) {
+                    if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n_occ)) {
+                        dc.fetch_ok = 0;
+                        return 2;
+                    }
+                    continue;
+                }
+                const u32 e = tab[index];
+                if ((e >> 16) == gen) {
+                    occ[n_occ++] = e & 0xFFFFu;
+                } else {
+                    tab[index] = tag | unique;
+                    refs[unique].vertex_id = index;
+                    refs[unique].base_index = base_index;
+                    occ[n_occ++] = unique++;
+                }
+            }
+        }
+        dc.n_source_refs = n_occ;
+        dc.n_refs = unique;
+        dc.refs_remapped = unique < n_occ;
+        return 2;
+    }
+
+    if (!dc_reserve_refs((u64)dc.n_refs + total)) return 0;
+    const int whole = dc.n_refs == 0;
+    u32 lo = 0xFFFFFFFFu, hi = 0;
+    rsx_vertex_ref* refs = dc.refs;
+    u32 n = dc.n_refs;
+    for (u32 b = 0; b < dc.n_idx; b++) {
+        const u32 count = dc.idx[b].count;
+        if (!count) continue;
+        const u8* run = eng_guest_ptr(NULL, ia_loc, ia->offset + dc.idx[b].first * esz,
+                                      count * esz);
+        for (u32 i = 0; i < count; i++) {
+            u32 index;
+            if (ia->is_u32) {
+                u32 w; memcpy(&w, run + (size_t)i * 4u, 4); index = __builtin_bswap32(w);
+            } else {
+                u16 w; memcpy(&w, run + (size_t)i * 2u, 2); index = __builtin_bswap16(w);
+            }
+            if (restart_en && index == restart_val) {
+                if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) {
+                    dc.n_refs = n;
+                    dc.fetch_ok = 0;
+                    return 1;
+                }
+                continue;
+            }
+            refs[n].vertex_id = index;
+            refs[n].base_index = base_index;
+            n++;
+            if (index < lo) lo = index;
+            if (index > hi) hi = index;
+        }
+    }
+    dc.n_refs = n;
+    if (whole && n) {
+        dc.rng_known = 1;
+        dc.rng_lo = lo;
+        dc.rng_hi = hi;
+    }
+    return 1;
+}
+
 /* Turn this group's batches into a reference list, recording a CUT rather
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
  * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
+/* VTX_VERIFY: a copy of what dc_fetch_indexed_fast produced, checked
+ * against the per-index path. */
+static struct {
+    int mode;                   /* dc_fetch_indexed_fast's return, 0 = none */
+    u32 n_src, n_refs, n_cuts;
+    int remapped;
+    rsx_vertex_ref* refs; u32* cuts; u32* occ;
+    u32 cap_refs, cap_cuts, cap_occ;
+} s_ivf;
+
+static int eng_ivf_copy(void** buf, u32* cap, const void* src, u32 n, size_t elem)
+{
+    if (n > *cap) {
+        void* b = realloc(*buf, (size_t)n * elem);
+        if (!b) return 0;
+        *buf = b;
+        *cap = n;
+    }
+    if (n) memcpy(*buf, src, (size_t)n * elem);
+    return 1;
+}
+
+static void eng_ivf_check(int stage)
+{
+    if (s_ivf.mode != stage) return;
+    int same = dc.n_refs == s_ivf.n_refs && dc.n_cuts == s_ivf.n_cuts &&
+               !memcmp(dc.refs, s_ivf.refs, (size_t)dc.n_refs * sizeof(*dc.refs)) &&
+               !memcmp(dc.cuts, s_ivf.cuts, (size_t)dc.n_cuts * sizeof(u32));
+    if (stage == 2)
+        same = same && dc.n_source_refs == s_ivf.n_src &&
+               dc.refs_remapped == s_ivf.remapped &&
+               (!dc.refs_remapped ||
+                !memcmp(dc.ref_remap.occurrence_to_unique, s_ivf.occ,
+                        (size_t)dc.n_source_refs * sizeof(u32)));
+    static u32 checks, logs;
+    checks++;
+    if (!same && logs++ < 8)
+        fprintf(stderr, "[rsx engine] VTX_VERIFY: index read differs (stage %d: refs %u vs %u,"
+                        " source %u vs %u, cuts %u vs %u)\n", stage, dc.n_refs, s_ivf.n_refs,
+                dc.n_source_refs, s_ivf.n_src, dc.n_cuts, s_ivf.n_cuts);
+    if ((checks & 0xFFFFu) == 0)
+        fprintf(stderr, "[rsx engine] VTX_VERIFY: %u index reads checked, %u differ\n",
+                checks, logs);
+    s_ivf.mode = 0;
+}
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
+    int deduped_fast = 0;   /* dc_fetch_indexed_fast: 0 not used, 1 read, 2 read + deduped */
+    s_ivf.mode = 0;
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
         for (u32 i = 0; i < dc.arr[b].count && dc.fetch_ok; i++)
             if (!dc_push_ref(dc.arr[b].first + i, 0)) dc.fetch_ok = 0;
@@ -1740,7 +2188,38 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          * rsx_dsp location enum: 0 selects local memory. */
         const u32 ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
 
-        for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
+        if (eng_vtx_fast_mode() == 1)
+            deduped_fast = dc_fetch_indexed_fast(&ia, ia_loc, base_index, restart_en,
+                                                 restart_val, allow_remap);
+        if (eng_vtx_fast_mode() == 2) {
+            /* Run the fast read, keep its result, then rewind and let the
+             * per-index path below produce the reference result. */
+            const u32 n_refs0 = dc.n_refs, n_cuts0 = dc.n_cuts;
+            const int r = dc_fetch_indexed_fast(&ia, ia_loc, base_index, restart_en,
+                                                restart_val, allow_remap);
+            if (r && dc.fetch_ok &&
+                eng_ivf_copy((void**)&s_ivf.refs, &s_ivf.cap_refs, dc.refs, dc.n_refs,
+                             sizeof(*dc.refs)) &&
+                eng_ivf_copy((void**)&s_ivf.cuts, &s_ivf.cap_cuts, dc.cuts, dc.n_cuts,
+                             sizeof(u32)) &&
+                (r != 2 || !dc.refs_remapped ||
+                 eng_ivf_copy((void**)&s_ivf.occ, &s_ivf.cap_occ,
+                              dc.ref_remap.occurrence_to_unique, dc.n_source_refs,
+                              sizeof(u32)))) {
+                s_ivf.mode = r;
+                s_ivf.n_src = dc.n_source_refs;
+                s_ivf.n_refs = dc.n_refs;
+                s_ivf.n_cuts = dc.n_cuts;
+                s_ivf.remapped = dc.refs_remapped;
+            }
+            dc.n_refs = n_refs0;
+            dc.n_cuts = n_cuts0;
+            dc.n_source_refs = 0;
+            dc.refs_remapped = 0;
+            dc.rng_known = 0;
+            dc.fetch_ok = 1;
+        }
+        for (u32 b = 0; !deduped_fast && b < dc.n_idx && dc.fetch_ok; b++) {
             const u32 first = dc.idx[b].first, count = dc.idx[b].count;
             const u64 start = (u64)ia.offset + (u64)first * esz;
             const u64 bytes = (u64)count * esz;
@@ -1766,18 +2245,20 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
     if (!dc.fetch_ok) return;
+    eng_ivf_check(1);
 
-    dc.n_source_refs = dc.n_refs;
+    if (deduped_fast != 2) dc.n_source_refs = dc.n_refs;
     /* Only a topology this engine rebuilds through an index buffer may share
      * repeated references. A line strip or a point list is drawn in the order
      * it arrived, so collapsing duplicates would reorder it. */
-    if (allow_remap && dc.n_refs > 1) {
+    if (deduped_fast != 2 && allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;
-        if (rsx_vertex_remap_build(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
+        if (eng_remap(&dc.ref_remap, dc.refs, dc.n_refs, &unique)) {
             dc.refs_remapped = unique < dc.n_refs;
             dc.n_refs = unique;
         }
     }
+    eng_ivf_check(2);
 
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
@@ -1788,11 +2269,42 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         dc.fetch_ok = 0;
         return;
     }
-    for (u32 i = 0; i < dc.n_refs; i++) {
-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+    const int fast = eng_vtx_fast_mode();
+    if (fast && layout->stride) {
+        if (!eng_fetch_batch(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts)) {
             dc.fetch_ok = 0;
             return;
+        }
+        if (fast == 2) {
+            static u8* chk; static u64 chk_cap;
+            const u64 bytes = (u64)dc.n_refs * layout->stride;
+            if (bytes > chk_cap) {
+                u8* c = (u8*)realloc(chk, (size_t)bytes);
+                if (c) { chk = c; chk_cap = bytes; }
+            }
+            if (bytes <= chk_cap) {
+                int ok = 1;
+                for (u32 i = 0; i < dc.n_refs && ok; i++)
+                    ok = rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i],
+                                              chk + (u64)i * layout->stride);
+                if (!ok || memcmp(chk, dc.verts, (size_t)bytes)) {
+                    static int nd = 0;
+                    if (nd++ < 8) fprintf(stderr, "[rsx engine] VTX_VERIFY: fetch differs (%u verts, %u attrs, ok %d)\n",
+                                          dc.n_refs, (unsigned)layout->count, ok);
+                }
+                static u64 nchk = 0;
+                if ((++nchk % 20000u) == 0)
+                    fprintf(stderr, "[rsx engine] VTX_VERIFY: %llu draws checked\n",
+                            (unsigned long long)nchk);
+            }
+        }
+    } else {
+        for (u32 i = 0; i < dc.n_refs; i++) {
+            u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+            if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+                dc.fetch_ok = 0;
+                return;
+            }
         }
     }
     dc.n_verts = dc.n_refs;
