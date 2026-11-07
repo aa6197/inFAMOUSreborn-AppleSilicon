@@ -16280,4 +16280,15 @@ void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 
+/* Defined above for Windows, referenced by portable code everywhere:
+ *   g_hz / ps3_hz_is_main -- hitch counters (include/ps3emu/hz_stats.h). The
+ *     counters still count; only the D3D12 frame reporter reads them, and
+ *     main-thread attribution is not tracked here.
+ *   rsx_ww_bump -- write-watch epoch for the D3D12 texture cache. No cache
+ *     here to invalidate. A backend that caches guest textures (Metal) has
+ *     to hook the same event before it relies on that cache. */
+volatile long long g_hz[32];
+int ps3_hz_is_main(void) { return 0; }
+void rsx_ww_bump(void) {}
+
 #endif /* _WIN32 */

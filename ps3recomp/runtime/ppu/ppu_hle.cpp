@@ -30,6 +30,9 @@
 #endif
 #include <windows.h>   /* v213 HLESTAT: QueryPerformanceCounter */
 #include <intrin.h>
+#else
+#include "../platform/win32_compat.h"          /* _InterlockedIncrement, LARGE_INTEGER, QueryPerformanceCounter */
+#include "../../include/ps3emu/host_simd.h"    /* __rdtsc (arm64: generic timer) */
 #endif
 #include <time.h>
 #include <stdio.h>

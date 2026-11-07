@@ -250,6 +250,10 @@ static void derive_vfs_root(const char* eboot)
 
 /* Host-provided symbols the runtime + HLE libs need. */
 extern "C" uint8_t* vm_base = nullptr;
+/* Runner-owned hooks a port defines in its own main.cpp (the loader and the
+ * SPU runtime call them). The smoke title is its own runner. */
+extern "C" int ps3_stdout_immediate(void) { return 1; }   /* unbuffered: smoke output is read live */
+extern "C" void* spu_plug_lookup(void* ctx, uint32_t pc) { (void)ctx; (void)pc; return nullptr; }   /* no compiled WWS plugins */
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
 

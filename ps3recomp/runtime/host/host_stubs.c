@@ -124,3 +124,23 @@ uint32_t g_spu_image_span = 0;
 void ppu_dump_bctrl_ring(uint32_t a, const char* tag) { (void)a; (void)tag; }
 uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }
 
+
+/* ppu_loader.cpp / ppu_hle.cpp - more references the library makes into the
+ * per-game loader. Inert values for a host with no lifted game:
+ *   - A/B experiment bits: all off (0); g_abx's game default (0x83F) only
+ *     selects tuning paths of a running title.
+ *   - Inline lifted-load limits: 0 = every access goes out of line, which is
+ *     what a host with no lifted code does anyway.
+ *   - Profiler / HLE name lookups: nothing to resolve. */
+volatile int g_ab_mask = 0;
+volatile int g_ab_phase = 0;
+volatile int g_abx = 0;
+const char* g_hle_inflight[64];
+int g_vm_fast_inline = 0;
+uint64_t g_ppu_ld_lim = 0, g_ppu_st_lim2 = 0, g_ppu_vst_lim2 = 0, g_ppu_ld32_lim = 0, g_ppu_st32_lim2 = 0;
+uint32_t ppu_prof_resolve_host(void* ra) { (void)ra; return 0; }
+const char* ps3_hle_ctx_name(uint32_t nid) { (void)nid; return 0; }
+void ps3_prof_register_spu_thread(void) {}
+
+/* Supplied by a title's lifted SPU code (compiled WWS plugins). None here. */
+void* spu_plug_lookup(void* ctx, uint32_t pc) { (void)ctx; (void)pc; return 0; }

@@ -33,6 +33,9 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_store_observer.h"
 #include "ppu_recomp.h"
+#ifndef PPU_INJECT_BASE_C   /* set by a port's patched ppu_recomp.h; the plain lifter header has no inline GCM check */
+#define PPU_INJECT_BASE_C 0x20000000u   /* = cellGcmSys.c ppu_hle_inject_base default */
+#endif
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
