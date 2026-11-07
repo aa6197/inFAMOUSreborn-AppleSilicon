@@ -174,6 +174,46 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 
+#if defined(__APPLE__)
+/* AUDIO_WAV=<path> (default off): also write every block sent to the device to
+ * a float32 stereo WAV, so a headless run can show the game makes sound. The
+ * header sizes are refreshed about once a second, since runs end by SIGKILL. */
+static FILE* s_wav = NULL;
+static u32   s_wav_frames = 0, s_wav_synced = 0;
+static void wav_header(u32 frames)
+{
+    const u32 data = frames * 8u, riff = 36u + data, fmt_len = 16u, rate = CELL_AUDIO_SAMPLE_RATE;
+    const u32 bps = rate * 8u;
+    const uint16_t tag = 3, ch = 2, align = 8, bits = 32;
+    fseek(s_wav, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, s_wav); fwrite(&riff, 4, 1, s_wav); fwrite("WAVEfmt ", 1, 8, s_wav);
+    fwrite(&fmt_len, 4, 1, s_wav); fwrite(&tag, 2, 1, s_wav); fwrite(&ch, 2, 1, s_wav);
+    fwrite(&rate, 4, 1, s_wav); fwrite(&bps, 4, 1, s_wav); fwrite(&align, 2, 1, s_wav);
+    fwrite(&bits, 2, 1, s_wav); fwrite("data", 1, 4, s_wav); fwrite(&data, 4, 1, s_wav);
+    fseek(s_wav, 0, SEEK_END);
+    fflush(s_wav);
+}
+static void wav_write(const float* stereo, u32 n)
+{
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char* path = getenv("AUDIO_WAV");
+        if (path && *path && (s_wav = fopen(path, "wb")) != NULL) {
+            wav_header(0);
+            fprintf(stderr, "[cellAudio] writing device output to %s (AUDIO_WAV)\n", path);
+        }
+    }
+    if (!s_wav) return;
+    fwrite(stereo, sizeof(float) * 2u, n, s_wav);
+    s_wav_frames += n;
+    if (s_wav_frames - s_wav_synced >= CELL_AUDIO_SAMPLE_RATE) {
+        wav_header(s_wav_frames);
+        s_wav_synced = s_wav_frames;
+    }
+}
+#endif
+
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
@@ -197,6 +237,11 @@ static int audio_backend_init(void)
         return -1;
     }
 
+#if defined(__APPLE__)
+    printf("[cellAudio] SDL audio open: %d Hz, %d ch, %d samples, f32 %s (driver %s)\n",
+           have.freq, have.channels, have.samples, have.format == AUDIO_F32SYS ? "yes" : "no",
+           SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
+#endif
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
 }
@@ -214,6 +259,9 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (s_sdl_audio_dev) {
         SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
                        num_samples * 2 * sizeof(float));
+#if defined(__APPLE__)
+        wav_write(stereo_samples, num_samples);
+#endif
     }
 }
 
