@@ -2107,6 +2107,17 @@ static int taskwait_adapt_active(void)
  * V241A_LEAN unset/"auto": on when the process affinity mask has fewer than V241A_LEAN_CPUS (default 17 since v242A, was 16) logical
  * CPUs (re-checked every 2 s, so a mask set after start counts); "0" = never (old behaviour); "1" = always.
  * V241A_LEAN_PHASE=0|1: only in that PS3_AB phase parity (in-run A/B). */
+#if defined(__APPLE__)
+#include <unistd.h>
+#include <TargetConditionals.h>
+static int spurs_apple_ncpu(void)   /* Apple port: logical CPUs online (V242A_NCPU overrides, as on Windows) */
+{
+    const char* o = getenv("V242A_NCPU");
+    if (o && *o) return atoi(o);
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+}
+#endif
 static int v241a_lean(void)
 {
     extern volatile int g_ab_phase;
@@ -2129,6 +2140,25 @@ static int v241a_lean(void)
             const int a = n < lim;
             if (a != s_auto || !s_chk) fprintf(stderr, "[LEAN] v241A %d logical CPUs in the affinity mask -> lean %s\n", n, a ? "ON" : "off");
             s_auto = a; s_chk = now;
+        }
+        on = s_auto;
+    }
+#elif defined(__APPLE__)
+    /* Apple port: iOS uses the same auto rule. No affinity masks there, so count the CPUs the system runs
+     * (an iPhone has 6, an M-series iPad 9-10). macOS keeps the old default (off): the Mac A/B (15 CPUs,
+     * 2 pairs x 300 s) gave lean off 34.8 / 35.3 flips/s, lean on 35.2 / 33.6 -> no gain. On the Mac,
+     * V242A_NCPU=<n> applies the auto rule to that count (to mimic an iPhone). Checked once. */
+    if (on < 0) {
+        if (!s_chk) {
+            const int n = spurs_apple_ncpu();
+#if TARGET_OS_IPHONE
+            s_auto = n < lim;
+#else
+            const char* o = getenv("V242A_NCPU");
+            s_auto = (o && *o) ? n < lim : 0;
+#endif
+            s_chk = 1;
+            fprintf(stderr, "[LEAN] v241A %d logical CPUs -> lean %s\n", n, s_auto ? "ON" : "off");
         }
         on = s_auto;
     }
@@ -2174,6 +2204,8 @@ static int v242a_aff_ncpu(void)   /* logical CPUs in the process affinity mask (
 #ifdef _WIN32
     DWORD_PTR pm = 0, sm = 0;
     if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm) return (int)__builtin_popcountll((unsigned long long)pm);
+#elif defined(__APPLE__)
+    return spurs_apple_ncpu();   /* lean width (CPUs/2 threads) and V242A_AUDKEEP use the real count */
 #endif
     return 64;
 }

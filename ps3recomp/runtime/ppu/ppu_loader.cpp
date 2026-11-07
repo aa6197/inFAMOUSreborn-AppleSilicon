@@ -4597,7 +4597,13 @@ extern "C" void ps3_prof_main_start(void)
     fprintf(stderr, "[PROF] sampling the main guest thread every %u ms (v62)\n", ms);
 }
 #else
-extern "C" int ps3_host_ncpu(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }   /* v242B */
+extern "C" int ps3_host_ncpu(void)   /* v242B; PS3_NCPU=<n> overrides, as on Windows */
+{
+    static int s_env = -2;
+    if (s_env == -2) { const char* e = getenv("PS3_NCPU"); s_env = (e && *e) ? atoi(e) : -1; }
+    if (s_env > 0) return s_env;
+    long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1;
+}
 extern "C" void ps3_thread_prefer_pcores(const char* who, int prio) { (void)who; (void)prio; }
 extern "C" void ps3_thread_pcore_set(const char* who, int want, int prio) { (void)who; (void)want; (void)prio; }
 extern "C" void ps3_prof_main_start(void) {}
