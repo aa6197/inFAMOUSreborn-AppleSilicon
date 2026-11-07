@@ -884,6 +884,112 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
 
 /* ---- guest textures ------------------------------------------------------ */
 
+/* BC (DXT) fallback (Apple port). Apple-silicon Macs sample BC1/2/3 natively;
+ * the iOS Simulator and older iOS GPUs do not (Metal rejects the texture
+ * descriptor). There the texture is made RGBA8 and its blocks are decoded on
+ * the CPU at upload, as the standard S3TC rules define them. The D3D12
+ * backend has no equivalent because every D3D12 GPU samples BC natively.
+ * PS3RECOMP_METAL_BC_DECODE=1 forces the decode (to test it on a Mac),
+ * =0 never decodes. */
+static int bc_decode_needed(void)
+{
+    static int v = -1;
+    if (v >= 0) return v;
+    const char* e = getenv("PS3RECOMP_METAL_BC_DECODE");
+    int hw = 0;
+    if (@available(macOS 11.0, iOS 16.4, *)) hw = s_dev && [s_dev supportsBCTextureCompression];
+    if (e && *e) v = (*e != '0');
+    else         v = !hw;
+    fprintf(stderr, "[rsx metal] BC textures: GPU %s, %s\n", hw ? "samples them" : "cannot sample them",
+            v ? "decoded to RGBA8 on the CPU" : "uploaded as BC");
+    return v;
+}
+
+static void bc_rgb565(u32 c, u8* o)
+{
+    const u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, b = c & 31u;
+    o[0] = (u8)((r << 3) | (r >> 2));
+    o[1] = (u8)((g << 2) | (g >> 4));
+    o[2] = (u8)((b << 3) | (b >> 2));
+    o[3] = 255;
+}
+
+/* One 8-byte colour block into 16 RGBA texels. `four` forces the 4-colour
+ * mode (BC2/BC3 colour blocks); BC1 picks it from c0 > c1. */
+static void bc_color_block(const u8* b, u8 px[16][4], int four)
+{
+    const u32 c0 = (u32)b[0] | ((u32)b[1] << 8), c1 = (u32)b[2] | ((u32)b[3] << 8);
+    u8 pal[4][4];
+    bc_rgb565(c0, pal[0]);
+    bc_rgb565(c1, pal[1]);
+    if (four || c0 > c1) {
+        for (int k = 0; k < 3; k++) {
+            pal[2][k] = (u8)((2u * pal[0][k] + pal[1][k]) / 3u);
+            pal[3][k] = (u8)((pal[0][k] + 2u * pal[1][k]) / 3u);
+        }
+        pal[2][3] = pal[3][3] = 255;
+    } else {
+        for (int k = 0; k < 3; k++) pal[2][k] = (u8)((pal[0][k] + pal[1][k]) / 2u);
+        pal[2][3] = 255;
+        pal[3][0] = pal[3][1] = pal[3][2] = pal[3][3] = 0;
+    }
+    const u32 idx = (u32)b[4] | ((u32)b[5] << 8) | ((u32)b[6] << 16) | ((u32)b[7] << 24);
+    for (int i = 0; i < 16; i++) memcpy(px[i], pal[(idx >> (2 * i)) & 3u], 4);
+}
+
+/* `bc` 1, 2 or 3. `src` holds rows of 4x4 blocks `row_bytes` apart; `dst`
+ * gets w x h RGBA8 texels, `dst_row` bytes per row. */
+static void bc_decode_rgba8(int bc, const u8* src, u32 row_bytes, u32 w, u32 h,
+                            u8* dst, u32 dst_row)
+{
+    const u32 bw = (w + 3u) / 4u, bh = (h + 3u) / 4u, bsz = (bc == 1) ? 8u : 16u;
+    for (u32 by = 0; by < bh; by++) {
+        const u8* row = src + (size_t)by * row_bytes;
+        for (u32 bx = 0; bx < bw; bx++) {
+            const u8* b = row + (size_t)bx * bsz;
+            u8 px[16][4];
+            if (bc == 1) {
+                bc_color_block(b, px, 0);
+            } else {
+                bc_color_block(b + 8, px, 1);
+                if (bc == 2) {
+                    for (int i = 0; i < 16; i++) {
+                        const u32 a = (b[i >> 1] >> ((i & 1) * 4)) & 15u;
+                        px[i][3] = (u8)(a * 17u);
+                    }
+                } else {
+                    const u32 a0 = b[0], a1 = b[1];
+                    u8 al[8];
+                    al[0] = (u8)a0; al[1] = (u8)a1;
+                    if (a0 > a1) {
+                        for (u32 k = 1; k < 7; k++) al[k + 1] = (u8)(((7u - k) * a0 + k * a1) / 7u);
+                    } else {
+                        for (u32 k = 1; k < 5; k++) al[k + 1] = (u8)(((5u - k) * a0 + k * a1) / 5u);
+                        al[6] = 0; al[7] = 255;
+                    }
+                    u64 bits = 0;
+                    for (int k = 0; k < 6; k++) bits |= (u64)b[2 + k] << (8 * k);
+                    for (int i = 0; i < 16; i++) px[i][3] = al[(bits >> (3 * i)) & 7u];
+                }
+            }
+            for (u32 y = 0; y < 4; y++) {
+                const u32 ty = by * 4u + y;
+                if (ty >= h) break;
+                for (u32 x = 0; x < 4; x++) {
+                    const u32 tx = bx * 4u + x;
+                    if (tx >= w) break;
+                    memcpy(dst + (size_t)ty * dst_row + (size_t)tx * 4u, px[y * 4 + x], 4);
+                }
+            }
+        }
+    }
+}
+
+static int texfmt_bc(rsx_texfmt f)
+{
+    return f == RSX_TEXFMT_BC1 ? 1 : f == RSX_TEXFMT_BC2 ? 2 : f == RSX_TEXFMT_BC3 ? 3 : 0;
+}
+
 static MTLPixelFormat texfmt_to_metal(rsx_texfmt f)
 {
     switch (f) {
@@ -1012,7 +1118,8 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt,
 
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType       = cube ? MTLTextureTypeCube : MTLTextureType2D;
-    td.pixelFormat       = texfmt_to_metal(lv[0].tl.fmt);
+    const int bc = bc_decode_needed() ? texfmt_bc(lv[0].tl.fmt) : 0;
+    td.pixelFormat       = bc ? MTLPixelFormatRGBA8Unorm : texfmt_to_metal(lv[0].tl.fmt);
     td.width             = w;
     td.height            = h;
     td.mipmapLevelCount  = nlv;
@@ -1038,13 +1145,24 @@ static id<MTLTexture> upload_texture(const u8* src, u32 w, u32 h, u32 fmt,
             rsx_texture_decode(s_tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
                                rsx_texture_argb_is_rgba());
+            const void* bytes = s_tex_staging;
+            u32 bpr = tl->dst_row_bytes;
+            u8* rgba = NULL;
+            if (bc) {
+                bpr = lv[m].w * 4u;
+                rgba = (u8*)malloc((size_t)bpr * lv[m].h);
+                if (!rgba) return nil;
+                bc_decode_rgba8(bc, s_tex_staging, tl->dst_row_bytes, lv[m].w, lv[m].h, rgba, bpr);
+                bytes = rgba;
+            }
             /* bytesPerImage is for 3D textures only; a cube face is a slice. */
             [tex replaceRegion:MTLRegionMake2D(0, 0, lv[m].w, lv[m].h)
                    mipmapLevel:m
                          slice:f
-                     withBytes:s_tex_staging
-                   bytesPerRow:tl->dst_row_bytes
+                     withBytes:bytes
+                   bytesPerRow:bpr
                  bytesPerImage:0];
+            free(rgba);
         }
     }
     return tex;
@@ -2079,6 +2197,7 @@ static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
  * first. Commits on the one queue finish in order. */
 #define ENG_FLIGHT 8u
 static u32 s_eng_obj_use[ENG_MAX_OBJECTS];
+static u8  s_eng_obj_bc[ENG_MAX_OBJECTS];   /* 1-3: a BC1-3 texture held as RGBA8 (bc_decode_needed) */
 static u32 s_eng_serial = 1;              /* the commit being recorded */
 static _Atomic u32 s_eng_done_serial;     /* last commit known finished */
 static id<MTLCommandBuffer> s_eng_flight_cb[ENG_FLIGHT];
@@ -2233,6 +2352,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
     }
     s_eng_obj[slot] = t;
     s_eng_obj_use[slot] = 0;
+    s_eng_obj_bc[slot] = 0;
     return slot + 1;
 }
 
@@ -2489,8 +2609,10 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     (void)user;
     if (!s_dev || !w || !h) return 0;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    const int bc = !bc_decode_needed() ? 0 :
+        fmt == RSX_BE_FMT_BC1 ? 1 : fmt == RSX_BE_FMT_BC2 ? 2 : fmt == RSX_BE_FMT_BC3 ? 3 : 0;
     td.textureType      = (faces == 6) ? MTLTextureTypeCube : MTLTextureType2D;
-    td.pixelFormat      = eng_pixel_format(fmt);
+    td.pixelFormat      = bc ? MTLPixelFormatRGBA8Unorm : eng_pixel_format(fmt);
     td.width            = w;
     td.height           = h;
     td.mipmapLevelCount = mips ? mips : 1;
@@ -2502,7 +2624,9 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 handle = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    if (handle) s_eng_obj_bc[handle - 1] = (u8)bc;
+    return handle;
 }
 
 static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
@@ -2513,6 +2637,16 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
     eng_obj_wait_idle(handle);
+    if (s_eng_obj_bc[handle - 1]) {
+        const u32 bpr = w * 4u;
+        u8* rgba = (u8*)malloc((size_t)bpr * h);
+        if (!rgba) return;
+        bc_decode_rgba8(s_eng_obj_bc[handle - 1], (const u8*)src, row_bytes, w, h, rgba, bpr);
+        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:mip slice:face
+               withBytes:rgba bytesPerRow:bpr bytesPerImage:0];
+        free(rgba);
+        return;
+    }
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
          mipmapLevel:mip
                slice:face
