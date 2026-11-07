@@ -23,6 +23,10 @@
 #include <string.h>
 #include <time.h>
 
+#define XXH_INLINE_ALL
+#define XXH_STATIC_LINKING_ONLY
+#include "xxhash.h"
+
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
@@ -151,6 +155,8 @@ static struct {
     u32 n_textures;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
+    /* Open-addressed index over pipelines[] by key: slot = pipeline + 1. */
+    u16 pipe_index[ENG_MAX_PIPELINES * 2u];
     eng_display_buffer display_buffers[8];
 
     u32 frames;
@@ -1575,7 +1581,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
     } else {
-        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        /* XXH3 over the program words, seeded with the running key: the
+         * byte-wise FNV here was ~3% of the RSX thread. */
+        key = XXH3_64bits_withSeed(vp_uc, (size_t)vp_instrs * 16u, key);
         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
         if (!key) return 0;
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
@@ -1601,11 +1609,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
 
-    for (u32 i = 0; i < g.n_pipelines; i++)
-        if (g.pipelines[i].key == key) {
-            *out_fixed = g.pipelines[i].fixed;
-            g.ps_hash = g.pipelines[i].ps_hash;
-            return g.pipelines[i].handle;
+    const u32 pmask = ENG_MAX_PIPELINES * 2u - 1u;
+    u32 pslot = (u32)(key ^ (key >> 29) ^ (key >> 47)) & pmask;
+    for (u32 n; (n = g.pipe_index[pslot]) != 0; pslot = (pslot + 1u) & pmask)
+        if (g.pipelines[n - 1u].key == key) {
+            *out_fixed = g.pipelines[n - 1u].fixed;
+            g.ps_hash = g.pipelines[n - 1u].ps_hash;
+            return g.pipelines[n - 1u].handle;
         }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
@@ -1665,6 +1675,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].ps_hash = g.ps_hash =
         eng_fnv1a(s_ps_hlsl, (u32)strlen(s_ps_hlsl), 1469598103934665603ull);
     g.n_pipelines++;
+    g.pipe_index[pslot] = (u16)g.n_pipelines;
     *out_fixed = fixed;
     return handle;
 }
