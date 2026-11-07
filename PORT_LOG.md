@@ -5,7 +5,12 @@ Read this first every session. Newest entry on top.
 ## Now
 
 - Milestone: **M0 done**. Next: **M1** (installer on Mac).
-- Blocked on: game dump location (`GAME_DIR`). Ask the user.
+- Game: ISO on an external drive (path in the local notes). Must be plugged in.
+  - BCES00220, inFamous, Europe. PARAM.SFO VERSION 01.01, APP_VER 01.00.
+  - Decrypted image: data in the "encrypted" regions is in the clear
+    (EBOOT.BIN reads `SCE\0`). The installer's detect_encryption handles this. No .dkey.
+  - EBOOT.BIN is a retail SELF, so M1 needs RPCS3 to decrypt it to EBOOT.elf.
+    Then check its sha256 against `eboot_sha256` in installer/infamous.toml.
 
 ---
 
