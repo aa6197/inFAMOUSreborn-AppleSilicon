@@ -4,7 +4,7 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M4 done**. Next: **M5** (gameplay renders close to references; audio plays).
+- Milestone: **M4 done**. M5 references captured (`$REF_DIR/rpcs3/`). Next: **M5** (gameplay renders close to references; audio plays).
 - Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
@@ -13,6 +13,64 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M5 prep: reference frames
+
+### Result
+
+Golden set captured in RPCS3 and compared with the port.
+
+- **Golden set:** `$REF_DIR/rpcs3/` (10 frames, 1280x720, `SOURCES.txt`).
+  Run: `$WORK_DIR/runs/20261107-142201-golden/`.
+- **Port, same path, French:** `$WORK_DIR/runs/20261107-142726-golden-port-fr/keep/`
+  (`cmp/` has the diff images).
+
+| Scene | RMSE | Mean RGB RPCS3 / port | Saturation RPCS3 / port | Look |
+|---|---|---|---|---|
+| SCE presents | 0.095 | 4,3,4 / 3,2,3 | — | same; legal line differs (US vs EU title id) |
+| Sucker Punch logo (warm) | 0.083 | 83,49,30 / 82,49,29 | 60 / 61 | same |
+| Sucker Punch logo (cool) | 0.086 | 48,61,68 / 48,60,66 | 19 / 18 | same |
+| Title | 0.144 | 37,46,55 / 58,68,74 | 17 / 15 | port brighter, flatter |
+| Cutscene (Cole wakes) | 0.162 | 46,30,24 / 66,58,54 | 20 / 9 | port grey; jacket light instead of dark |
+| First gameplay | 0.077 | 45,29,23 / 48,40,36 | 20 / 9 | port grey |
+| Tutorial | 0.104 | 69,48,40 / 78,68,62 | 24 / 12 | port grey; Cole's clothes light |
+| Pause menu | 0.134 | 147,146,145 / 156,155,154 | 4 / 5 | same text and layout; port adds Settings, Quit Game (by design) |
+
+RMSE is high everywhere because animated scenes never line up in time.
+Read the colour columns and the pictures, not RMSE alone.
+
+### Findings
+
+- **2D is right.** Movies, logos and menus match RPCS3.
+- **3D scenes are washed out.** About half the saturation, brighter shadows,
+  no warm grade. Cole's dark jacket comes out light grey. Looks like a
+  missing or wrong post-process (colour grade / tone curve) or a texture
+  channel problem. This is the first M5 task. Next: frame trace + pass
+  dumps of one gameplay frame, find the grade pass, compare with D3D12.
+
+### Setup found on the way
+
+- **Firmware 4.93** from Sony (`deu01.ps3.update.playstation.net/.../PS3UPDAT.PUP`,
+  206,197,916 bytes, MD5 `a2b60b6ac1d2e49e230144345616927c`, matches the URL).
+  In `$WORK_DIR/firmware/`. `--installfw` fails with `--headless`; GUI mode works.
+- **RPCS3 wrote to ~/Library since M1.** It ignores `RPCS3_CONFIG_DIR` /
+  `RPCS3_CACHE_DIR`. Moved `~/Library/Application Support/rpcs3` and
+  `~/Library/Caches/rpcs3` (both made by the M1 run) into
+  `$WORK_DIR/rpcs3-home/Library/`. Now run with `HOME=$WORK_DIR/rpcs3-home`.
+  Checked: nothing new in ~/Library.
+- **Language:** the EU disc ships French, Italian, German, Spanish, Dutch
+  (lists at `0x00720868`, read from `EBOOT.elf`). No English, so RPCS3 is
+  always French. The port reports title id `BLES00000`, gets the US list,
+  shows English. Use `PS3_LANG=french` on the port for comparisons.
+- **Driving RPCS3** with no screen-recording permission: `tools/rkey`
+  (CGEvent posted to the RPCS3 pid only), F12 screenshots, keyboard pad.
+  New tools in `$WORK_DIR/tools`: `rkey`, `rshot.sh`, `rpcs3_run.sh`.
+- RPCS3 config: fullscreen off, "Show capture hints" off (older shots have a
+  "Screenshot saved" box top-left; mask `0,0 560,56`).
+- The port ignores SIGINT and SIGTERM; stop it with KILL.
+- Disk: 94% full (58 GB free). `$WORK_DIR/runs` is about 6 GB of frame dumps.
 
 ---
 
@@ -246,7 +304,8 @@ Logs: `$WORK_DIR/runs/m1-install-20261107-123619/`, `$WORK_DIR/logs/m1-*.log`.
 - **RPCS3:** Homebrew has no cask. Used the official build
   (v0.0.43-20570, github.com/RPCS3/rpcs3-binaries-mac-arm64), digest checked,
   unpacked into `$WORK_DIR/tools/rpcs3`. Only used for `--decrypt`.
-  `RPCS3_CONFIG_DIR` / `RPCS3_CACHE_DIR` keep it out of ~/Library.
+  (Wrong at the time: RPCS3 ignores `RPCS3_CONFIG_DIR` / `RPCS3_CACHE_DIR`.
+  Fixed during M5 prep, see that entry.)
 
 ### What changed
 
