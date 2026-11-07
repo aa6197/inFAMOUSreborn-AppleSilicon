@@ -4,10 +4,13 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M6 done.** Next: **M7** (steady 30 fps; now ~9.5 flips/s
-  in gameplay).
-- M5 is **parked**: audio plays, 3D is still too bright on near surfaces.
+- Milestone: **M7 done** (~33 flips/s on the Mac, was ~9.6).
+  Next: **M8** (iOS Simulator app boots to the menu).
+- M5 is **parked**: 3D is still too bright on near surfaces. Audio is
+  now clean (it was choppy only because the game ran slow).
   Open items are in the M5 entry below.
+- Run the static speed test with `$WORK_DIR/tools/prof.sh` and a
+  movement soak with `$WORK_DIR/tools/soak.sh` (see the M7 entry).
 - Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
@@ -16,6 +19,113 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M7: speed
+
+### Result
+
+- **M7 done.** Steady 30+ flips/s on the Mac (was ~9.6).
+  - The game is not capped at 30, so it runs a bit above.
+  - Static tutorial scene (no input after START), 150–290 s:
+    **32.9 flips/s**. 10-flip windows: lowest 29.7, p5 31.4, p50 33.0.
+    0 of 460 below 29.
+  - Movement soak (walk, jump, camera, R1, pause loop), 240–420 s:
+    **34.1 flips/s**. Lowest 31.6, p5 33.1. 0 of 613 below 29.
+- **Memory:** RSS 1.43 GB at 7 min (M6: ~1.5 GB). See "Memory" below.
+- **Audio:** clean. 0% silent, 0 late blocks (M6: ~33% silent).
+  The M5 "choppy audio" item is fixed by the speed.
+- **Checks:**
+  - `PS3RECOMP_ENGINE_VTX_VERIFY=1` run: 34.3 M index reads and
+    34.9 M draws checked against the old path, 0 differences.
+  - Frames look right by eye (title, gameplay) after each change.
+  - Toolkit: builds, ctest 2/2, `test_shader_msl` 65/65,
+    `ps3recomp_host --draw` OK.
+
+### Where the time went
+
+- Time Profiler (`xctrace`) on the static scene.
+- The RSX thread is the limit: ~98% busy at 9.6 flips/s, and still at 33.
+- Big costs at the start:
+  - vertex and index fetch, one index at a time;
+  - hashing every byte of every texture each frame;
+  - pipeline lookup (long key, linear search);
+  - clearing a 32 KB constant block per draw;
+  - headless presents waited for the GPU every frame;
+  - each commit copied the whole staging arena into a new buffer.
+- SPU: `setjmp`/`longjmp` made a syscall each time (signal mask),
+  ~35% of the SPURS kernel thread.
+
+### What changed (static scene, flips/s after each step)
+
+| Step | flips/s |
+|---|---|
+| Start (`base1`) | 9.6–10.2 |
+| SPU: NEON `tbl` for shufb tables, `_setjmp`/`_longjmp` | 9.1–9.4 (frees CPU; RSX still the limit) |
+| Engine: fp constants without the 32 KB clear; sampled texture checksum + set-associative texture lookup | 12.8–14.0 |
+| Engine: fast vertex path. A/B on vs off: 16.3 vs 12.9 (+26%) | ~16.3 |
+| XXH3 pipeline key + hashed lookup; element ranges scanned once; VS constants staged without a copy; Metal: pipelined headless presents, staging ring, no redundant encoder state | 25.3–26.4 |
+| Bulk index read with one-pass dedupe | 28.8–30.5 |
+| Per-type vertex loops | 31.0–32.4 |
+| Fixed 64 MB staging slots (memory fix) | 31.0–31.2 |
+| VCB_DEDUP: re-use the staged vertex constants when unchanged (as D3D12) | 32.2–33.4 |
+
+### Memory
+
+- Pipelined presents need a ring of 4 staging buffers (3 frames in flight).
+- A gameplay frame stages 150–240 MB: 8 KB of vertex constants per draw
+  (~13k draws), plus vertices and indices.
+- First version: each slot grew to the largest frame. RSS 2.9 GB.
+  Growing in smaller steps was worse (4.9 GB): freed Metal buffers stay
+  resident.
+- Now: slots are a fixed 64 MB, made once. A frame that fills ¾ of a slot
+  commits what it has (no wait) and goes on in the next slot.
+- VCB_DEDUP then cut what a frame stages, which won back the speed.
+
+### New switches
+
+- `PS3RECOMP_ENGINE_VTX_FAST=0`: old vertex and index path.
+- `PS3RECOMP_ENGINE_VTX_VERIFY=1`: run both paths, log any difference.
+- `PS3RECOMP_ENGINE_TEX_FULLHASH=1`: hash whole textures (old way).
+- `PS3RECOMP_METAL_HEADLESS_SYNC=1`: wait for the GPU on every commit (old way).
+- `PS3RECOMP_METAL_STAGE_MB=<n>`: staging slot size, 8–384 (default 64).
+- `VCB_DEDUP=0`: stage the vertex constants for every draw (same name as D3D12).
+
+### Tools added
+
+- `$WORK_DIR/tools/prof.sh <secs> <tag> <at> <dur> [template] [VAR=val ...]`:
+  static-scene run (START at 50 s, then no input). If `<at>` > 0, attaches
+  `xctrace` at `<at>` s for `<dur>` s into `<run>/prof.trace`.
+  - Export: `xcrun xctrace export --input prof.trace --xpath
+    '/trace-toc/run/data/table[@schema="time-profile"]' > tp.xml`.
+- Keep the Mac awake beside it: `nohup caffeinate -i -t <secs> &`.
+  Early runs slept at 1% battery; now on AC.
+
+### Runs
+
+- Start: `20261107-185502-m7-base1`.
+- Final static: `20261107-211501-m7-vcb1`.
+- Final movement: `20261107-212032-m7-move4`.
+- Index verify: `20261107-202722-m7-vverify2`.
+- Memory: `20261107-203743-m7-move` (2.9 GB), `-205016-m7-move2` (4.9 GB),
+  `-210032-m7-move3` (1.42 GB).
+
+### Open items
+
+- RSX thread still ~98% busy. Next hot spots: `sink_end` 16%,
+  `dc_fetch_indexed_fast` 12%, `rsx_process_method` 8%, `memmove` 8%,
+  texture hash 6%, Metal encode ~16% (profile before VCB_DEDUP).
+- Ideas from D3D12: cross-frame vertex cache (VCACHE), vertex fetch on
+  worker threads (VTX_ASYNC).
+- iPhone: maybe 2 frames in flight instead of 3 (one less staging slot).
+- Linker warning "reducing alignment of section `__DATA,__common`".
+  Harmless; the toolkit build shows it too.
+- `[STALL] late pickup` SPURS lines: same rate as M6 (~3–4 a minute). Not new.
+
+### Next step
+
+- M8: build for the iOS Simulator and boot to the menu.
 
 ---
 
