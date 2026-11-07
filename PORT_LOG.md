@@ -4,7 +4,8 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M2 done**. Next: **M3** (boot: guest reaches entry, then `main`; log shows flips).
+- Milestone: **M3 done**. Next: **M4** (main menu renders via Metal; `PAD_FILE` navigates it).
+- Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
   The ISO on an external drive is only needed to re-extract.
@@ -12,6 +13,58 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M3: boot
+
+### Result
+
+M3 check passes on the first try. No code change was needed.
+
+| Check | Result |
+|---|---|
+| Entry | ELF entry OPD `0x00771B50` -> code `0x00010230`; dispatched |
+| `main` | crt `func_00010348` calls `func_00193950(argc, argv, envp)`, then `exit()`. That is guest `main`. |
+| In `main` | flip stack: `func_00010230` -> `func_00010348+0x190` -> `func_00193950+0x104` -> ... -> flip, on PPU tid 1 |
+| Flips | 11,390 in 100 s (`GCM_FLIPCOUNT=1`) |
+| Errors / crashes | 0 in the log |
+| Repo after run | clean (no stray files) |
+
+- Two headless runs (120 s, 100 s), same result.
+- Metal: "headless on Apple M5 Pro (1280x720), guest shaders on".
+- SPURS, SPU threads, audio, file reads and Bink all start.
+
+Logs: `$WORK_DIR/runs/20261107-130159-boot1/`, `$WORK_DIR/runs/20261107-130458-boot2/`.
+
+### What changed
+
+- No code changes.
+- **Run script:** `$WORK_DIR/tools/run_game.sh` (outside the repo). It
+  loads `$WORK_DIR/launch_env.sh`, which holds the 173 `[launch] env`
+  vars from `installer/infamous.toml`. Re-make that file if the toml changes.
+- **Port notes:**
+  - The `PS3_DEBUG` console only exists in the toolkit harness, not in
+    `inFamousRecomp`.
+  - Added the flip switches (`GCM_FLIPCOUNT`, `FRAME_DRAWS`, `GCM_FLIP_BT`).
+  - Use `/usr/bin/grep` on the lifted files; the shell's ugrep skips them.
+
+### Open items
+
+- **Ctrl-C (SIGINT) doesn't stop the game.** `gtimeout` needs its
+  `-k 10` kill (rc 137). Likely SDL's own SIGINT handler, which turns the
+  signal into a quit event that nothing reads. Look at it before the M6 soak.
+- **Frame rate:** about 15 flips/s late in the run, with ~5,900 draws and
+  ~1.6 M verts per frame. Windows in-world is ~1,270 draws. Don't know
+  yet what is on screen. Check it with a frame dump in M4.
+- **Pad:** `connected=0` (no controller, headless). M4 uses `PAD_FILE`.
+- **`__common` alignment warning** (from M2): nothing odd seen so far.
+
+### Next step
+
+- M4: frame dump (`PS3RECOMP_METAL_FRAME_DUMP`) to see what renders. Then
+  reach the main menu and drive it with `PAD_FILE`.
+- Needs reference frames for the menu in `$REF_DIR` (RPCS3, or ask the user).
 
 ---
 
