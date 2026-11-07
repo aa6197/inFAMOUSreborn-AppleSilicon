@@ -4,7 +4,9 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M4 done**. M5 references captured (`$REF_DIR/rpcs3/`). Next: **M5** (gameplay renders close to references; audio plays).
+- Milestone: **M5 in progress**. Audio plays. 3D is closer but still greyer
+  and brighter than RPCS3 on near surfaces. Next: see "Next step" in the
+  newest entry.
 - Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
@@ -13,6 +15,66 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M5: lighting fixes, audio check
+
+### Result
+
+- **Audio plays.** SDL2 on CoreAudio, 48 kHz stereo float. A WAV dump of a
+  228 s run has game sound. Choppy: ~half the blocks arrive late
+  (concealed), 30–50% of blocks silent. Tied to low frame rate (~15 flips/s). Goes to M7.
+- **3D colour: better, not done.** Ported three D3D12 fixes to the engine:
+  - TEX_XF (bx2 expand of G-buffer normals; sRGB decode when the guest asks).
+  - SUN_NDL_CLAMP (sun cascade N.L clamped).
+  - Depth bounds (each sun cascade lights only its own depth slice).
+
+| Scene | Mean RGB RPCS3 / port | HSL sat RPCS3 / port | RMSE |
+|---|---|---|---|
+| Title | 43,53,64 / 49,62,73 | 47 / 50 | 0.084 |
+| Cutscene (Cole wakes) | 54,36,28 / 98,76,66 | 56 / 48 | 0.221 |
+| Tutorial | 72,50,41 / 98,76,66 | 66 / 53 | 0.137 |
+
+Run: `$WORK_DIR/runs/20261107-154709-m5-dbt1/keep/` (+ `cmp/`).
+
+### What is still wrong
+
+- Near lit surfaces are 1.3–2x too bright and less warm. Far fog and sky
+  match (ratio ~0.92). Rock is grey in the port, brown in RPCS3.
+- Ruled out (measured, not guessed):
+  - sRGB output: packer reg 0x1FEC is 0 on every draw.
+  - Texture gamma: no texture sets gamma bits (engine reads the same
+    register as D3D12).
+  - Composite tone curve: its c0 is 0, so it is off. Bloom and particles
+    are small (means < 0.03).
+  - Cascades stacking: each cascade lights a separate screen band.
+  - Cube map stride: the cubes are 1 mip, 2048 bytes a face, pitch 0.
+  - BC1 decode and channel remap: same code path as D3D12.
+- Left: the sun shader's light terms (sun colour, cool back light, ambient
+  cube, reflection cube, B8 ramp), or a decompiler gap shared with D3D12
+  (H/R register aliasing is not modelled). No second reference to tell
+  which: Windows can't run here.
+- Missing from the engine: signed blend (D3D12 v166). Heat-haze smoke may
+  show hard holes. Does not change overall brightness.
+
+### Tools added
+
+- Engine trace line: `ps=<hash>` (matches `fp_<hash>.hlsl` from
+  `PS3RECOMP_METAL_SHADER_DUMP`), depth bounds, stencil, texture location,
+  size, pitch, first bytes, and FP constants (up to 8).
+- `AUDIO_WAV=<path>` (Apple only): float WAV of what goes to the device.
+- Run recipe must include `PS3RECOMP_METAL_HEADLESS=1 PAD_FILE=...`, or
+  the GPU stalls at boot.
+
+### Next step
+
+Pick one:
+- Dump RPCS3's decompiled shaders (its "log shader programs" option) and
+  diff the sun shader against ours. Finds a shared decompiler bug.
+- Or get one Windows (D3D12) capture of the tutorial frame. Tells if the
+  gap is Apple-only.
+- Or park colour and go on to M6.
 
 ---
 
