@@ -4,9 +4,10 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M5 in progress**. Audio plays. 3D is closer but still greyer
-  and brighter than RPCS3 on near surfaces. Next: see "Next step" in the
-  newest entry.
+- Milestone: **M6 done.** Next: **M7** (steady 30 fps; now ~9.5 flips/s
+  in gameplay).
+- M5 is **parked**: audio plays, 3D is still too bright on near surfaces.
+  Open items are in the M5 entry below.
 - Run: `$WORK_DIR/tools/run_game.sh <secs> <tag> [VAR=val ...]` (see the port notes, "Run and observe").
 - Build dir: `infamous-recomp/build-mac` (Release, `-O2`, arm64). Command is in the port notes.
 - Game: extracted copy in `$WORK_DIR/game/BCES00220` (has `EBOOT.elf`).
@@ -15,6 +16,63 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-07 — M6: soak and TSAN
+
+### Result
+
+- **Soak 1 (31 min): pass.** No crash, no hang.
+  - Script: boot, START, then a 20 s loop: walk, jump, camera, R1, pause
+    menu open and close. Ran to the timeout (1910 s).
+  - Flips never stalled: lowest 270 per 30 s. Last flip 1.5 s before the kill.
+  - Gameplay speed ~9.6 flips/s (M7).
+  - RSS 1.33 GB at 4 min, 1.47 GB at 29 min, peak 1.59 GB, 1.36 GB at the
+    end. Grows ~5 MB/min, then drops back. Watch on iPad (M9).
+  - Run: `$WORK_DIR/runs/20261107-173902-m6-soak1/` (`soak.tsv`).
+- **Soak 2 (31 min, with the sync fixes): pass.** Same script, same result.
+  - Lowest 270 flips per 30 s. Last flip 1.6 s before the kill.
+  - ~9.5 flips/s in gameplay.
+  - RSS 1.47 GB at 4 min, 1.56 GB at the end, peak 1.64 GB.
+  - Run: `$WORK_DIR/runs/20261107-181123-m6-soak2/`.
+- **TSAN on sync code: clean.** `sync_stress` (lv2 mutex, cond, semaphore,
+  event queue, rwlock, plus the Win32 shim) under ThreadSanitizer.
+  - Before: 26 data-race warnings (all tests still passed).
+  - After: 0 warnings on 16 seeds. Normal `ctest` passes.
+
+### What TSAN found
+
+- No lost wakeups, no corruption. All were reads without the lock:
+  - Mutex owner pre-checks (`sys_mutex_lock`/`trylock`/`unlock`,
+    `sys_cond_wait`).
+  - "Queue empty?" hint before `sys_event_queue_receive` waits.
+  - Two log counters (`semaphore_post`, `PS3_EVQSTAT` init).
+  - Test watchdogs reading `Interlocked*` counters.
+- Fix: `LV2_PEEK`/`LV2_POKE`/`LV2_BUMP` in `lv2_syscall_table.h`. Relaxed
+  atomics off Windows (same `ldr`/`str` on arm64); plain access on
+  `_WIN32`, so Windows is unchanged. Harness uses `ReadAcquire`.
+- Not covered: lwmutex and lwcond (not in `sync_stress`), and a TSAN
+  build of the whole game (generated files are huge).
+
+### Tools added
+
+- `$WORK_DIR/tools/soak.sh <secs> <tag>`: soak run with the pad loop
+  above; samples secs, RSS MB and flip count to `<run>/soak.tsv` every 30 s.
+- TSAN build of the stress test (outside the repo):
+  ```
+  cmake -S ps3recomp/tests/sync_stress -B $WORK_DIR/build/sync_stress-tsan -G Ninja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -ffp-contract=off" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+  ```
+  Run `./sync_stress <seed>`; count `WARNING: ThreadSanitizer` in stderr.
+
+### Next step
+
+- M7: profile a gameplay run with `xctrace` (Time Profiler) and find
+  where the ~100 ms per frame goes.
+- Later: add lwmutex/lwcond to `sync_stress`; recheck RSS growth on iPad.
 
 ---
 
