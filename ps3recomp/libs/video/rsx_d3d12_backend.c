@@ -16290,5 +16290,8 @@ void rsx_d3d12_backend_present(void) {}
 volatile long long g_hz[32];
 int ps3_hz_is_main(void) { return 0; }
 void rsx_ww_bump(void) {}
+/*   g_lodx_f5_off -- F5 draw-distance toggle (the title's LODX hook reads it).
+ *     0 = scale on, the Windows default; no key handler here flips it. */
+volatile int g_lodx_f5_off = 0;
 
 #endif /* _WIN32 */

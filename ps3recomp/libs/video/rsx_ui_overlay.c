@@ -1156,6 +1156,12 @@ static void uiov_draw_list(ID3D12GraphicsCommandList* cl, D3D12_CPU_DESCRIPTOR_H
 }
 
 #else  /* !_WIN32: no overlay; cellMsgDialog keeps its non-interactive behaviour */
+/* Settings / pause-menu hooks that portable code (cellPad.c, the title's stubs.cpp and clock probe) reads or
+ * writes. Same defaults as the Windows definitions above; with no overlay nothing acts on them yet. */
+volatile int g_ui_fps_cap = -2;
+int (*volatile g_uiov_paused_fn)(void) = 0;
+volatile unsigned long long g_pause_menu_built_ms = 0;
+volatile int g_uiov_request = 0;
 int  uiov_dialog_available(void) { return 0; }
 unsigned long long uiov_last_draw_ms(void) { return 0; }
 void uiov_dialog_open(const char* m, int k, int d) { (void)m; (void)k; (void)d; }
