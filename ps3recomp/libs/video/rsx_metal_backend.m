@@ -2164,6 +2164,11 @@ static EngStageSlot s_eng_ring[ENG_STAGE_RING];
 static u32 s_eng_ring_cur;
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* The last transform constant block staged in this commit (VCB_DEDUP). */
+static int s_eng_vcb_valid;
+static u64 s_eng_vcb_gen;
+static u32 s_eng_vcb_off, s_eng_vcb_bytes, s_eng_vcb_tail_bytes;
+static u8  s_eng_vcb_tail[64];
 
 /* What the bind_* calls have accumulated for the next draw. */
 static EngRecord s_eng_pending;
@@ -2448,6 +2453,7 @@ static void eng_shutdown(void* user)
     s_eng_ring_cur = 0;
     s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_vcb_valid = 0;
     s_eng_helper_lib = nil;
     s_eng_blit_pso = nil;
     s_eng_depth_pso = nil;
@@ -2897,16 +2903,39 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     s_eng_pending.vs_cb_bytes = bytes;
 }
 
+/* VCB_DEDUP (rsx_d3d12_backend.c:7392): a draw whose transform constants
+ * and epilogue equal the last block staged in this commit binds that block
+ * again. Every constant write bumps a_gen; a commit forgets the block, since
+ * it recycles the arena. ~13k draws a frame each staged 8 KB, most of a
+ * frame's staging. VCB_DEDUP=0 stages every draw's block, as before. */
 static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
-                                        const void* b, u32 b_bytes)
+                                        const void* b, u32 b_bytes, u64 a_gen)
 {
     (void)user;
+    static int dedup = -1;
+    if (dedup < 0) {
+        const char* e = getenv("VCB_DEDUP");
+        dedup = (e && *e == '0') ? 0 : 1;
+    }
     (void)eng_rec_room();
     eng_stage_flush_point();
     u32 off = 0, bytes = a_bytes + b_bytes;
+    if (dedup && s_eng_vcb_valid && a_gen == s_eng_vcb_gen &&
+        bytes == s_eng_vcb_bytes && b_bytes == s_eng_vcb_tail_bytes &&
+        !memcmp(b, s_eng_vcb_tail, b_bytes)) {
+        s_eng_pending.vs_cb_off = s_eng_vcb_off;
+        s_eng_pending.vs_cb_bytes = bytes;
+        return;
+    }
     if (bytes && eng_stage_reserve(bytes, &off)) {
         memcpy(s_eng_stage + off, a, a_bytes);
         memcpy(s_eng_stage + off + a_bytes, b, b_bytes);
+        s_eng_vcb_valid = b_bytes <= sizeof s_eng_vcb_tail;
+        s_eng_vcb_gen = a_gen;
+        s_eng_vcb_off = off;
+        s_eng_vcb_bytes = bytes;
+        s_eng_vcb_tail_bytes = b_bytes;
+        if (s_eng_vcb_valid) memcpy(s_eng_vcb_tail, b, b_bytes);
     } else {
         bytes = 0;
     }
@@ -3445,6 +3474,7 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
         }
         s_eng_rec_count  = 0;
         s_eng_stage_used = 0;
+        s_eng_vcb_valid  = 0;
         eng_collect_retired_objects();
     }
 }

@@ -2837,7 +2837,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_pipeline(g.be->user, pipeline);
     if (g.be->bind_vs_constants_split) {
         g.be->bind_vs_constants_split(g.be->user, g.rsx.constants,
-                                      RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+                                      RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf,
+                                      g.rsx.constants_gen);
     } else {
         memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
         memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);

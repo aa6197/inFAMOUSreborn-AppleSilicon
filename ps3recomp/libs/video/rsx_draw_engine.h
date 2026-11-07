@@ -191,9 +191,12 @@ typedef struct rsx_draw_backend {
     /* Optional: the vertex constants as two pieces (the transform constant
      * block, then the viewport epilogue), staged with no intermediate copy --
      * the D3D12 path writes them straight into its upload heap
-     * (rsx_live_draw.c:7211-7213). NULL = bind_vs_constants on a joined copy. */
+     * (rsx_live_draw.c:7211-7213). NULL = bind_vs_constants on a joined copy.
+     * a_gen changes whenever a's contents may have: a backend may bind what it
+     * staged for an equal a_gen and equal b again (D3D12 VCB_DEDUP,
+     * rsx_d3d12_backend.c:7392). */
     void (*bind_vs_constants_split)(void* user, const void* a, u32 a_bytes,
-                                    const void* b, u32 b_bytes);
+                                    const void* b, u32 b_bytes, u64 a_gen);
     void (*bind_textures)(void* user, const u32* textures,
                           const rsx_be_sampler_desc* samplers, u32 mask);
     void (*bind_vertex_textures)(void* user, const u32* textures,
