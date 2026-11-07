@@ -3079,13 +3079,26 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
- * Headless submits have completed; windowed captures fence the same queue. */
+ * Headless submits have completed; windowed captures fence the same queue.
+ *   PS3RECOMP_METAL_FRAME_DUMP=<path>      binary PPM; a printf field in the path ("%u", "%06u") takes the
+ *                                          frame number (one file per capture), otherwise the file is overwritten.
+ *   PS3RECOMP_METAL_FRAME_DUMP_EVERY=<n>   capture every n-th presented frame (default 120). */
 static void eng_dump_frame(id<MTLTexture> src)
 {
     const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
     if (!path || !*path) return;
-    static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    static unsigned frame, every;
+    if (!every) {
+        const char* e = getenv("PS3RECOMP_METAL_FRAME_DUMP_EVERY");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        every = v > 0 ? (unsigned)v : 120u;
+    }
+    if ((++frame % every) != 0) return;
+    char numbered[1024];
+    if (strchr(path, '%')) {
+        snprintf(numbered, sizeof numbered, path, frame);
+        path = numbered;
+    }
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
         [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
     size_t w = [src width], h = [src height];
