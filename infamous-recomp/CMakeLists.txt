@@ -621,6 +621,70 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # link language from the generated C would leave the C++ standard library out.
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
+# ---------------------------------------------------------------------------
+# iOS / iPadOS app (Apple port; -DCMAKE_SYSTEM_NAME=iOS, Xcode generator)
+# ---------------------------------------------------------------------------
+# A personal sideload for the user's own devices: never exported as an .ipa.
+# The bundle holds code and the launcher environment only. Game data is
+# copied into the app's Documents (or, in the Simulator, passed as a host
+# path), never into the bundle. ios/ios_shell.mm owns the main thread and
+# runs main.cpp's entry (port_game_main under PORT_IOS) on a thread of its own.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    enable_language(OBJCXX)
+    set(PORT_BUNDLE_ID "local.subs.infamous" CACHE STRING "iOS bundle identifier (personal sideload)")
+    set(PORT_TEAM_ID "" CACHE STRING "Apple development team for device builds (empty = Simulator, ad-hoc signed)")
+    # The 4 GB guest reserve and the memory headroom want two entitlements
+    # (ios/infamous.entitlements) that need an explicit App ID with those
+    # capabilities. OFF signs without them (the team's wildcard profile is
+    # enough), for a first device run before the App ID exists.
+    option(PORT_IOS_ENTITLEMENTS "Sign with extended-virtual-addressing + increased-memory-limit" ON)
+
+    # The launcher environment ([launch] env), which an iOS app has no launcher to set.
+    find_package(Python3 3.11 COMPONENTS Interpreter REQUIRED)   # tomllib
+    set(_port_toml "${CMAKE_CURRENT_SOURCE_DIR}/../installer/infamous.toml")
+    set(_port_launch_env "${CMAKE_CURRENT_BINARY_DIR}/launch.env")
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/ios/gen_launch_env.py"
+                "${_port_toml}" "${_port_launch_env}"
+        RESULT_VARIABLE _port_env_rc)
+    if(NOT _port_env_rc EQUAL 0)
+        message(FATAL_ERROR "ios/gen_launch_env.py failed on ${_port_toml}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_port_toml}")
+    configure_file(ios/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
+
+    target_sources(${PROJECT_NAME} PRIVATE ios/ios_shell.mm "${_port_launch_env}")
+    set_property(SOURCE ios/ios_shell.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
+    # Only main.cpp changes under PORT_IOS: a target-wide define would also
+    # change the compile command of every lifted TU.
+    set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS PORT_IOS=1)
+
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+        RESOURCE "${_port_launch_env}"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${PORT_BUNDLE_ID}"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+        XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "16.0"
+        XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT "dwarf"
+        XCODE_ATTRIBUTE_ENABLE_USER_SCRIPT_SANDBOXING "NO")
+    if(PORT_IOS_ENTITLEMENTS)
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/ios/infamous.entitlements")
+    endif()
+    if(PORT_TEAM_ID)
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${PORT_TEAM_ID}"
+            XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+            XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development")
+    else()
+        set_target_properties(${PROJECT_NAME} PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+            XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-")
+    endif()
+    message(STATUS "iOS app:          ${PORT_BUNDLE_ID} (team: '${PORT_TEAM_ID}', entitlements: ${PORT_IOS_ENTITLEMENTS})")
+endif()
+
 # Windows system import libraries. dbghelp symbolizes crash-handler addresses
 # against the PDB, user32 and gdi32 are what the backend's window and its GDI
 # present are made of, and winmm is timeBeginPeriod. None of the four names
@@ -797,4 +861,5 @@ endif()
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin
+                                BUNDLE DESTINATION bin)   # the iOS app bundle (Apple port)

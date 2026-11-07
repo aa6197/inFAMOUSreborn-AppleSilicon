@@ -189,8 +189,23 @@ static void present_guest_frame(void)
 extern "C" int __llvm_profile_write_file(void);   /* v189c: also used by the window-close exit */
 #endif
 extern "C" volatile int g_abx;   /* v198: ppu_loader.cpp (in-run A/B bits) */
+#if defined(PORT_IOS)
+/* Apple port, iOS app shell (ios/ios_shell.mm). iOS stops an app that runs GPU
+ * work in the background, so on the way there the shell sets "paused" and waits
+ * until this frame clock -- the only thread that encodes Metal work -- reports
+ * itself parked. No vblanks tick while parked, so the guest idles too.
+ * "parked" starts at 1: before the clock runs there is no Metal work at all. */
+#include <atomic>
+static std::atomic<int> s_app_paused{0};
+static std::atomic<int> s_rsx_parked{1};
+extern "C" void port_app_set_paused(int paused) { s_app_paused.store(paused ? 1 : 0, std::memory_order_release); }
+extern "C" int  port_app_rsx_parked(void)       { return s_rsx_parked.load(std::memory_order_acquire); }
+#endif
 static DWORD WINAPI frame_clock(LPVOID)
 {
+#if defined(PORT_IOS)
+    s_rsx_parked.store(0, std::memory_order_release);
+#endif
 #ifdef _WIN32
     /* The RSX pump releases guest fences and therefore sits on the critical
      * path of nearly every frame.  Keep it responsive under Windows' desktop
@@ -217,6 +232,16 @@ static DWORD WINAPI frame_clock(LPVOID)
     static int s_flat = -1;
     if (s_flat < 0) { const char* e = getenv("RSX_IDLE_SLEEP"); s_flat = (e && *e == '1') ? 1 : 0; }
     for (;;) {
+#if defined(PORT_IOS)
+        if (s_app_paused.load(std::memory_order_acquire)) {
+            fprintf(stderr, "[ios] frame clock parked (app in background)\n");
+            s_rsx_parked.store(1, std::memory_order_release);
+            while (s_app_paused.load(std::memory_order_acquire)) usleep(10000);
+            s_rsx_parked.store(0, std::memory_order_release);
+            next_tick = GetTickCount64();   /* resume on time: no burst of missed vblanks */
+            fprintf(stderr, "[ios] frame clock resumed\n");
+        }
+#endif
 #ifdef _WIN32
         /* v198 ABX 0x20000: FIFO thread at HIGHEST (in-run A/B; it publishes the fence the main thread waits on) */
         { static int s_prio = -1; const int want = (g_abx & 0x20000) ? 1 : 0;
@@ -557,6 +582,21 @@ static const char* find_default_elf(const char* argv0)
         FILE* f = fopen(g_default_elf, "rb");
         if (f) { fclose(f); return g_default_elf; }
     }
+#if defined(PORT_IOS)
+    /* iOS: the game folder is copied into the app's Documents (Files app /
+     * Finder file sharing). The bundle itself never carries game data. */
+    const char* home = getenv("HOME");
+    static const char* ios_rel[] = {
+        "/Documents/BCES00220/PS3_GAME/USRDIR/EBOOT.elf",
+        "/Documents/PS3_GAME/USRDIR/EBOOT.elf",
+    };
+    for (const char* r : ios_rel) {
+        if (!home) break;
+        snprintf(g_default_elf, sizeof(g_default_elf), "%s%s", home, r);
+        FILE* f = fopen(g_default_elf, "rb");
+        if (f) { fclose(f); return g_default_elf; }
+    }
+#endif
     return NULL;
 }
 
@@ -888,7 +928,13 @@ static void configure_stdout_buffering(void)
         setvbuf(stdout, stdout_buffer, _IOFBF, sizeof stdout_buffer);
     }
 }
+#if defined(PORT_IOS)
+/* iOS: UIKit owns the process main thread; the app shell (ios/ios_shell.mm)
+ * runs this on a big-stack thread of its own. */
+extern "C" int port_game_main(int argc, char** argv)
+#else
 int main(int argc, char** argv)
+#endif
 {
 #ifdef _WIN32
     /* v241C LOG_ASYNC drain helper process (see v241c_la): nothing else runs in it */
