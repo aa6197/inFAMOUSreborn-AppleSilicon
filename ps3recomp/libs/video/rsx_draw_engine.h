@@ -147,6 +147,16 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* The bytes an A8R8G8B8 fetch of a D24S8 zeta returns on RSX, as a colour
+     * texture of w x h (top-left region) holding R,G,B,A = depth[15:8],
+     * depth[7:0], stencil, depth[23:16]: the D3D12 backend's depth colour
+     * copy (zs_color_rt / zs_convert, v156 ZCONV_STENCIL). Optional. */
+    u32  (*depth_color_copy)(void* user, u32 depth, u32 w, u32 h);
+    /* Copy a colour target into `dst` (a copy an earlier call returned, or 0
+     * for a new one) as a record in the stream, and return the copy: the input
+     * of a draw that samples a target it also writes (the D3D12 backend's
+     * off_rt_feedback_copy). Optional. */
+    u32  (*surface_copy)(void* user, u32 surface, u32 dst);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
