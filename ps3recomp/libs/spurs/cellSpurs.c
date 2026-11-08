@@ -51,17 +51,24 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #endif
 #if defined(__APPLE__)
 #include <pthread/qos.h>
+#include <TargetConditionals.h>
 /* Apple port: SPURS_LANE_QOS = ut (utility) | in (user-initiated) | ui (user-interactive) for the lane-pool
- * workers; unset = leave the QoS alone (old behaviour). QoS picks P vs E cores on Apple chips: the iPad Pro
- * M4 has 3 P cores, and the RSX FIFO thread (the frame-rate limit there) still ran ~25% on E cores while the
- * lane workers sat at default QoS. Runs on the worker itself (only a thread can set its own QoS). */
+ * workers. QoS picks P vs E cores on Apple chips: the iPad Pro M4 has 3 P cores, and the RSX FIFO thread
+ * (the frame-rate limit there) still ran ~25% on E cores while the lane workers sat at default QoS.
+ * Default: ut on iOS/iPadOS (iPad M4: 16.6/16.4 vs 15.8/16.1 flips/s), untouched on macOS.
+ * SPURS_LANE_QOS=0 (or any other value) keeps the old behaviour on iOS.
+ * Runs on the worker itself (only a thread can set its own QoS). */
 static void spurs_apple_lane_qos(void)
 {
     const char* e = getenv("SPURS_LANE_QOS");
+#if TARGET_OS_IPHONE
+    if (!e || !*e) e = "ut";
+#endif
     if (!e || !*e) return;
+    if (!((e[0] == 'u' && (e[1] == 't' || e[1] == 'i')) || (e[0] == 'i' && e[1] == 'n'))) return;
     const qos_class_t q = (e[0] == 'u' && e[1] == 't') ? QOS_CLASS_UTILITY :
                           (e[0] == 'i' && e[1] == 'n') ? QOS_CLASS_USER_INITIATED :
-                          (e[0] == 'u' && e[1] == 'i') ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT;
+                          QOS_CLASS_USER_INTERACTIVE;
     pthread_set_qos_class_self_np(q, 0);
     static atomic_int s_said;
     if (!atomic_exchange(&s_said, 1)) fprintf(stderr, "[spurs-kern] SPURS_LANE_QOS=%s for the lane workers\n", e);
