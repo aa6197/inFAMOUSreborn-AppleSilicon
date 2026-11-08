@@ -119,6 +119,7 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    u32 span, span_levels; /* eng_texture_span for these levels (0 = none)   */
 } eng_texture;
 
 typedef struct { u64 key; u32 handle; u8 fixed; u64 ps_hash; } eng_pipeline;
@@ -1302,8 +1303,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
-    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    if (!span) return 0;
+    /* The span is a function of fmt, w, h, levels, pitch and cube; all but
+     * levels are the entry's identity, so a hit with the same levels reuses
+     * the span it stored. Same early return as before when it is 0. */
+    u32 span = 0;
 
     /* Hashed hints first (the D3D12 backend's TEX_ASSOC, rsx_d3d12_backend.c
      * v227A): four recent slots per bucket, each verified against the full
@@ -1319,12 +1322,24 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             eng_tex_same(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
             found = i;
     }
+    if (found < 0) {
+        span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+        if (!span) return 0;
+    }
     for (u32 i = 0; found < 0 && i < g.n_textures; i++)
         if (eng_tex_same(&g.textures[i], location, offset, fmt, w, h, pitch, remap, cube))
             found = (int)i;
     if (found >= 0) {
-        eng_tex_assoc_note(hb, found);
         eng_texture* e = &g.textures[found];
+        if (!span) {
+            if (e->span && e->span_levels == levels) span = e->span;
+            else {
+                span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+                if (!span) return 0;
+            }
+        }
+        e->span = span; e->span_levels = levels;
+        eng_tex_assoc_note(hb, found);
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
             const u64 hash = eng_texture_content_hash(location, offset, fmt,
@@ -1364,6 +1379,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.remap = remap; e.cubemap = (u32)(cube != 0);
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
+    e.span = span; e.span_levels = levels;
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, fmt, w, h,
                                                 levels, pitch, cube, span,
@@ -1408,22 +1424,6 @@ static u32 eng_vtex_mask(void)
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
         if (vt.enabled && vt.width && vt.height) mask |= 1u << u;
-    }
-    return mask;
-}
-
-static u32 eng_cube_mask(void)
-{
-    u32 mask = 0;
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
-        /* A cube face is square by construction, so a non-square image
-         * cannot be one; the fragment program is compiled against this mask
-         * and a texturecube slot filled with a 2D texture is a validation
-         * failure, not a wrong pixel. */
-        if (t.enabled && t.cubemap && t.width && t.width == t.height)
-            mask |= 1u << u;
     }
     return mask;
 }
@@ -1575,7 +1575,8 @@ static u64 eng_fp_struct_hash(const u8* uc, u32 max_bytes, u64 seed)
  * retried on every draw of every frame. */
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
-                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+                            rsx_be_format rt_fmt, u32 rt_count,
+                            u32 cube_mask, u32 vtex_mask, int* out_fixed)
 {
     *out_fixed = 1;
     const u8* vp_uc = NULL;
@@ -1585,8 +1586,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vtex_mask = eng_vtex_mask();
     /* Only units the program samples: a stale depth binding on an unused
      * unit must not make a second pipeline. */
     u32 shkey = 0;
@@ -3031,9 +3030,10 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
-                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
+                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES],
+                              u32* out_cube_mask)
 {
-    u32 mask = 0;
+    u32 mask = 0, cube_mask = 0;
     g.shkey = 0;
     g.texk = 0;
     s_bind_serial++;
@@ -3042,6 +3042,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
         mask |= 1u << u;
+        /* The pipeline's cube mask, from the same registers. A cube face is
+         * square by construction, so a non-square image cannot be one; the
+         * fragment program is compiled against this mask and a texturecube
+         * slot filled with a 2D texture is a validation failure, not a wrong
+         * pixel. */
+        if (t.cubemap && t.width && t.width == t.height) cube_mask |= 1u << u;
         s_tex_kind[u] = 'T'; s_tex_src[u] = t.offset; s_tex_fmt[u] = t.format;
         eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
         /* From the register, whatever the unit ends up reading (guest upload,
@@ -3128,6 +3134,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu);
     }
+    *out_cube_mask = cube_mask;
     return mask;
 }
 
@@ -3237,8 +3244,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(samplers, 0, sizeof samplers);
     memset(vtextures, 0, sizeof vtextures);
     memset(vsamplers, 0, sizeof vsamplers);
+    u32 cube_mask = 0;
     u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
-                                      textures, samplers);
+                                      textures, samplers, &cube_mask);
     /* Depth bounds: the zeta as stored before this draw, on the spare unit. */
     g.dbt = 0;
     if (eng_dbt_on() && (rsx_dsp_reg(&g.rsx, 0x0380u) & 1u) && zslot != ENG_INVALID &&
@@ -3250,7 +3258,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
             g.dbt = 1;
         }
     }
-    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+    const u32 vtex_raw = eng_vtex_mask();
+    const u32 vtex_mask = sink_bind_vertex_textures(vtex_raw, vtextures,
                                                     vsamplers);
 
     /* A guest program pair that will not translate has no fallback: the draw
@@ -3260,7 +3269,8 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int pipeline_is_fixed = 1;
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed);
+                                          n_targets, cube_mask, vtex_raw,
+                                          &pipeline_is_fixed);
     if (!pipeline) {
         if (ENG_TRACING())
             fprintf(stderr, "[eng-trace] f%u DROP no pipeline prim=%u n=%u tgt=s%u\n",
