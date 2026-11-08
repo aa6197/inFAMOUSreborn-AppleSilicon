@@ -119,6 +119,18 @@ if(PORT_LTO)
     message(STATUS "LTO:             ThinLTO ON (cache ${CMAKE_BINARY_DIR}/lto-cache)")
 endif()
 
+# Apple port: CPU baseline for iOS/iPadOS. With deployment target 16.0 clang picks -mcpu=apple-a7 (ARMv8.0:
+# no LSE atomics, every atomic is an LL/SC loop), while the macOS build gets apple-m1. apple-a14 is the same
+# core generation as M1, so iOS code generation matches the tested Mac build. Needs an A14 / M1 or newer device
+# (personal sideload: iPad Pro M4, iPhone 16 Pro). Empty = clang default.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(PORT_IOS_CPU "apple-a14" CACHE STRING "iOS -mcpu (empty = clang default for the deployment target)")
+    if(PORT_IOS_CPU)
+        add_compile_options("-mcpu=${PORT_IOS_CPU}")
+        message(STATUS "iOS CPU:         -mcpu=${PORT_IOS_CPU}")
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Standards
 # ---------------------------------------------------------------------------
