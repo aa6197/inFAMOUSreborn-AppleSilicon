@@ -1872,11 +1872,45 @@ static int eng_fetch_attr_slow(const rsx_vertex_fetch_plan* plan, u32 attr,
     return 1;
 }
 
+/* Half to float bits, branch-free, same bits as the per-component decode:
+ * exponent 0 gives signed zero (denormals flushed), 31 gives inf/NaN with
+ * the mantissa kept, the rest rebias by 112. */
+static inline u32 eng_half_bits(u32 h)
+{
+    const u32 sign = (h & 0x8000u) << 16;
+    const u32 em = h & 0x7FFFu, ex = em >> 10;
+    const u32 w = sign | ((em << 13) + (ex == 31u ? (224u << 23) : (112u << 23)));
+    return ex == 0u ? sign : w;
+}
+
+/* Division tables for eng_fetch_batch. Each entry is the same expression
+ * the per-vertex code evaluated, so the values are bit for bit the same;
+ * a load replaces a divide. CMP32 x/y are indexed by the raw 11-bit field
+ * (sign folded in), z by the raw 10-bit field. */
+static float s_eng_u8n[256], s_eng_cmp_xy[2048], s_eng_cmp_z[1024];
+static int s_eng_div_ready;
+static void eng_div_tables_init(void)
+{
+    for (u32 i = 0; i < 256u; i++) s_eng_u8n[i] = (u8)i / 255.0f;
+    for (u32 r = 0; r < 2048u; r++) {
+        s32 x = (s32)r;
+        if (x & 0x400) x -= 0x800;
+        s_eng_cmp_xy[r] = (float)x / 1023.0f;
+    }
+    for (u32 r = 0; r < 1024u; r++) {
+        s32 z = (s32)r;
+        if (z & 0x200) z -= 0x400;
+        s_eng_cmp_z[r] = (float)z / 511.0f;
+    }
+    s_eng_div_ready = 1;
+}
+
 /* All refs, one attribute at a time. Returns 0 where fetch_one would. */
 static int eng_fetch_batch(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
                            u32 n, u8* out)
 {
     const u32 vstride = plan->layout.stride;
+    if (!s_eng_div_ready) eng_div_tables_init();
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         const rsx_vertex_fetch_attr* f = &plan->attr[attr];
@@ -1936,20 +1970,21 @@ static int eng_fetch_batch(const rsx_vertex_fetch_plan* plan, const rsx_vertex_r
             }
             break;
         case RSX_VTX_TYPE_HALF:
-            ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 c = 0; c < sz; c++) {
-                    const u16 h = (u16)((s[c * 2u] << 8) | s[c * 2u + 1u]);
-                    const u32 sign = (u32)(h >> 15) << 31;
-                    const u32 ex = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
-                    const u32 w = ex == 0 ? sign
-                        : ex == 31 ? (sign | 0x7F800000u | (man << 13))
-                        : (sign | ((ex + 112u) << 23) | (man << 13));
-                    memcpy(&v[c], &w, 4);
-                })
+            /* One loop per size, so the component loop has a fixed count. */
+#define ENG_HALF_LOOP(N) \
+            ENG_VLOOP(u32 w[4] = {0u, 0u, 0u, 0x3F800000u}; \
+                for (u32 c = 0; c < (N); c++) \
+                    w[c] = eng_half_bits(((u32)s[c * 2u] << 8) | s[c * 2u + 1u]); \
+                memcpy(v, w, 16);)
+            if (sz == 4) { ENG_HALF_LOOP(4u) }
+            else if (sz == 3) { ENG_HALF_LOOP(3u) }
+            else if (sz == 2) { ENG_HALF_LOOP(2u) }
+            else { ENG_HALF_LOOP(1u) }
+#undef ENG_HALF_LOOP
             break;
         case RSX_VTX_TYPE_UNORM8:
             ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 c = 0; c < sz; c++) v[c] = s[c] / 255.0f;)
+                for (u32 c = 0; c < sz; c++) v[c] = s_eng_u8n[s[c]];)
             break;
         case RSX_VTX_TYPE_UINT8:
             ENG_VLOOP(v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
@@ -1968,13 +2003,9 @@ static int eng_fetch_batch(const rsx_vertex_fetch_plan* plan, const rsx_vertex_r
         case RSX_VTX_TYPE_CMP32:
             ENG_VLOOP(
                 const u32 w = ((u32)s[0] << 24) | ((u32)s[1] << 16) | ((u32)s[2] << 8) | s[3];
-                s32 x = (s32)(w & 0x7FF), y = (s32)((w >> 11) & 0x7FF), z = (s32)((w >> 22) & 0x3FF);
-                if (x & 0x400) x -= 0x800;
-                if (y & 0x400) y -= 0x800;
-                if (z & 0x200) z -= 0x400;
-                v[0] = (float)x / 1023.0f;
-                v[1] = (float)y / 1023.0f;
-                v[2] = (float)z / 511.0f;
+                v[0] = s_eng_cmp_xy[w & 0x7FFu];
+                v[1] = s_eng_cmp_xy[(w >> 11) & 0x7FFu];
+                v[2] = s_eng_cmp_z[(w >> 22) & 0x3FFu];
                 v[3] = 1.0f;)
             break;
         default:
@@ -2041,7 +2072,9 @@ static int dc_fetch_indexed_fast(const rsx_dsp_index_array* ia, u32 ia_loc,
             rm->occurrence_to_unique = occ;
             rm->occurrence_capacity = (u32)total;
         }
-        if (!dc_reserve_refs(total < 65536u ? total : 65536u)) return 0;
+        /* One spare ref: the loop below writes refs[unique] on every index,
+         * hit or miss, so a 16-bit list with all 65536 values needs 65537. */
+        if (!dc_reserve_refs((total < 65536u ? total : 65536u) + 1u)) return 0;
         if (!s_idx16_tab) {
             s_idx16_tab = (u32*)calloc(65536u, sizeof(u32));
             if (!s_idx16_tab) return 0;
@@ -2056,6 +2089,9 @@ static int dc_fetch_indexed_fast(const rsx_dsp_index_array* ia, u32 ia_loc,
         u32* occ = rm->occurrence_to_unique;
         rsx_vertex_ref* refs = dc.refs;
         u32 n_occ = 0, unique = 0;
+        /* A 16-bit index never equals 0xFFFFFFFF, so this one compare stands
+         * for "restart enabled and index == restart value". */
+        const u32 restart_cmp = restart_en ? restart_val : 0xFFFFFFFFu;
         for (u32 b = 0; b < dc.n_idx; b++) {
             const u32 count = dc.idx[b].count;
             if (!count) continue;
@@ -2065,22 +2101,24 @@ static int dc_fetch_indexed_fast(const rsx_dsp_index_array* ia, u32 ia_loc,
                 u16 w;
                 memcpy(&w, run + (size_t)i * 2u, 2);
                 const u32 index = __builtin_bswap16(w);
-                if (restart_en && index == restart_val) {
+                if (__builtin_expect(index == restart_cmp, 0)) {
                     if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n_occ)) {
                         dc.fetch_ok = 0;
                         return 2;
                     }
                     continue;
                 }
+                /* Branch-free: a repeat (about 5 in 6 in a triangle list)
+                 * and a first occurrence take the same path. The refs slot
+                 * past the last unique one is scratch until a miss claims it. */
                 const u32 e = tab[index];
-                if ((e >> 16) == gen) {
-                    occ[n_occ++] = e & 0xFFFFu;
-                } else {
-                    tab[index] = tag | unique;
-                    refs[unique].vertex_id = index;
-                    refs[unique].base_index = base_index;
-                    occ[n_occ++] = unique++;
-                }
+                const u32 hit = (e >> 16) == gen;
+                const u32 slot = hit ? (e & 0xFFFFu) : unique;
+                tab[index] = tag | slot;
+                refs[unique].vertex_id = index;
+                refs[unique].base_index = base_index;
+                occ[n_occ++] = slot;
+                unique += hit ^ 1u;
             }
         }
         dc.n_source_refs = n_occ;
