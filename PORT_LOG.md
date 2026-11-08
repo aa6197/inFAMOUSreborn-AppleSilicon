@@ -75,8 +75,8 @@ path, and every check said 0 differ.
   behaviour (`#if defined(__APPLE__)`).
 - `metal: draw geometry memo hits straight from the memo ring`.
   The ring is a shared MTLBuffer. Before an overwrite the engine asks
-  the back end: it waits for a finished-soon command buffer, or skips
-  the store when the open batch reads that spot. New optional
+  the back end: it waits for a submitted command buffer that still
+  reads that spot, or skips the store when the open batch reads it. New optional
   back-end hooks; D3D12 does not set them.
 - Switches (all in the port notes, "Engine speed"): `GEO_MEMO=0`,
   `GEO_MB`, `GEO_STATS`, `GEO_DIRECT=0`, `GCM_TC_ENG=0`, and the
