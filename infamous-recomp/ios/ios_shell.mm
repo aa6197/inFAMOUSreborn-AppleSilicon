@@ -29,7 +29,9 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
 
+#include <mach/mach.h>
 #include <os/proc.h>
+#include <pthread/qos.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,8 +122,81 @@ static void* memory_logger(void*)
     int secs = (e && *e) ? atoi(e) : 5;
     if (secs < 1) secs = 1;
     for (;;) {
-        fprintf(stderr, "[ios-mem] available %zu MB\n", os_proc_available_memory() >> 20);
+        /* thermal: 0 nominal, 1 fair, 2 serious, 3 critical (the OS slows the CPU from 2 up) */
+        fprintf(stderr, "[ios-mem] available %zu MB, thermal %ld\n", os_proc_available_memory() >> 20,
+                (long)NSProcessInfo.processInfo.thermalState);
         sleep((unsigned)secs);
+    }
+    return NULL;
+}
+
+/* IOS_CPU_LOG_SECS=<n> (default 0 = off): every n s, CPU use per thread over the last n s
+ * (100 = one core busy), busiest first, with the thread's name and QoS. Xcode's Time Profiler
+ * cannot record over Wi-Fi; this shows which thread limits the frame rate without it. */
+static const char* qos_name(qos_class_t q)
+{
+    switch (q) {
+    case QOS_CLASS_USER_INTERACTIVE: return "UI";
+    case QOS_CLASS_USER_INITIATED:   return "IN";
+    case QOS_CLASS_DEFAULT:          return "DF";
+    case QOS_CLASS_UTILITY:          return "UT";
+    case QOS_CLASS_BACKGROUND:       return "BG";
+    default:                         return "--";
+    }
+}
+
+static void* cpu_logger(void*)
+{
+    pthread_setname_np("ios-cpu");
+    const char* e = getenv("IOS_CPU_LOG_SECS");
+    const int secs = (e && *e) ? atoi(e) : 0;
+    if (secs < 1) return NULL;
+    enum { MAXT = 512 };
+    static uint64_t prev_id[MAXT], prev_us[MAXT];
+    static int nprev;
+    for (;;) {
+        sleep((unsigned)secs);
+        thread_act_array_t th; mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) continue;
+        struct Row { int pct; char name[40]; const char* qos; } rows[MAXT];
+        static uint64_t cur_id[MAXT], cur_us[MAXT];
+        int nr = 0, ncur = 0, total = 0;
+        for (mach_msg_type_number_t i = 0; i < n; i++) {
+            thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            thread_identifier_info_data_t ii; mach_msg_type_number_t c2 = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(th[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS &&
+                thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c2) == KERN_SUCCESS &&
+                ncur < MAXT) {
+                const uint64_t us = (uint64_t)bi.user_time.seconds * 1000000 + bi.user_time.microseconds +
+                                    (uint64_t)bi.system_time.seconds * 1000000 + bi.system_time.microseconds;
+                uint64_t was = us;   /* new thread: counts from the next round */
+                for (int k = 0; k < nprev; k++) if (prev_id[k] == ii.thread_id) { was = prev_us[k]; break; }
+                cur_id[ncur] = ii.thread_id; cur_us[ncur] = us; ncur++;
+                const int pct = (int)((us - was) / (10000ull * (uint64_t)secs));
+                total += pct;
+                if (pct >= 3) {
+                    Row& r = rows[nr++];
+                    r.pct = pct; r.name[0] = 0; r.qos = "--";
+                    pthread_t pt = pthread_from_mach_thread_np(th[i]);
+                    if (pt) {
+                        pthread_getname_np(pt, r.name, sizeof r.name);
+                        qos_class_t q; int rel;
+                        if (pthread_get_qos_class_np(pt, &q, &rel) == 0) r.qos = qos_name(q);
+                    }
+                    if (!r.name[0]) snprintf(r.name, sizeof r.name, "tid%llu", (unsigned long long)ii.thread_id);
+                }
+            }
+            mach_port_deallocate(mach_task_self(), th[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(thread_t));
+        memcpy(prev_id, cur_id, sizeof(uint64_t) * ncur); memcpy(prev_us, cur_us, sizeof(uint64_t) * ncur);
+        nprev = ncur;
+        for (int a = 1; a < nr; a++)   /* busiest first */
+            for (int b = a; b > 0 && rows[b].pct > rows[b - 1].pct; b--) { Row t = rows[b]; rows[b] = rows[b - 1]; rows[b - 1] = t; }
+        char line[2048]; int o = snprintf(line, sizeof line, "[ios-cpu] total %d%%, %u threads:", total, (unsigned)n);
+        for (int a = 0; a < nr && o < (int)sizeof line - 64; a++)
+            o += snprintf(line + o, sizeof line - o, " %s %d (%s)%s", rows[a].name, rows[a].pct, rows[a].qos, a + 1 < nr ? "," : "");
+        fprintf(stderr, "%s\n", line);
     }
     return NULL;
 }
@@ -230,6 +305,9 @@ int main(int argc, char* argv[])
         pthread_t mt;
         pthread_create(&mt, NULL, memory_logger, NULL);
         pthread_detach(mt);
+        pthread_t ct;
+        pthread_create(&ct, NULL, cpu_logger, NULL);
+        pthread_detach(ct);
 
         /* The desktop build runs the guest on the process main thread (8 MB
          * on macOS, more on Windows); iOS gives other threads 512 KB. */
