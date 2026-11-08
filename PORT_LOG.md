@@ -9,10 +9,10 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed: **15.5–15.8 flips/s** in gameplay (was 14.6), after
-  raising the RSX thread's QoS. Profiled: see the entry below.
-  Next step: A/B `SPURS_LANE_QOS=ut` on the iPad (built, not measured:
-  the iPad dropped off USB mid-run).
+- iPad speed: **16.2–16.6 flips/s** in gameplay (was 14.6), from two
+  QoS changes (RSX thread up, SPURS lane workers down). Profiled: see
+  the entry below. From 14:55 the whole iPad ran ~13 for both
+  settings (no heat, no app of ours running): re-check when it is quiet.
 - Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
@@ -34,8 +34,9 @@ Read this first every session. Newest entry on top.
 
 ### Result
 
-- **Gameplay 14.6 → 15.5–15.8 flips/s (+7%)** from one change: the RSX
-  thread now runs at user-interactive QoS on iOS.
+- **Gameplay 14.6 → 16.2–16.6 flips/s (+12%)** from two QoS changes
+  on iOS: the RSX thread runs at user-interactive (+7%), and the SPURS
+  lane workers run at utility (+3%), which leaves the P cores to RSX.
 - The limit is the RSX FIFO thread (`frame_clock`): 97% busy.
 - Same work as on the Mac: same top functions in the same shares
   (`sink_end` 16–18%, `dc_fetch_indexed_fast` 13–15%,
@@ -56,6 +57,17 @@ Read this first every session. Newest entry on top.
 | + `SPURS_LANE_SPIN_US=0` | 16.3 (noise: lean already turns this spin off) |
 | + lane and kernel spin 0 | 15.4 |
 
+Lane workers at utility QoS (`SPURS_LANE_QOS=ut`), runs in time order:
+
+| iPad state | lanes at utility | old (default QoS) |
+|---|---|---|
+| quiet (14:17–14:54) | 16.6, 16.4, 16.2 | 15.8, 16.1, 15.7 |
+| slow (14:55–15:25) | 14.3, 13.3, 12.9 | 13.2, 12.9 |
+
+Utility never lost to a nearby old run. Now the iOS default.
+In the slow runs even the pause menu (little SPU work) was slower
+(16 vs 19), so that drop is the iPad, not the setting.
+
 | Mac static scene | flips/s |
 |---|---|
 | default QoS | 32.1, 31.7, 32.1 |
@@ -68,8 +80,9 @@ So the QoS raise is iOS-only (`PORT_IOS`).
 - `apple: raise RSX FIFO thread QoS on iOS (RSX_QOS)`.
 - `ios: log thermal state and per-thread CPU use (IOS_CPU_LOG_SECS)`.
 - `ios: build for A14/M1-class CPUs (PORT_IOS_CPU)`.
-- `spurs: SPURS_LANE_QOS` opt-in switch (Apple only, unset = old
-  behaviour). Built, not measured yet.
+- `spurs: SPURS_LANE_QOS` switch (Apple only), then
+  `spurs: lane workers at utility QoS by default on iOS`.
+  macOS and Windows unchanged. `SPURS_LANE_QOS=0` = old behaviour.
 - Tools (`$WORK_DIR/tools`): `ios_prof.sh` (iPad Time Profiler),
   `prof_mac_xc.sh` (Mac Time Profiler, same scene), `ab_mac.sh`.
   `ios_device.sh`: relaunch retry, log-pull retry, `JOBS=<n>`.
@@ -85,11 +98,14 @@ So the QoS raise is iOS-only (`PORT_IOS`).
   read the old log. Another pulled an empty log. Both now retry.
 - 12:14: the iPad dropped off USB (state "connecting") mid-run.
   Tests stopped. It may be in use by another task.
+- From 14:55 the iPad got ~15% slower for every setting. Thermal 0,
+  memory the same, no third-party app running (Settings was open).
+  Cause unknown.
 
 ### Next
 
-- When the iPad is free: A/B `SPURS_LANE_QOS=ut` vs default, 2 pairs.
-- If no gain, the gap is per-core speed. Then cut RSX-thread work
+- When the iPad is quiet again: one plain run to confirm ~16.
+- The rest of the gap is per-core speed. Next: cut RSX-thread work
   (`sink_end`, `dc_fetch_indexed_fast`, texture content hash). That
   helps every platform but is a bigger job.
 - User: touch pad taps and a controller.
