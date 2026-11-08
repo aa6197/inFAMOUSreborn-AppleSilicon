@@ -12,10 +12,13 @@ Read this first every session. Newest entry on top.
 - iPad speed: **20.2–21.5 flips/s** in gameplay (21:28–21:40), was
   16.2–16.6 before the RSX-thread trim and 14.6 before the QoS changes.
   Cuts: memo, constant blocks, in-place memo hits, one-pass pipeline
-  key (entry "RSX thread trim"). The iPad sometimes runs the RSX thread
-  on E cores only (~11 flips/s); check the profile's P/E split.
-- Next speed work: the texture check (no exact cut found yet) and the
-  geometry hash on the RSX thread.
+  key, texture span/mask reuse (entry "RSX thread trim"). The iPad
+  sometimes runs the RSX thread on E cores only (~11 flips/s); check the
+  profile's P/E split. It also drifts slow over a session (22:57–23:22:
+  21.8 → 14.5 over four runs, both builds), so only trust
+  back-to-back profile pairs or ABBA runs.
+- Next speed work: the texture check (no exact cut found yet), the
+  geometry hash (XXH3) and `sink_end` on the RSX thread.
 - Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
@@ -48,6 +51,7 @@ path, and every check said 0 differ.
 | constant blocks in one call | TC_VERIFY: 103M blocks, 0 differ | Mac +12% |
 | memo hits drawn in place (no copy) | GEO_VERIFY: 33M hits, 0 differ | iPad -8% RSX CPU per frame, Mac neutral |
 | pipeline key in one XXH3 pass | old vs new key: 107.6M draws, 297 keys, 0 differ | key work: Mac 13.5% → 7.7%, iPad 14.6% → 9.2% of the RSX thread |
+| texture span kept per cache entry; texture units decoded once per draw | old vs new: 683M spans, 104M masks, 0 differ | iPad RSX busy 9.4 → 8.6 s per 10 s; profile pair 19.3 → 19.8 flips/s |
 
 - **iPad now 20.2 and 21.5 flips/s** (two plain runs, plus 19.3 with
   the profiler on), RSX thread 86% on P cores. Before this round:
@@ -60,6 +64,9 @@ path, and every check said 0 differ.
 - In-place memo hits, iPad: memcpy fell from 10.1% to 5.4% of the RSX
   thread. Flips 14.6, 11.4, 11.3 vs 9.9, 10.8, 10.8.
 - Mac static is now ~34–36 flips/s in quiet runs (was ~32).
+- Texture span/mask cut, iPad self time: mip chain + layout 3.1% →
+  under 0.5%; texture register decode 3.1% → 1.4%. Mac the same
+  (mip chain + layout 3.2% → under 1%, decode 3.6% → 1.5%).
 
 ### iPad slow state
 
@@ -73,6 +80,12 @@ path, and every check said 0 differ.
 
 ### What changed
 
+- `engine: reuse texture span and texture-unit masks per draw`.
+  `eng_texture_slot` keeps each entry's span (it depends only on the
+  identity fields plus levels). `sink_end` reads the 16 texture units
+  once: the cube mask comes from `sink_bind_textures`, and the vertex
+  texture mask is read once and passed to `eng_pipeline_get`.
+  The draw engine runs only with the Metal back end.
 - `engine: branch-free index dedupe, table-based vertex decode`.
 - `engine: cross-frame geometry memo (as D3D12 VCACHE)`.
 - `engine: constant-upload fast path with the draw engine (Apple)`.
@@ -91,6 +104,13 @@ path, and every check said 0 differ.
 
 ### What failed
 
+- Plain flips A/B of the texture cut (old, new, new, old, 22:57–23:22):
+  21.8, 17.7, 15.9, 14.5. The iPad slowed steadily whatever the build
+  (thermal 0), so this says nothing either way. The profile pair above
+  is the evidence.
+- Mac flips during the texture-cut profile (38.9 vs 46.1) are not
+  comparable: another task was running the Simulator and
+  copying files (load ~12).
 - iPad profile of the new key at 21:10: the iPad was locked. Re-run
   after the user unlocked it.
 - Texture check (once per frame per bound texture, 1024 samples each):
@@ -108,8 +128,11 @@ path, and every check said 0 differ.
 
 ### Next
 
-- Top of the RSX thread now (iPad, self time): texture check 7.7%,
-  sink_end 7.7%, geometry hash (XXH3) 6.4%. Find the D3D12 way first.
+- Top of the RSX thread now (iPad, self time): sink_end 8.7%, texture
+  check 8.3%, FIFO parse 6.9%, XXH3 6.4% (mostly `eng_geo_vtx_hash`),
+  memmove 5.4%. Find the D3D12 way first.
+- `eng_bind_vs_constants_split` is 16% inclusive, but most of that is
+  the Metal submit under `eng_stage_flush_point`, not the copy.
 - Texture check: an exact cut needs to know a texture was not written
   since its last check. Page protection is out (file reads into guest
   memory would fail with EFAULT).
