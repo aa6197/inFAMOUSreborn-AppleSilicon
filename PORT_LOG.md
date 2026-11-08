@@ -9,9 +9,10 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed is the open item: about 14–15 flips/s in gameplay.
-  (The Mac static test gives about 35, but that is a different scene.)
-  Next step: profile on the iPad.
+- iPad speed: **15.5–15.8 flips/s** in gameplay (was 14.6), after
+  raising the RSX thread's QoS. Profiled: see the entry below.
+  Next step: A/B `SPURS_LANE_QOS=ut` on the iPad (built, not measured:
+  the iPad dropped off USB mid-run).
 - Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
@@ -26,6 +27,72 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-08 — iPad speed: profiling
+
+### Result
+
+- **Gameplay 14.6 → 15.5–15.8 flips/s (+7%)** from one change: the RSX
+  thread now runs at user-interactive QoS on iOS.
+- The limit is the RSX FIFO thread (`frame_clock`): 97% busy.
+- Same work as on the Mac: same top functions in the same shares
+  (`sink_end` 16–18%, `dc_fetch_indexed_fast` 13–15%,
+  `rsx_process_method` 8%). Each step just takes ~2x longer.
+  - The iPad has 3 P cores. The RSX thread still runs ~25% of its
+    time on E cores (the SPURS threads compete for P cores).
+  - M4 P cores are slower than M5 Pro ones, with less cache.
+- Thermal state stays 0 (nominal) in every run. No throttling.
+- Build flags are fine: `-O2` in both. iOS used `-mcpu=apple-a7`
+  (deployment target 16.0); now `apple-a14`, but that made no
+  difference.
+
+| change (iPad, gameplay) | flips/s |
+|---|---|
+| default QoS (`RSX_QOS=0`) | 14.6 |
+| RSX at user-interactive | 15.7, 15.5, 15.8 |
+| + `-mcpu=apple-a14` | 15.5, 15.5 |
+| + `SPURS_LANE_SPIN_US=0` | 16.3 (noise: lean already turns this spin off) |
+| + lane and kernel spin 0 | 15.4 |
+
+| Mac static scene | flips/s |
+|---|---|
+| default QoS | 32.1, 31.7, 32.1 |
+| RSX at user-interactive | 30.9, 30.1 |
+
+So the QoS raise is iOS-only (`PORT_IOS`).
+
+### What changed
+
+- `apple: raise RSX FIFO thread QoS on iOS (RSX_QOS)`.
+- `ios: log thermal state and per-thread CPU use (IOS_CPU_LOG_SECS)`.
+- `ios: build for A14/M1-class CPUs (PORT_IOS_CPU)`.
+- `spurs: SPURS_LANE_QOS` opt-in switch (Apple only, unset = old
+  behaviour). Built, not measured yet.
+- Tools (`$WORK_DIR/tools`): `ios_prof.sh` (iPad Time Profiler),
+  `prof_mac_xc.sh` (Mac Time Profiler, same scene), `ab_mac.sh`.
+  `ios_device.sh`: relaunch retry, log-pull retry, `JOBS=<n>`.
+- Profile reader: `tprof_core.py` (scratchpad; per-thread P/E split
+  and top functions).
+
+### What failed
+
+- xctrace over Wi-Fi fails. Over USB `--attach` still fails;
+  `--all-processes` works. iPad traces hold fewer samples than the
+  Mac's, but the shares are fine.
+- One A/B run: the relaunch failed (CoreDevice 10004) and the tool
+  read the old log. Another pulled an empty log. Both now retry.
+- 12:14: the iPad dropped off USB (state "connecting") mid-run.
+  Tests stopped. It may be in use by another task.
+
+### Next
+
+- When the iPad is free: A/B `SPURS_LANE_QOS=ut` vs default, 2 pairs.
+- If no gain, the gap is per-core speed. Then cut RSX-thread work
+  (`sink_end`, `dc_fetch_indexed_fast`, texture content hash). That
+  helps every platform but is a bigger job.
+- User: touch pad taps and a controller.
 
 ---
 
