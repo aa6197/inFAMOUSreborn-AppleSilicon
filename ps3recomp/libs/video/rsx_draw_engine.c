@@ -2218,6 +2218,17 @@ static void eng_ivf_check(int stage)
     s_ivf.mode = 0;
 }
 
+/* The fetch plan's register part: descriptors, defaults, sources. Nothing
+ * in it depends on the references, so it is set up before dc_fetch (the
+ * geometry memo keys on it) and dc_fetch only adds the element ranges. */
+static void dc_plan_init(const rsx_vertex_layout_plan* layout)
+{
+    dc.layout = *layout;
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
+    rsx_vertex_fetch_plan_set_immediate(&dc.fetch_plan, dc.imm, dc.imm_count);
+}
+
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     int deduped_fast = 0;   /* dc_fetch_indexed_fast: 0 not used, 1 read, 2 read + deduped */
@@ -2309,10 +2320,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     }
     eng_ivf_check(2);
 
-    dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
-    rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
-    rsx_vertex_fetch_plan_set_immediate(&dc.fetch_plan, dc.imm, dc.imm_count);
+    /* dc_plan_init already set up dc.fetch_plan for this layout. */
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
         dc.fetch_ok = 0;
@@ -2357,6 +2365,361 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         }
     }
     dc.n_verts = dc.n_refs;
+}
+
+/* ---- GEO_MEMO: converted vertices and indices kept across frames --------
+ * The D3D12 backend's VCACHE (rsx_d3d12_backend.c, v60) measured 86-89% of
+ * the city's vertices byte-identical to the frame before. Here a draw whose
+ * inputs hash to a draw seen before reuses that draw's converted vertices and
+ * rebuilt index list, instead of reading, deduplicating and converting again.
+ * Host memory only: the backend copies what it is handed during draw(), as it
+ * does with dc.verts, so nothing about GPU lifetimes changes. The key is XXH3
+ * over
+ *   - the shape: primitive, batches, index-array registers, base index, restart;
+ *   - the guest index bytes;
+ *   - the fetch plan: layout, base offset, divider, every descriptor and default;
+ *   - the guest vertex bytes every attribute reads, over the element range the
+ *     index list spans (remembered per shape + index hash from the draw that
+ *     converted it, so a hit never scans the indices).
+ * Draws it skips: immediate or inline vertices, a frequency divider, a source
+ * that is not one readable span, and the VTX_FAST verify/off modes. A draw
+ * whose vertices change every frame (skinning) stops hashing them for a while.
+ * PS3RECOMP_ENGINE_GEO_MEMO=0 turns it off; PS3RECOMP_ENGINE_GEO_MB sets the
+ * arena (default 256, 16..2048); PS3RECOMP_ENGINE_GEO_STATS=1 logs every 600
+ * frames. */
+#define GEO_SET_BITS 16u     /* 2-way sets: 128K entries per level */
+typedef struct { u64 key; u32 elo, ehi, last; u8 vol, used; } geo_l1;
+typedef struct { u64 key; u64 pos; u32 vbytes, n_verts, n_draw, stride, last; u8 indexed, used; } geo_l2;
+/* The way holding key, else the way to replace (empty, then least recent). */
+static geo_l1* eng_geo_way_l1(geo_l1* t, u64 k)
+{
+    geo_l1* s = &t[(k & ((1u << GEO_SET_BITS) - 1u)) * 2u];
+    if (s[0].used && s[0].key == k) return &s[0];
+    if (s[1].used && s[1].key == k) return &s[1];
+    if (!s[0].used) return &s[0];
+    if (!s[1].used) return &s[1];
+    return (s[0].last <= s[1].last) ? &s[0] : &s[1];
+}
+static geo_l2* eng_geo_way_l2(geo_l2* t, u64 k)
+{
+    geo_l2* s = &t[(k & ((1u << GEO_SET_BITS) - 1u)) * 2u];
+    if (s[0].used && s[0].key == k) return &s[0];
+    if (s[1].used && s[1].key == k) return &s[1];
+    if (!s[0].used) return &s[0];
+    if (!s[1].used) return &s[1];
+    return (s[0].last <= s[1].last) ? &s[0] : &s[1];
+}
+static geo_l1* s_geo_l1;
+static geo_l2* s_geo_l2;
+static u8* s_geo_arena;
+static u64 s_geo_size, s_geo_head;
+static int s_geo_on = -1, s_geo_stats;
+static struct { u64 draws, elig, hit, miss1, miss2, volskip, stored, hashb, reuseb, storeb, refresh; } s_geo_st;
+
+static int eng_geo_on(void)
+{
+    if (s_geo_on >= 0) return s_geo_on;
+    s_geo_on = eng_env_flag("PS3RECOMP_ENGINE_GEO_MEMO", 1);
+    s_geo_stats = eng_env_flag("PS3RECOMP_ENGINE_GEO_STATS", 0);
+    u64 mb = 256;
+    const char* e = getenv("PS3RECOMP_ENGINE_GEO_MB");
+    if (e && *e) { mb = strtoull(e, NULL, 10); if (mb < 16) mb = 16; if (mb > 2048) mb = 2048; }
+    if (s_geo_on) {
+        s_geo_size = mb << 20;
+        s_geo_l1 = (geo_l1*)calloc((size_t)2 << GEO_SET_BITS, sizeof(geo_l1));
+        s_geo_l2 = (geo_l2*)calloc((size_t)2 << GEO_SET_BITS, sizeof(geo_l2));
+        s_geo_arena = (u8*)malloc((size_t)s_geo_size);
+        if (!s_geo_l1 || !s_geo_l2 || !s_geo_arena) {
+            free(s_geo_l1); free(s_geo_l2); free(s_geo_arena);
+            s_geo_l1 = NULL; s_geo_l2 = NULL; s_geo_arena = NULL;
+            s_geo_on = 0;
+        }
+    }
+    fprintf(stderr, "[rsx engine] geometry memo: %s (PS3RECOMP_ENGINE_GEO_MEMO, %llu MB)\n",
+            s_geo_on ? "on" : "off", (unsigned long long)(s_geo_on ? mb : 0));
+    return s_geo_on;
+}
+
+/* Arena: a byte ring addressed by absolute position. Data at pos is intact
+ * while the head has not gone a full ring past it. */
+static u8* eng_geo_alloc(u32 bytes, u64* pos)
+{
+    const u64 off = s_geo_head % s_geo_size;
+    if (off + bytes > s_geo_size) s_geo_head += s_geo_size - off;
+    *pos = s_geo_head;
+    s_geo_head += bytes;
+    return s_geo_arena + (*pos % s_geo_size);
+}
+
+typedef struct {
+    int ok;             /* eligible for the memo */
+    u64 shape;          /* shape + index bytes */
+    u64 plan;           /* fetch plan */
+    geo_l1* l1;
+    geo_l2* l2;
+    u64 key;            /* full key, when the vertex hash was taken */
+    int have_key;
+} eng_geo_probe;
+
+/* Hash the guest bytes every laid-out attribute reads for elements
+ * [elo, ehi]: one range per attribute, overlapping ranges of one location
+ * merged so an interleaved buffer is read once. 0 = a range is unreadable. */
+static int eng_geo_vtx_hash(const rsx_vertex_fetch_plan* plan, u32 elo, u32 ehi, u64* out)
+{
+    u32 loc[RSX_DSP_NUM_VERTEX_ATTR];
+    u64 lo[RSX_DSP_NUM_VERTEX_ATTR], hi[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 n = 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+        if (!f->desc.type || !f->desc.size || !f->elem_size) continue;
+        const u64 prefix = (u64)plan->base_offset + (u64)f->desc.offset;
+        const u64 a = prefix + (u64)elo * f->stride;
+        const u64 b = prefix + (u64)ehi * f->stride + f->elem_size;
+        if (a > 0xFFFFFFFFull || b > 0x100000000ull || b <= a) return 0;
+        /* insertion sort by (location, start) */
+        u32 k = n++;
+        while (k > 0 && (loc[k - 1] > f->desc.location ||
+                         (loc[k - 1] == f->desc.location && lo[k - 1] > a))) {
+            loc[k] = loc[k - 1]; lo[k] = lo[k - 1]; hi[k] = hi[k - 1]; k--;
+        }
+        loc[k] = f->desc.location; lo[k] = a; hi[k] = b;
+    }
+    u64 h = 0x9E3779B97F4A7C15ull;
+    for (u32 i = 0; i < n;) {
+        u64 a = lo[i], b = hi[i];
+        u32 j = i + 1;
+        while (j < n && loc[j] == loc[i] && lo[j] <= b) { if (hi[j] > b) b = hi[j]; j++; }
+        const u8* src = eng_guest_ptr(NULL, loc[i], (u32)a, (u32)(b - a));
+        if (!src) return 0;
+        h = XXH3_64bits_withSeed(src, (size_t)(b - a), h ^ ((u64)loc[i] << 40) ^ a);
+        s_geo_st.hashb += b - a;
+        i = j;
+    }
+    *out = h;
+    return 1;
+}
+
+/* Every field of the plan the conversion reads, packed without padding:
+ * u32 words only, laid-out slots only. */
+static u64 eng_geo_plan_hash(const rsx_vertex_fetch_plan* plan)
+{
+    u32 k[4 + RSX_DSP_NUM_VERTEX_ATTR * 13];
+    u32 n = 0;
+    k[n++] = plan->layout.mask;
+    k[n++] = plan->layout.stride;
+    k[n++] = plan->base_offset;
+    k[n++] = plan->divider_mask;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+        k[n++] = attr;
+        k[n++] = f->desc.type; k[n++] = f->desc.size; k[n++] = f->desc.stride;
+        k[n++] = f->desc.frequency; k[n++] = f->desc.offset; k[n++] = f->desc.location;
+        k[n++] = f->elem_size; k[n++] = f->stride;
+        memcpy(&k[n], f->default_value, 16); n += 4;
+    }
+    return XXH3_64bits(k, (size_t)n * 4u);
+}
+
+/* Before dc_fetch. Returns the cached entry on a hit, else NULL with the
+ * probe filled in for eng_geo_store. */
+static const geo_l2* eng_geo_lookup(u32 prim, eng_geo_probe* pr)
+{
+    memset(pr, 0, sizeof *pr);
+    if (!eng_geo_on() || eng_vtx_fast_mode() != 1) return NULL;
+    s_geo_st.draws++;
+    const rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
+    if (dc.imm_count || dc.inl || plan->inline_data || plan->imm_verts || !plan->layout.stride)
+        return NULL;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+        if (f->desc.type && f->desc.size && f->desc.frequency > 1u) return NULL;
+    }
+
+    struct {
+        u32 prim, n_arr, n_idx, base_index, ia_off, ia_loc, is_u32, restart_en, restart_val;
+    } sh;
+    memset(&sh, 0, sizeof sh);
+    sh.prim = prim;
+    sh.n_arr = dc.n_arr;
+    sh.n_idx = dc.n_idx;
+    u64 h = 0;
+    if (dc.n_idx) {
+        rsx_dsp_index_array ia;
+        rsx_dsp_get_index_array(&g.rsx, &ia);
+        sh.base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+        sh.ia_off = ia.offset;
+        sh.ia_loc = ia.location ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
+        sh.is_u32 = ia.is_u32;
+        sh.restart_en = (u32)rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
+        sh.restart_val = rsx_dsp_restart_index(&g.rsx);
+        h = XXH3_64bits(&sh, sizeof sh);
+        const u32 esz = ia.is_u32 ? 4u : 2u;
+        for (u32 b = 0; b < dc.n_idx; b++) {
+            const u32 count = dc.idx[b].count;
+            if (!count) continue;
+            const u64 start = (u64)ia.offset + (u64)dc.idx[b].first * esz;
+            const u64 bytes = (u64)count * esz;
+            if (start + bytes > 0x100000000ull) return NULL;
+            const u8* run = eng_guest_ptr(NULL, sh.ia_loc, (u32)start, (u32)bytes);
+            if (!run) return NULL;
+            h = XXH3_64bits_withSeed(run, (size_t)bytes, h ^ start);
+            s_geo_st.hashb += bytes;
+        }
+    } else {
+        h = XXH3_64bits(&sh, sizeof sh);
+    }
+    h = XXH3_64bits_withSeed(dc.idx, dc.n_idx * sizeof(dc.idx[0]), h);
+    h = XXH3_64bits_withSeed(dc.arr, dc.n_arr * sizeof(dc.arr[0]), h);
+    pr->ok = 1;
+    pr->shape = h;
+    pr->plan = eng_geo_plan_hash(plan);
+    s_geo_st.elig++;
+
+    geo_l1* l1 = eng_geo_way_l1(s_geo_l1, h);
+    pr->l1 = l1;
+    if (!l1->used || l1->key != h) { s_geo_st.miss1++; return NULL; }
+    l1->last = g.frames;
+    /* Vertices that changed the last three times: probe 1 frame in 16. */
+    if (l1->vol >= 3 && (g.frames & 15u)) { s_geo_st.volskip++; pr->ok = 0; return NULL; }
+    u64 hv;
+    if (!eng_geo_vtx_hash(plan, l1->elo, l1->ehi, &hv)) { pr->ok = 0; return NULL; }
+    u64 key = XXH3_64bits_withSeed(&pr->plan, sizeof pr->plan, h ^ hv);
+    if (!key) key = 1;
+    pr->key = key;
+    pr->have_key = 1;
+    geo_l2* l2 = eng_geo_way_l2(s_geo_l2, key);
+    pr->l2 = l2;
+    if (!l2->used || l2->key != key || l2->stride != plan->layout.stride ||
+        s_geo_head > l2->pos + s_geo_size) {
+        if (l1->vol < 255) l1->vol++;
+        s_geo_st.miss2++;
+        return NULL;
+    }
+    l1->vol = 0;
+    l2->last = g.frames;
+    const u32 ib = l2->indexed ? l2->n_draw * 4u : 0u;
+    const u32 bytes = ((l2->vbytes + 15u) & ~15u) + ib;
+    /* Older than half the ring: move it up front, so data drawn every frame
+     * is never the next to be overwritten. The copy may skip to the ring's
+     * start and then needs 2 x bytes; it must end before the head reaches
+     * the source's slot again. Too close to that: draw it from where it is. */
+    const u64 age = s_geo_head - l2->pos, room = ((u64)bytes + 15u) & ~15ull;
+    if (age > s_geo_size / 2u && age + 2u * room <= s_geo_size) {
+        const u8* src = s_geo_arena + (l2->pos % s_geo_size);
+        u64 pos;
+        u8* dst = eng_geo_alloc((u32)room, &pos);
+        memcpy(dst, src, bytes);
+        l2->pos = pos;
+        s_geo_st.refresh++;
+    }
+    s_geo_st.hit++;
+    s_geo_st.reuseb += bytes;
+    return l2;
+}
+
+/* After a miss converted the draw: remember the element range and the data. */
+static void eng_geo_store(eng_geo_probe* pr, int indexed, u32 n_draw, const u32* indices)
+{
+    if (!pr->ok || !dc.fetch_ok || !dc.n_verts) return;
+    const rsx_vertex_fetch_plan* plan = &dc.fetch_plan;
+    u32 elo = 0, ehi = 0;
+    int have = 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+        if (!f->desc.type || !f->desc.size || !f->elem_size) continue;
+        if (!f->stable_base) return;    /* read element by element: not memoized */
+        if (!have) { elo = f->stable_first; ehi = f->stable_last; have = 1; }
+        else if (f->stable_first != elo || f->stable_last != ehi) return;
+    }
+    if (!have) return;  /* no array at all: defaults only, cheap anyway */
+    geo_l1* l1 = pr->l1;
+    if (!l1->used || l1->key != pr->shape || l1->elo != elo || l1->ehi != ehi) {
+        l1->key = pr->shape; l1->elo = elo; l1->ehi = ehi; l1->vol = 0; l1->used = 1;
+        pr->have_key = 0;
+    }
+    l1->last = g.frames;
+    if (!pr->have_key) {
+        u64 hv;
+        if (!eng_geo_vtx_hash(plan, elo, ehi, &hv)) return;
+        pr->key = XXH3_64bits_withSeed(&pr->plan, sizeof pr->plan, pr->shape ^ hv);
+        if (!pr->key) pr->key = 1;
+    }
+    const u32 vbytes = dc.n_verts * plan->layout.stride;
+    const u32 ib = indexed ? n_draw * 4u : 0u;
+    const u64 total = (((u64)vbytes + 15u) & ~15ull) + ib;
+    if (total > s_geo_size / 8u) return;
+    u64 pos;
+    u8* dst = eng_geo_alloc((u32)((total + 15u) & ~15ull), &pos);
+    memcpy(dst, dc.verts, vbytes);
+    if (ib) memcpy(dst + ((vbytes + 15u) & ~15u), indices, ib);
+    geo_l2* l2 = eng_geo_way_l2(s_geo_l2, pr->key);
+    l2->key = pr->key;
+    l2->last = g.frames;
+    l2->pos = pos;
+    l2->vbytes = vbytes;
+    l2->n_verts = dc.n_verts;
+    l2->n_draw = n_draw;
+    l2->stride = plan->layout.stride;
+    l2->indexed = (u8)(indexed != 0);
+    l2->used = 1;
+    s_geo_st.stored++;
+    s_geo_st.storeb += total;
+}
+
+/* PS3RECOMP_ENGINE_GEO_VERIFY=1: every hit also converts the draw the long
+ * way and compares vertices, index list and counts with what it reused. */
+static void eng_geo_verify_hit(u32 prim, int rebuild, const rsx_vertex_layout_plan* layout,
+                               const geo_l2* hit)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_flag("PS3RECOMP_ENGINE_GEO_VERIFY", 0);
+    if (!on) return;
+    static u64 checks, bad;
+    const u8* verts = s_geo_arena + (hit->pos % s_geo_size);
+    const u32* idx = (const u32*)(verts + ((hit->vbytes + 15u) & ~15u));
+    dc_fetch(layout, rebuild);
+    int ok = dc.n_verts && dc.fetch_ok, indexed = 0;
+    u32 n_draw = dc.n_source_refs;
+    if (ok && rebuild) {
+        ok = eng_topology_rebuild(prim, dc.refs_remapped, &indexed) != 0;
+        n_draw = indexed ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
+                                                                dc.cuts, dc.n_cuts)
+                         : dc.n_source_refs - dc.n_source_refs % 3u;
+    }
+    if (ok && indexed) {
+        ok = dc_reserve_indices(n_draw);
+        if (ok)
+            rsx_draw_engine_write_topology_indices(
+                prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
+                dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL, g.indices);
+    }
+    const int same = ok && dc.n_verts == hit->n_verts && indexed == (int)hit->indexed &&
+                     n_draw == hit->n_draw &&
+                     !memcmp(dc.verts, verts, (size_t)hit->n_verts * layout->stride) &&
+                     (!indexed || !memcmp(g.indices, idx, (size_t)n_draw * 4u));
+    checks++;
+    if (!same && bad++ < 16)
+        fprintf(stderr, "[rsx engine] GEO_VERIFY: hit differs (prim %u verts %u/%u draw %u/%u"
+                        " indexed %d/%d ok %d)\n", prim, dc.n_verts, hit->n_verts, n_draw,
+                hit->n_draw, indexed, (int)hit->indexed, ok);
+    if ((checks % 100000u) == 0)
+        fprintf(stderr, "[rsx engine] GEO_VERIFY: %llu hits checked, %llu differ\n",
+                (unsigned long long)checks, (unsigned long long)bad);
+}
+
+static void eng_geo_frame(void)
+{
+    if (!s_geo_on || !s_geo_stats || (g.frames % 600u) != 599u) return;
+    const double f = 600.0;
+    fprintf(stderr, "[rsx engine] GEO_MEMO per frame: draws %.0f eligible %.0f hit %.0f"
+                    " miss(new %.0f changed %.0f) volatile-skip %.0f | hashed %.1f MB"
+                    " reused %.1f MB stored %.1f MB refreshed %.0f\n",
+            s_geo_st.draws / f, s_geo_st.elig / f, s_geo_st.hit / f, s_geo_st.miss1 / f,
+            s_geo_st.miss2 / f, s_geo_st.volskip / f, s_geo_st.hashb / f / 1048576.0,
+            s_geo_st.reuseb / f / 1048576.0, s_geo_st.storeb / f / 1048576.0,
+            s_geo_st.refresh / f);
+    memset(&s_geo_st, 0, sizeof s_geo_st);
 }
 
 /* ---- one-frame trace and target dump (debug, opt-in) -------------------- */
@@ -2746,17 +3109,38 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
-    dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    dc_plan_init(&layout);
 
+    /* GEO_MEMO: the same inputs as a draw already converted take its
+     * vertices and index list as they are. */
+    eng_geo_probe geo;
+    const geo_l2* geo_hit = eng_geo_lookup(prim, &geo);
+    const u8* verts;
+    const u32* draw_indices = NULL;
+    u32 n_verts;
     int indexed = 0;
-    u32 n_draw = dc.n_source_refs;
-    if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
-        n_draw = indexed
-            ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
-                                                   dc.cuts, dc.n_cuts)
-            : dc.n_source_refs - dc.n_source_refs % 3u;
+    u32 n_draw;
+    if (geo_hit) {
+        eng_geo_verify_hit(prim, rebuild, &layout, geo_hit);
+        verts = s_geo_arena + (geo_hit->pos % s_geo_size);
+        n_verts = geo_hit->n_verts;
+        indexed = geo_hit->indexed;
+        n_draw = geo_hit->n_draw;
+        if (indexed)
+            draw_indices = (const u32*)(verts + ((geo_hit->vbytes + 15u) & ~15u));
+    } else {
+        dc_fetch(&layout, rebuild);
+        if (!dc.n_verts || !dc.fetch_ok) return;
+        verts = dc.verts;
+        n_verts = dc.n_verts;
+        n_draw = dc.n_source_refs;
+        if (rebuild) {
+            if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+            n_draw = indexed
+                ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
+                                                       dc.cuts, dc.n_cuts)
+                : dc.n_source_refs - dc.n_source_refs % 3u;
+        }
     }
     if (!n_draw) return;
 
@@ -2817,12 +3201,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
         return;
     }
 
-    if (indexed) {
+    if (indexed && !geo_hit) {
         if (!dc_reserve_indices(n_draw)) return;
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
             g.indices);
+        draw_indices = g.indices;
     }
 
     /* The transform constant block, then the viewport epilogue the vertex
@@ -2913,7 +3298,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
-    const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    const u32 uploaded = indexed ? n_verts : n_draw;
     if (ENG_TRACING()) {
         char zbuf[48]; zbuf[0] = 0;
         if (zslot != ENG_INVALID)
@@ -2955,8 +3340,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 rsx_dsp_reg(&g.rsx, 0x0380u) & 1u, eng_reg_f32(0x0384u), eng_reg_f32(0x0388u),
                 (unsigned)rs.stencil_enable, rsx_dsp_reg(&g.rsx, 0x1FECu), (unsigned long long)g.ps_hash, tx);
     }
-    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
-               indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    if (!geo_hit) eng_geo_store(&geo, indexed, n_draw, draw_indices);
+    g.be->draw(g.be->user, topology, verts, uploaded, layout.stride,
+               indexed ? draw_indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -3060,6 +3446,7 @@ static void eng_present(u32 buffer_id)
     g.be->present(g.be->user, g.surfaces[target].handle);
     if (ENG_TRACING()) { eng_trace_pass_boundary(1); eng_dump_surfaces(); }
     eng_trace_tick(g.frames);
+    eng_geo_frame();
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
