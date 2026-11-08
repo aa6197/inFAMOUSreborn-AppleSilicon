@@ -45,6 +45,7 @@ path, and every check said 0 differ.
 | geometry memo (as D3D12 VCACHE) | GEO_VERIFY: 61M hits, 0 differ | Mac static +8%, iPad +5% (noisy) |
 | constant blocks in one call | TC_VERIFY: 103M blocks, 0 differ | Mac +12% |
 | memo hits drawn in place (no copy) | GEO_VERIFY: 33M hits, 0 differ | iPad -8% RSX CPU per frame, Mac neutral |
+| pipeline key in one XXH3 pass | old vs new key: 107.6M draws, 297 keys, 0 differ | not yet measured |
 
 - Memo: 99% of ~8.7k draws a frame re-use converted geometry.
 - Constant fast path, Mac static: 31.8, 31.9 (one noisy 27.4) vs
@@ -84,6 +85,12 @@ path, and every check said 0 differ.
 
 ### What failed
 
+- Texture check (once per frame per bound texture, 1024 samples each):
+  Mac ~470–590 a frame, ~1.7–2.0 ms; iPad ~300 a frame, ~2.4 ms
+  (~4% of a frame). Only 0–3 change per frame. Eight-load batches and
+  prefetch gave nothing on P cores and only noise on E cores, so no
+  change. Moving the check to worker threads would make it earlier than
+  the bind, which is not exact.
 - The iPad A/B for the constant fast path is inconclusive: the iPad
   drifted slow during it (on 18.0, 15.2, 11.1; off 13.9, 14.9, 12.6).
 - The Mac stays noisy (load ~18). One profile pair had every function
