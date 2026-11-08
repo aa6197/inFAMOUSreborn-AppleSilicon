@@ -10,9 +10,10 @@ Read this first every session. Newest entry on top.
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed: **16.2–16.6 flips/s** in gameplay (was 14.6), from two
-  QoS changes (RSX thread up, SPURS lane workers down). Profiled: see
-  the entry below. From 14:55 the whole iPad ran ~13 for both
-  settings (no heat, no app of ours running): re-check when it is quiet.
+  QoS changes. Then four RSX-thread cuts (entry "RSX thread trim"):
+  memo, constant blocks, in-place memo hits. Not yet measured in the
+  iPad's normal state: in the evening it ran on E cores only (~11).
+- Next speed work: the texture and geometry hashes on the RSX thread.
 - Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
@@ -27,6 +28,75 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-08 — RSX thread trim
+
+### Result
+
+Four cuts to the RSX FIFO thread (`frame_clock`), the frame-rate limit.
+All are exact: each has a check switch that compares against the old
+path, and every check said 0 differ.
+
+| change | check | speed |
+|---|---|---|
+| decode micro-opts (index dedupe, table decode) | VTX_VERIFY: 39.5M draws, 0 differ | not split out |
+| geometry memo (as D3D12 VCACHE) | GEO_VERIFY: 61M hits, 0 differ | Mac static +8%, iPad +5% (noisy) |
+| constant blocks in one call | TC_VERIFY: 103M blocks, 0 differ | Mac +12% |
+| memo hits drawn in place (no copy) | GEO_VERIFY: 33M hits, 0 differ | iPad -8% RSX CPU per frame, Mac neutral |
+
+- Memo: 99% of ~8.7k draws a frame re-use converted geometry.
+- Constant fast path, Mac static: 31.8, 31.9 (one noisy 27.4) vs
+  28.3, 28.0, 28.4. On the iPad `rsx_process_method` fell from 11.6%
+  to 3.8% of the RSX thread.
+- In-place memo hits, iPad: memcpy fell from 10.1% to 5.4% of the RSX
+  thread. Flips 14.6, 11.4, 11.3 vs 9.9, 10.8, 10.8.
+- Mac static is now ~34–36 flips/s in quiet runs (was ~32).
+
+### iPad slow state
+
+- From ~17:40 the iPad got slow again for every setting
+  (18 → 11 flips/s). Thermal 0, no other app.
+- The 18:51 profile shows why: the RSX thread ran **99% on E cores**
+  (at midday it was ~75% on P cores). In that state the RSX thread is
+  only 70% busy, so it is no longer the only limit.
+- Not our code. Maybe night-time background work or a power mode.
+  Speed numbers from that state are only good for on/off pairs.
+
+### What changed
+
+- `engine: branch-free index dedupe, table-based vertex decode`.
+- `engine: cross-frame geometry memo (as D3D12 VCACHE)`.
+- `engine: constant-upload fast path with the draw engine (Apple)`.
+  The engine took the per-word path because GCM_TC_FAST turned off
+  with the engine on. On Apple, `constants_gen` now moves only when a
+  value changes (more constant re-use). Windows keeps the old
+  behaviour (`#if defined(__APPLE__)`).
+- `metal: draw geometry memo hits straight from the memo ring`.
+  The ring is a shared MTLBuffer. Before an overwrite the engine asks
+  the back end: it waits for a finished-soon command buffer, or skips
+  the store when the open batch reads that spot. New optional
+  back-end hooks; D3D12 does not set them.
+- Switches (all in the port notes, "Engine speed"): `GEO_MEMO=0`,
+  `GEO_MB`, `GEO_STATS`, `GEO_DIRECT=0`, `GCM_TC_ENG=0`, and the
+  three `*_VERIFY` checks.
+
+### What failed
+
+- The iPad A/B for the constant fast path is inconclusive: the iPad
+  drifted slow during it (on 18.0, 15.2, 11.1; off 13.9, 14.9, 12.6).
+- The Mac stays noisy (load ~18). One profile pair had every function
+  ~15–20% slower in one run.
+- A first version of the constant change also changed Windows. Caught
+  before the commit and guarded.
+
+### Next
+
+- Top of the RSX thread now (Mac, self time): texture content hash
+  7%, geometry hash (XXH3) 6%, FIFO loop 5%, fragment-program hash 4%,
+  render-state hash 3.5%. Find the D3D12 way for each first.
+- Re-run the iPad in its normal (P-core) state; expect above 16.6.
 
 ---
 
