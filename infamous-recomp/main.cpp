@@ -213,6 +213,22 @@ static DWORD WINAPI frame_clock(LPVOID)
     if (getenv("PS3_FAST_HOST"))
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
+#if defined(__APPLE__)
+    /* Apple port: same reason as above, but on Apple chips priority (QoS) also picks the core
+     * type. At the default QoS the iPad Pro M4 (3 P + 6 E cores) ran this thread on E cores
+     * ~24% of the time while it was the limit (88% busy). ABOVE_NORMAL maps to
+     * QOS_CLASS_USER_INTERACTIVE in win32_compat. iPad: +7% (15.5-15.7 vs 14.6 flips/s).
+     * Mac M5 Pro: -4% (30.1-30.9 vs 31.7-32.1), so it is on by default only on iOS/iPadOS.
+     * RSX_QOS=1 forces it on, RSX_QOS=0 forces it off. */
+    { const char* e = getenv("RSX_QOS");
+  #if defined(PORT_IOS)
+      const bool on = !(e && *e == '0');
+  #else
+      const bool on = (e && *e == '1');
+  #endif
+      if (on) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+      fprintf(stderr, "[rsx] FIFO thread QoS %s (RSX_QOS)\n", on ? "user-interactive" : "default"); }
+#endif
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "inFamous (BCES00220)";
 
