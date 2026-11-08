@@ -296,45 +296,52 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
 }
 
+/* The pipeline-identity fields of a render state as words, each named so
+ * struct padding can never be identity (rsx_live_draw.c:3151-3185). The alpha
+ * REFERENCE is deliberately absent: it lives in the fragment constant block,
+ * so a title animating a fade must not compile a new pipeline per frame.
+ * Enable and compare mode still select a variant. */
+#define ENG_RS_WORDS 29u
+static void eng_rs_words(const rsx_be_render_state* rs, u32* w)
+{
+    w[0] = rs->alpha_test_enable;
+    w[1] = rs->alpha_func;
+    w[2] = rs->blend_enable;
+    w[3] = rs->sf_rgb;
+    w[4] = rs->df_rgb;
+    w[5] = rs->sf_a;
+    w[6] = rs->df_a;
+    w[7] = rs->eq_rgb;
+    w[8] = rs->eq_a;
+    w[9] = rs->depth_test;
+    w[10] = rs->depth_write;
+    w[11] = rs->depth_func;
+    w[12] = rs->cull_enable;
+    w[13] = rs->cull_face;
+    w[14] = rs->front_face;
+    w[15] = rs->color_mask;
+    w[16] = rs->rt_fp16;
+    w[17] = rs->stencil_enable;
+    w[18] = rs->stencil_two_sided;
+    w[19] = rs->s_func;
+    w[20] = rs->s_func_mask;
+    w[21] = rs->s_write_mask;
+    w[22] = rs->s_fail;
+    w[23] = rs->s_zfail;
+    w[24] = rs->s_zpass;
+    w[25] = rs->bs_func;
+    w[26] = rs->bs_fail;
+    w[27] = rs->bs_zfail;
+    w[28] = rs->bs_zpass;
+}
+
+/* One XXH3 over the words: the byte-at-a-time FNV over the same fields was
+ * ~3.5% of the RSX thread (it runs on every draw). */
 u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
 {
-#define ENG_HASH_FIELD(name) hash = eng_fnv1a(&rs->name, sizeof(rs->name), hash)
-    /* The alpha REFERENCE is deliberately absent: it lives in the fragment
-     * constant block, so a title animating a fade must not compile a new
-     * pipeline per frame. Enable and compare mode still select a variant.
-     * Every field is listed by name so struct padding can never be identity
-     * (rsx_live_draw.c:3151-3185). */
-    ENG_HASH_FIELD(alpha_test_enable);
-    ENG_HASH_FIELD(alpha_func);
-    ENG_HASH_FIELD(blend_enable);
-    ENG_HASH_FIELD(sf_rgb);
-    ENG_HASH_FIELD(df_rgb);
-    ENG_HASH_FIELD(sf_a);
-    ENG_HASH_FIELD(df_a);
-    ENG_HASH_FIELD(eq_rgb);
-    ENG_HASH_FIELD(eq_a);
-    ENG_HASH_FIELD(depth_test);
-    ENG_HASH_FIELD(depth_write);
-    ENG_HASH_FIELD(depth_func);
-    ENG_HASH_FIELD(cull_enable);
-    ENG_HASH_FIELD(cull_face);
-    ENG_HASH_FIELD(front_face);
-    ENG_HASH_FIELD(color_mask);
-    ENG_HASH_FIELD(rt_fp16);
-    ENG_HASH_FIELD(stencil_enable);
-    ENG_HASH_FIELD(stencil_two_sided);
-    ENG_HASH_FIELD(s_func);
-    ENG_HASH_FIELD(s_func_mask);
-    ENG_HASH_FIELD(s_write_mask);
-    ENG_HASH_FIELD(s_fail);
-    ENG_HASH_FIELD(s_zfail);
-    ENG_HASH_FIELD(s_zpass);
-    ENG_HASH_FIELD(bs_func);
-    ENG_HASH_FIELD(bs_fail);
-    ENG_HASH_FIELD(bs_zfail);
-    ENG_HASH_FIELD(bs_zpass);
-#undef ENG_HASH_FIELD
-    return hash;
+    u32 w[ENG_RS_WORDS];
+    eng_rs_words(rs, w);
+    return XXH3_64bits_withSeed(w, sizeof w, hash);
 }
 
 /* ---- topology expansion -------------------------------------------------- */
@@ -1530,6 +1537,39 @@ static const char* const kEngFixedPS =
 "};\n"
 "float4 main(PSInput input) : SV_TARGET { return input.col0; }\n";
 
+/* rsx_fp_structural_hash's identity -- every instruction's 16 bytes and the
+ * inline-constant count, the constant VALUES left out (they are hoisted into
+ * the buffered block) -- gathered and hashed by one XXH3 call instead of FNV
+ * a byte at a time (that was ~4% of the RSX thread: it runs on every draw).
+ * 0 = malformed, as there. RSX thread only (static buffer). */
+static u64 eng_fp_struct_hash(const u8* uc, u32 max_bytes, u64 seed)
+{
+    static u8 buf[ENG_FP_MAX_BYTES + 4];
+    if (!uc) return 0;
+    u32 off = 0, n = 0, consts = 0;
+    while (off + 16 <= max_bytes && n + 16 <= ENG_FP_MAX_BYTES) {
+        const u32 w0 = rsx_fp_read_word(uc + off);
+        const u32 w1 = rsx_fp_read_word(uc + off + 4);
+        const u32 w2 = rsx_fp_read_word(uc + off + 8);
+        const u32 w3 = rsx_fp_read_word(uc + off + 12);
+        memcpy(buf + n, uc + off, 16);
+        n += 16;
+        off += 16;
+        /* Register type 2 = an inline constant follows (FP_REG_TYPE_CONST). */
+        if ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u) {
+            if (off + 16 > max_bytes || consts >= RSX_FP_MAX_INLINE_CONSTANTS) return 0;
+            consts++;
+            off += 16;
+        }
+        if (w0 & 1u) {                  /* FP_END */
+            memcpy(buf + n, &consts, 4);
+            const u64 h = XXH3_64bits_withSeed(buf, n + 4u, seed ^ 0x31535046u);
+            return h ? h : 1u;
+        }
+    }
+    return 0;
+}
+
 /* The pipeline for this draw, built once per distinct key. A negative result
  * is cached too (handle 0), so a program pair that will not translate is not
  * retried on every draw of every frame. */
@@ -1577,37 +1617,33 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
     u64 key = 1469598103934665603ull;
+    /* The small fields go in one XXH3 call at fixed positions (0 where a
+     * field does not apply), not field by field through byte-wise FNV. */
+    u32 kw[10u + ENG_RS_WORDS];
+    memset(kw, 0, 6u * sizeof kw[0]);
     if (fixed) {
-        static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
-        key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+        key = XXH3_64bits_withSeed("XIFN", 4, key);
     } else {
         /* XXH3 over the program words, seeded with the running key: the
          * byte-wise FNV here was ~3% of the RSX thread. */
         key = XXH3_64bits_withSeed(vp_uc, (size_t)vp_instrs * 16u, key);
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+        key = eng_fp_struct_hash(fp_uc, fp_size, key);
         if (!key) return 0;
-        const u32 fp_ctrl_key = fp_ctrl & 0x40u;
-        key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
-        key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
-        key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
-        if (shkey) key = eng_fnv1a(&shkey, sizeof shkey, key);
-        if (dbt) {
-            const u32 tag = 0x44425400u;        /* "TBD" */
-            key = eng_fnv1a(&tag, sizeof tag, key);
-        }
-        if (texk) {
-            const u32 tag = 0x54584600u | 1u;   /* "TXF" */
-            key = eng_fnv1a(&tag, sizeof tag, key);
-            key = eng_fnv1a(&texk, sizeof texk, key);
-        }
+        kw[0] = fp_ctrl & 0x40u;
+        kw[1] = cube_mask;
+        kw[2] = vtex_mask;
+        kw[3] = shkey;
+        kw[4] = dbt;
+        kw[5] = texk;
     }
-    key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
-    key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
-    key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
+    kw[6] = layout->mask;
+    kw[7] = layout->stride;
+    kw[8] = (u32)rt_fmt;
     /* How many colour attachments the pass will have is pipeline identity:
      * a host API matches the two against each other. */
-    key = eng_fnv1a(&rt_count, sizeof rt_count, key);
-    key = rsx_draw_engine_hash_render_state(rs, key);
+    kw[9] = rt_count;
+    eng_rs_words(rs, kw + 10);
+    key = XXH3_64bits_withSeed(kw, sizeof kw, key);
 
     const u32 pmask = ENG_MAX_PIPELINES * 2u - 1u;
     u32 pslot = (u32)(key ^ (key >> 29) ^ (key >> 47)) & pmask;
