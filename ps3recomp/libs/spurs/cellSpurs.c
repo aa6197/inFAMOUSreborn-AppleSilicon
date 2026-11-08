@@ -49,6 +49,24 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #include <pthread.h>
 #include <time.h>
 #endif
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+/* Apple port: SPURS_LANE_QOS = ut (utility) | in (user-initiated) | ui (user-interactive) for the lane-pool
+ * workers; unset = leave the QoS alone (old behaviour). QoS picks P vs E cores on Apple chips: the iPad Pro
+ * M4 has 3 P cores, and the RSX FIFO thread (the frame-rate limit there) still ran ~25% on E cores while the
+ * lane workers sat at default QoS. Runs on the worker itself (only a thread can set its own QoS). */
+static void spurs_apple_lane_qos(void)
+{
+    const char* e = getenv("SPURS_LANE_QOS");
+    if (!e || !*e) return;
+    const qos_class_t q = (e[0] == 'u' && e[1] == 't') ? QOS_CLASS_UTILITY :
+                          (e[0] == 'i' && e[1] == 'n') ? QOS_CLASS_USER_INITIATED :
+                          (e[0] == 'u' && e[1] == 'i') ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_DEFAULT;
+    pthread_set_qos_class_self_np(q, 0);
+    static atomic_int s_said;
+    if (!atomic_exchange(&s_said, 1)) fprintf(stderr, "[spurs-kern] SPURS_LANE_QOS=%s for the lane workers\n", e);
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
@@ -2938,6 +2956,9 @@ static DWORD WINAPI spurs_lane_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     { extern void ps3_prof_register_spu_thread(void); ps3_prof_register_spu_thread(); }   /* v63 PS3_PROF_MAIN */
+#if defined(__APPLE__)
+    spurs_apple_lane_qos();
+#endif
     struct LaneWorkerArg* wa = (struct LaneWorkerArg*)p;
     struct LanePool* lp = wa->lp;
     long my = 0;
