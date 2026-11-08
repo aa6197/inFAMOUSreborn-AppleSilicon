@@ -56,6 +56,28 @@ static void update_touch_pad(void)
 static int    s_game_argc;
 static char** s_game_argv;
 
+static UIWindow*     s_uiwin;
+static CAMetalLayer* s_layer;
+
+/* Main thread. One line with every size that decides the picture's layout. */
+static void log_geometry(const char* why)
+{
+    if (!s_uiwin) return;
+    UIView*        v   = s_uiwin.rootViewController.view;
+    UIWindowScene* sc  = s_uiwin.windowScene;
+    const CGRect   sb  = UIScreen.mainScreen.bounds;
+    const CGRect   scb = sc ? sc.coordinateSpace.bounds : CGRectZero;
+    const CGRect   wf  = s_uiwin.frame;
+    const CGRect   vb  = v ? v.bounds : CGRectZero;
+    const CGSize   ds  = s_layer ? s_layer.drawableSize : CGSizeZero;
+    const long     io  = sc ? (long)sc.effectiveGeometry.interfaceOrientation : -1;
+    fprintf(stderr, "[ios-geo] %s: screen %.0fx%.0f, scene %.0fx%.0f (orientation %ld), window %.0fx%.0f, "
+                    "view %.0fx%.0f, drawable %.0fx%.0f, scale %.2f native %.2f\n",
+            why, sb.size.width, sb.size.height, scb.size.width, scb.size.height, io,
+            wf.size.width, wf.size.height, vb.size.width, vb.size.height, ds.width, ds.height,
+            UIScreen.mainScreen.scale, UIScreen.mainScreen.nativeScale);
+}
+
 /* A normal launch (home screen, devicectl) gives the app /dev/null for its
  * output; the log then goes to Documents, like the desktop launcher's
  * play.out.log / play.err.log. A console (simctl --console-pty) or a file
@@ -169,6 +191,10 @@ int main(int argc, char* argv[])
         load_launch_env();
 
         SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");
+        /* Landscape only. Without this, SDL's view-frame code (UIKit_ComputeViewFrame) reads the old
+         * statusBarOrientation, which on iPadOS 27 says portrait, and swaps the view to 970x1408 on the
+         * first resume: the picture and touch pad were laid out portrait on a landscape screen. */
+        SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
             fprintf(stderr, "[ios] SDL_Init failed: %s\n", SDL_GetError());
             return 1;
@@ -196,6 +222,9 @@ int main(int argc, char* argv[])
         if (uiwin) {
             port_touch_pad_attach(uiwin);
             update_touch_pad();
+            s_uiwin = (__bridge UIWindow*)uiwin;
+            s_layer = layer;
+            log_geometry("start");
         }
 
         pthread_t mt;
@@ -218,10 +247,27 @@ int main(int argc, char* argv[])
         pthread_attr_destroy(&attr);
     }
 
+    const Uint64 t0 = SDL_GetTicks();
+    int geo_step = 0;
     for (;;) {
         @autoreleasepool {
             SDL_Event e;
-            if (SDL_WaitEventTimeout(&e, 100) && e.type == SDL_EVENT_QUIT) break;
+            if (SDL_WaitEventTimeout(&e, 100)) {
+                if (e.type == SDL_EVENT_QUIT) break;
+                switch (e.type) {
+                case SDL_EVENT_WINDOW_RESIZED:            log_geometry("window resized"); break;
+                case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: log_geometry("pixel size changed"); break;
+                case SDL_EVENT_WINDOW_METAL_VIEW_RESIZED: log_geometry("metal view resized"); break;
+                case SDL_EVENT_DISPLAY_ORIENTATION:       log_geometry("display orientation"); break;
+                default: break;
+                }
+            }
+            static const Uint64 geo_at[] = { 1000, 3000, 10000 };
+            if (geo_step < 3 && SDL_GetTicks() - t0 >= geo_at[geo_step]) {
+                char b[32]; snprintf(b, sizeof b, "t=%llus", (unsigned long long)geo_at[geo_step] / 1000);
+                log_geometry(b);
+                geo_step++;
+            }
         }
     }
     fprintf(stderr, "[ios] quit\n");
