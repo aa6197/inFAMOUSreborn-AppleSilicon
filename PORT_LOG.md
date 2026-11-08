@@ -4,15 +4,15 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- Milestone: **M8 done**. M9 and M10 are **done in the Simulator**
-  (iPad Pro 11, iPhone 17, iPhone 18 Pro: gameplay + pause menu).
-  **M9 on the real iPad is blocked**: Apple wants the new Program License
-  Agreement accepted for my team before it signs anything new
-  (re-checked 22:56, still blocked). Only the user can do it
-  (developer.apple.com → Account). Then: `$WORK_DIR/tools/ios_device.sh`
-  `check`, `build`, `install`, `copy-game`, `run 180 ipad1`.
-- M10 (iPhone) = iPhone Simulator only. **Never use the physical iPhone.**
+- Milestone: **M9 done on the real iPad** (iPad Pro 11 M4, iPadOS 27.2):
+  gameplay + pause menu, 330 s, no crash. M10 (iPhone) is done in the
+  Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
+- Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
+- iPad speed is the open item: about 14–15 flips/s in gameplay.
+  (The Mac static test gives about 35, but that is a different scene.)
+  Next step: profile on the iPad.
+- Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
   Open items are in the M5 entry below.
@@ -26,6 +26,61 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-08 — M9: real iPad
+
+### Result
+
+- **Runs on the iPad Pro 11 (M4)**, iPadOS 27.2, 9 CPUs, 7.5 GB RAM.
+  - Title → START → blast cutscene → gameplay tutorial → START = pause
+    menu → DOWN moves to "Commandes". 330 s, no crash (4 runs).
+  - Full-screen landscape 2816x1940, game image 16:9 with black bars.
+  - MetalFX on: 1280x720 → 2560x1440 (kept within 2x), the final blit
+    does the rest.
+  - Entitlements work: extended virtual addressing, increased memory
+    limit (8183 MB available to the app at start).
+  - Memory: lowest free during a run 6542 MB, so the app uses about
+    1.6 GB. Plenty of headroom.
+  - Touch pad: shown by default (no controller connected). Not yet
+    tested with real taps. No real controller tested.
+- **Speed: about 14–15 flips/s in gameplay** (flips/s 150–250 s,
+  same script each run):
+
+  | run | flips/s |
+  |---|---|
+  | lean on, MetalFX on (default) | 14.2 |
+  | lean off | 14.1 |
+  | MetalFX off | 15.0 |
+  | lean on again | 14.5 |
+
+  All within noise. Defaults stay (lean on, MetalFX on).
+
+### What changed
+
+- `ios: keep the view landscape on iPadOS 27` — the first iPad run drew
+  the game and touch pad in portrait size (970x1408) on the landscape
+  screen. Cause: SDL's view-frame code reads the old
+  `statusBarOrientation`, which says portrait on iPadOS 27, and swaps
+  the view on the first resume. Fix: `SDL_HINT_ORIENTATIONS` =
+  landscape only. Checked on the iPad and the iPhone 17 Simulator.
+- The shell logs `[ios-geo]` lines: screen, scene, window, view and
+  drawable sizes at start, 1/3/10 s and on resize.
+- `$WORK_DIR/tools/ios_device.sh run` takes screenshots
+  (`SHOT_EVERY`, default 10 s) and copies the log to `stderr.log`.
+- New `$WORK_DIR/tools/ios_ab.sh` for iPad A/B runs.
+
+### What failed
+
+- Signing: blocked on the Apple PLA until the user re-accepted it and
+  signed in again with the developer account.
+- First run: portrait layout (fixed above).
+
+### Next
+
+- Profile on the iPad to find why gameplay runs at ~15 flips/s.
+- User: try the touch pad with real taps, and a controller.
 
 ---
 
