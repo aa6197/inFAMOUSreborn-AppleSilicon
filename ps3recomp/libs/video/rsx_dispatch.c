@@ -301,6 +301,30 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* One incrementing FIFO block inside SET_TRANSFORM_CONSTANT_LOAD (0x1EFC) ..
+ * SET_TRANSFORM_CONSTANT[31] (0x1F7C), words still in guest (big-endian)
+ * order. Same result as rsx_dispatch_method on each word (regs, seen, load
+ * pointer, constants, constants_gen), without the per-word decode. The caller
+ * keeps RSX_CONST_LOG runs on the per-word path. Only the Apple build calls it. */
+void rsx_dispatch_const_block(rsx_dispatch* rsx, u32 method, const u8* be_words, u32 count)
+{
+    for (u32 i = 0; i < count; i++) {
+        const u32 m = method + 4u * i;
+        const u32 arg = ((u32)be_words[4u * i] << 24) | ((u32)be_words[4u * i + 1] << 16) |
+                        ((u32)be_words[4u * i + 2] << 8) | (u32)be_words[4u * i + 3];
+        rsx->seen[m >> 2]++;
+        rsx->regs[m >> 2] = arg;
+        if (m >= M_VP_UPLOAD_CONST) {
+            const u32 word = (m - M_VP_UPLOAD_CONST) >> 2;
+            const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
+            if (slot < RSX_DSP_NUM_CONSTANTS && rsx->constants[slot][word & 3] != arg) {
+                rsx->constants[slot][word & 3] = arg;
+                rsx->constants_gen++;
+            }
+        }
+    }
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
@@ -354,7 +378,15 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
+        /* Apple: constants_gen moves only when a value changes. Titles re-send
+         * the same constants before every draw, and the Metal back end re-uses
+         * its staged copy while the generation is unchanged. Elsewhere every
+         * write still bumps it, as before. */
+#if defined(__APPLE__)
+        if (slot < RSX_DSP_NUM_CONSTANTS && rsx->constants[slot][word & 3] != arg) {
+#else
         if (slot < RSX_DSP_NUM_CONSTANTS) {
+#endif
             rsx->constants[slot][word & 3] = arg;
             rsx->constants_gen++;
         }

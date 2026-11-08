@@ -125,7 +125,7 @@ struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
-    u64 constants_gen;                /* bumped by every constants[] write */
+    u64 constants_gen;                /* bumped by a constants[] write (Apple: only a change) */
 
     rsx_dispatch_sink sink;
 
@@ -168,6 +168,10 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+
+/* A whole incrementing transform-constant block (methods 0x1EFC..0x1F7C),
+ * words in guest byte order: same result as rsx_dispatch_method per word. */
+void rsx_dispatch_const_block(rsx_dispatch* rsx, u32 method, const u8* be_words, u32 count);
 
 /* ---- decoded state getters -------------------------------------------- */
 

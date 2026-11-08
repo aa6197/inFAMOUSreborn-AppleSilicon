@@ -253,6 +253,11 @@ void rsx_draw_engine_shutdown(void);
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
 
+/* A whole incrementing transform-constant block on subchannel 0 (methods
+ * 0x1EFC..0x1F7C), words in guest byte order: same result as calling
+ * rsx_draw_engine_method on each word. */
+void rsx_draw_engine_const_block(u32 method, const u8* be_words, u32 count);
+
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

@@ -3068,8 +3068,8 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 
 /* VCB_DEDUP (rsx_d3d12_backend.c:7392): a draw whose transform constants
  * and epilogue equal the last block staged in this commit binds that block
- * again. Every constant write bumps a_gen; a commit forgets the block, since
- * it recycles the arena. ~13k draws a frame each staged 8 KB, most of a
+ * again. Every constant change bumps a_gen (a rewrite of the same value
+ * does not); a commit forgets the block, since it recycles the arena. ~13k draws a frame each staged 8 KB, most of a
  * frame's staging. VCB_DEDUP=0 stages every draw's block, as before. */
 static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
                                         const void* b, u32 b_bytes, u64 a_gen)

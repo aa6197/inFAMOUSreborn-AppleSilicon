@@ -1920,16 +1920,38 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * incrementing block, one IO page: store straight into the state, exactly as
              * rsx_process_method does. GCM_TC_FAST=0 off (also off with TCONST_DBG/SEQ_DBG). */
             { static int tcf = -1;
+#if defined(__APPLE__)
+              static int tc_eng = 0;
+#endif
               if (tcf < 0) { const char* e = getenv("GCM_TC_FAST"); tcf = (e && *e == '0') ? 0 : 1;
-                             if (getenv("TCONST_DBG") || getenv("SEQ_DBG") || getenv("LOAD_DBG") || /* v180: RSX_MHIST no longer disables it (histogram = generic methods only) */
-                                 getenv("RSX_TRACE") || getenv("TCONST_FIFO") || getenv("GCM_VAL_WATCH") ||
-                                 rsx_live_draw_enabled() || rsx_draw_engine_enabled()) tcf = 0; }
+                             const int tc_dbg = getenv("TCONST_DBG") || getenv("SEQ_DBG") || getenv("LOAD_DBG") || /* v180: RSX_MHIST no longer disables it (histogram = generic methods only) */
+                                 getenv("RSX_TRACE") || getenv("TCONST_FIFO") || getenv("GCM_VAL_WATCH");
+                             if (tc_dbg || rsx_live_draw_enabled() || rsx_draw_engine_enabled()) tcf = 0;
+#if defined(__APPLE__)
+                             /* Apple: keep this path with the draw engine (the Metal back end) on, and hand
+                              * the same block to the engine in one call. The per-word path below would feed
+                              * each word to rsx_draw_engine_method and rsx_process_method in turn; the result
+                              * in both states is the same. Off with GCM_TC_ENG=0, GCM_TC_FAST=0, or any switch
+                              * that watches single methods (the list above, RSX_LIVE_FEED_DBG, RSX_CONST_LOG). */
+                             if (rsx_draw_engine_enabled()) {
+                                 const char* te = getenv("GCM_TC_ENG");
+                                 tc_eng = !(e && *e == '0') && !(te && *te == '0') && !tc_dbg &&
+                                          !rsx_live_draw_enabled() && !getenv("RSX_LIVE_FEED_DBG") && !getenv("RSX_CONST_LOG");
+                                 if (tc_eng) tcf = 1;
+                                 fprintf(stderr, "[GCM] constant-upload fast path for the draw engine %s (GCM_TC_ENG=0 off)%c",
+                                         tc_eng ? "ON" : "off", 10);
+                             }
+#endif
+              }
               if (tcf && type == 0 && subch == 0 && count && method >= 0x1EFCu && method + 4u * (count - 1u) < 0x1F80u) {
                   const u32 io0 = s_fifo_getoff + 4u, io1 = s_fifo_getoff + 4u * count;
                   const u32 ea0 = gcm_io2ea(io0);
                   if (ea0 && (io0 >> 20) == (io1 >> 20)) {
                       extern uint8_t* vm_base;
                       const u8* p = vm_base + ea0;
+#if defined(__APPLE__)
+                      if (tc_eng) rsx_draw_engine_const_block(method, p, count);
+#endif
                       /* v221C TC_VEC (TC_VEC=1 = on, default off until b029 is measured; ABX 0x100000 = off): the
                        * constant words of one block land in CONSECUTIVE floats of vertex_constants (row-major [512][4],
                        * slot = load + reg/4, lane = reg%4) -> byte-swap-copy them 8 at a time and update the dirty

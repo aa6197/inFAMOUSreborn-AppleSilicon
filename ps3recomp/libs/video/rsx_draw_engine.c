@@ -3556,6 +3556,59 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 
+void rsx_draw_engine_const_block(u32 method, const u8* be_words, u32 count)
+{
+    if (!g.ready) return;
+    method &= 0x1FFCu;
+    /* PS3RECOMP_ENGINE_TC_VERIFY=1: run the block both ways (bulk, then the
+     * per-word rsx_dispatch_method from the same start) and compare the
+     * registers, write counts, constants and generation. The per-word
+     * result is kept. */
+    static int verify = -1;
+    if (verify < 0) {
+        const char* e = getenv("PS3RECOMP_ENGINE_TC_VERIFY");
+        verify = (e && *e == '1') ? 1 : 0;
+        if (verify) fprintf(stderr, "[rsx engine] TC_VERIFY: constant blocks checked against the per-word path\n");
+    }
+    if (!verify || count > 33u || method < 0x1EFCu) {
+        rsx_dispatch_const_block(&g.rsx, method, be_words, count);
+        return;
+    }
+    enum { R0 = 0x1EFCu >> 2, NR = 33 };
+    static u32 c_save[RSX_DSP_NUM_CONSTANTS][4], c_bulk[RSX_DSP_NUM_CONSTANTS][4];
+    static unsigned long long n_blocks = 0, n_bad = 0;
+    u32 regs_save[NR], seen_save[NR], regs_bulk[NR], seen_bulk[NR];
+    rsx_dispatch* r = &g.rsx;
+    memcpy(regs_save, &r->regs[R0], sizeof regs_save);
+    memcpy(seen_save, &r->seen[R0], sizeof seen_save);
+    memcpy(c_save, r->constants, sizeof c_save);
+    const u64 gen_save = r->constants_gen;
+
+    rsx_dispatch_const_block(r, method, be_words, count);
+    memcpy(regs_bulk, &r->regs[R0], sizeof regs_bulk);
+    memcpy(seen_bulk, &r->seen[R0], sizeof seen_bulk);
+    memcpy(c_bulk, r->constants, sizeof c_bulk);
+    const u64 gen_bulk = r->constants_gen;
+
+    memcpy(&r->regs[R0], regs_save, sizeof regs_save);
+    memcpy(&r->seen[R0], seen_save, sizeof seen_save);
+    memcpy(r->constants, c_save, sizeof c_save);
+    r->constants_gen = gen_save;
+    for (u32 i = 0; i < count; i++) {
+        const u8* w = be_words + 4u * i;
+        rsx_dispatch_method(r, method + 4u * i,
+                            ((u32)w[0] << 24) | ((u32)w[1] << 16) | ((u32)w[2] << 8) | (u32)w[3]);
+    }
+    const int bad = memcmp(regs_bulk, &r->regs[R0], sizeof regs_bulk) ||
+                    memcmp(seen_bulk, &r->seen[R0], sizeof seen_bulk) ||
+                    memcmp(c_bulk, r->constants, sizeof c_bulk) || gen_bulk != r->constants_gen;
+    n_blocks++;
+    if (bad && ++n_bad <= 16)
+        fprintf(stderr, "[rsx engine] TC_VERIFY: block differs (method 0x%04X count %u)\n", method, count);
+    if ((n_blocks % 1000000ull) == 0)
+        fprintf(stderr, "[rsx engine] TC_VERIFY: %llu blocks checked, %llu differ\n", n_blocks, n_bad);
+}
+
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height)
 {
