@@ -9,11 +9,13 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed: **16.2–16.6 flips/s** in gameplay (was 14.6), from two
-  QoS changes. Then four RSX-thread cuts (entry "RSX thread trim"):
-  memo, constant blocks, in-place memo hits. Not yet measured in the
-  iPad's normal state: in the evening it ran on E cores only (~11).
-- Next speed work: the texture and geometry hashes on the RSX thread.
+- iPad speed: **20.2–21.5 flips/s** in gameplay (21:28–21:40), was
+  16.2–16.6 before the RSX-thread trim and 14.6 before the QoS changes.
+  Cuts: memo, constant blocks, in-place memo hits, one-pass pipeline
+  key (entry "RSX thread trim"). The iPad sometimes runs the RSX thread
+  on E cores only (~11 flips/s); check the profile's P/E split.
+- Next speed work: the texture check (no exact cut found yet) and the
+  geometry hash on the RSX thread.
 - Still needs the user: real taps on the touch pad, and a real controller.
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
@@ -45,7 +47,11 @@ path, and every check said 0 differ.
 | geometry memo (as D3D12 VCACHE) | GEO_VERIFY: 61M hits, 0 differ | Mac static +8%, iPad +5% (noisy) |
 | constant blocks in one call | TC_VERIFY: 103M blocks, 0 differ | Mac +12% |
 | memo hits drawn in place (no copy) | GEO_VERIFY: 33M hits, 0 differ | iPad -8% RSX CPU per frame, Mac neutral |
-| pipeline key in one XXH3 pass | old vs new key: 107.6M draws, 297 keys, 0 differ | Mac: key work 13.5% → 7.7% of the RSX thread; iPad not yet |
+| pipeline key in one XXH3 pass | old vs new key: 107.6M draws, 297 keys, 0 differ | key work: Mac 13.5% → 7.7%, iPad 14.6% → 9.2% of the RSX thread |
+
+- **iPad now 20.2 and 21.5 flips/s** (two plain runs, plus 19.3 with
+  the profiler on), RSX thread 86% on P cores. Before this round:
+  16.2–16.6. Gameplay screenshots look right.
 
 - Memo: 99% of ~8.7k draws a frame re-use converted geometry.
 - Constant fast path, Mac static: 31.8, 31.9 (one noisy 27.4) vs
@@ -85,8 +91,8 @@ path, and every check said 0 differ.
 
 ### What failed
 
-- iPad profile of the new key (21:10): the iPad was locked, so the app
-  could not start. Needs an unlock, then `ios_prof.sh 260 keyx 200 10`.
+- iPad profile of the new key at 21:10: the iPad was locked. Re-run
+  after the user unlocked it.
 - Texture check (once per frame per bound texture, 1024 samples each):
   Mac ~470–590 a frame, ~1.7–2.0 ms; iPad ~300 a frame, ~2.4 ms
   (~4% of a frame). Only 0–3 change per frame. Eight-load batches and
@@ -102,10 +108,11 @@ path, and every check said 0 differ.
 
 ### Next
 
-- Top of the RSX thread now (Mac, self time): texture content hash
-  7%, geometry hash (XXH3) 6%, FIFO loop 5%, fragment-program hash 4%,
-  render-state hash 3.5%. Find the D3D12 way for each first.
-- Re-run the iPad in its normal (P-core) state; expect above 16.6.
+- Top of the RSX thread now (iPad, self time): texture check 7.7%,
+  sink_end 7.7%, geometry hash (XXH3) 6.4%. Find the D3D12 way first.
+- Texture check: an exact cut needs to know a texture was not written
+  since its last check. Page protection is out (file reads into guest
+  memory would fail with EFAULT).
 
 ---
 
