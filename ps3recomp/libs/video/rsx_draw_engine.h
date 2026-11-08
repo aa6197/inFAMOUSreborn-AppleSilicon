@@ -224,6 +224,24 @@ typedef struct rsx_draw_backend {
     void (*present)(void* user, u32 surface);
     void (*readback)(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                      void* out, u32 out_pitch);
+
+    /* Optional, all three or none: the geometry memo's ring in memory the GPU
+     * reads, so a memo hit is drawn from the ring itself instead of being
+     * copied into the frame's staging -- the D3D12 VCACHE binds its cache
+     * buffer the same way (rsx_d3d12_backend.c, VC_CHUNK_ID). Positions are
+     * the engine's absolute ring positions; the byte offset is pos % bytes.
+     *   arena_create: CPU pointer to `bytes` of GPU-visible memory, or NULL.
+     *   arena_retire: the engine is about to overwrite every position below
+     *     `below`. Wait for any submitted GPU work that reads one; return 0
+     *     (and the engine writes nothing) when draws not yet submitted read
+     *     one, since a submit here would cut a draw that is half set up.
+     *   draw_arena:   `draw`, with the vertices (and the u32 indices, when
+     *     index_count) at those ring positions. */
+    void* (*arena_create)(void* user, u64 bytes);
+    int   (*arena_retire)(void* user, u64 below);
+    void  (*draw_arena)(void* user, rsx_topology topology, u64 vb_pos,
+                        u32 vertex_count, u32 stride, u64 ib_pos,
+                        u32 index_count);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

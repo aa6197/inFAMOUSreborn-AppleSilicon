@@ -2414,7 +2414,12 @@ static geo_l2* s_geo_l2;
 static u8* s_geo_arena;
 static u64 s_geo_size, s_geo_head;
 static int s_geo_on = -1, s_geo_stats;
-static struct { u64 draws, elig, hit, miss1, miss2, volskip, stored, hashb, reuseb, storeb, refresh; } s_geo_st;
+/* GEO_DIRECT: the arena is the backend's GPU-visible buffer (arena_create)
+ * and a hit is drawn from it as it is (draw_arena), as the D3D12 VCACHE binds
+ * its cache buffer. PS3RECOMP_ENGINE_GEO_DIRECT=0: hits are copied into the
+ * staging like any other draw. */
+static int s_geo_gpu;
+static struct { u64 draws, elig, hit, miss1, miss2, volskip, stored, hashb, reuseb, storeb, refresh, direct, refused; } s_geo_st;
 
 static int eng_geo_on(void)
 {
@@ -2428,27 +2433,50 @@ static int eng_geo_on(void)
         s_geo_size = mb << 20;
         s_geo_l1 = (geo_l1*)calloc((size_t)2 << GEO_SET_BITS, sizeof(geo_l1));
         s_geo_l2 = (geo_l2*)calloc((size_t)2 << GEO_SET_BITS, sizeof(geo_l2));
-        s_geo_arena = (u8*)malloc((size_t)s_geo_size);
+        if (g.be && g.be->arena_create && g.be->arena_retire && g.be->draw_arena &&
+            eng_env_flag("PS3RECOMP_ENGINE_GEO_DIRECT", 1)) {
+            s_geo_arena = (u8*)g.be->arena_create(g.be->user, s_geo_size);
+            s_geo_gpu = s_geo_arena != NULL;
+        }
+        if (!s_geo_arena) s_geo_arena = (u8*)malloc((size_t)s_geo_size);
         if (!s_geo_l1 || !s_geo_l2 || !s_geo_arena) {
-            free(s_geo_l1); free(s_geo_l2); free(s_geo_arena);
+            free(s_geo_l1); free(s_geo_l2);
+            if (!s_geo_gpu) free(s_geo_arena);
             s_geo_l1 = NULL; s_geo_l2 = NULL; s_geo_arena = NULL;
-            s_geo_on = 0;
+            s_geo_on = 0; s_geo_gpu = 0;
         }
     }
-    fprintf(stderr, "[rsx engine] geometry memo: %s (PS3RECOMP_ENGINE_GEO_MEMO, %llu MB)\n",
-            s_geo_on ? "on" : "off", (unsigned long long)(s_geo_on ? mb : 0));
+    fprintf(stderr, "[rsx engine] geometry memo: %s (PS3RECOMP_ENGINE_GEO_MEMO, %llu MB%s)\n",
+            s_geo_on ? "on" : "off", (unsigned long long)(s_geo_on ? mb : 0),
+            s_geo_gpu ? ", hits drawn from it: PS3RECOMP_ENGINE_GEO_DIRECT" : "");
     return s_geo_on;
 }
 
 /* Arena: a byte ring addressed by absolute position. Data at pos is intact
- * while the head has not gone a full ring past it. */
+ * while the head has not gone a full ring past it. NULL (and nothing moves)
+ * when GEO_DIRECT draws still to be submitted read the bytes it would hand
+ * out; the backend has waited for any submitted ones. */
 static u8* eng_geo_alloc(u32 bytes, u64* pos)
 {
-    const u64 off = s_geo_head % s_geo_size;
-    if (off + bytes > s_geo_size) s_geo_head += s_geo_size - off;
-    *pos = s_geo_head;
-    s_geo_head += bytes;
-    return s_geo_arena + (*pos % s_geo_size);
+    u64 head = s_geo_head;
+    const u64 off = head % s_geo_size;
+    if (off + bytes > s_geo_size) head += s_geo_size - off;
+    if (s_geo_gpu && head + bytes > s_geo_size &&
+        !g.be->arena_retire(g.be->user, head + bytes - s_geo_size)) {
+        s_geo_st.refused++;
+        return NULL;
+    }
+    *pos = head;
+    s_geo_head = head + bytes;
+    return s_geo_arena + (head % s_geo_size);
+}
+
+/* A hit drawn from the arena must stay intact until its frame is on the GPU
+ * and done. One in the oldest eighth is copied instead: the next stores
+ * would soon need its bytes, and arena_retire would have to wait for it. */
+static int eng_geo_direct(const geo_l2* l2)
+{
+    return s_geo_gpu && s_geo_head + s_geo_size / 8u <= l2->pos + s_geo_size;
 }
 
 typedef struct {
@@ -2609,9 +2637,11 @@ static const geo_l2* eng_geo_lookup(u32 prim, eng_geo_probe* pr)
         const u8* src = s_geo_arena + (l2->pos % s_geo_size);
         u64 pos;
         u8* dst = eng_geo_alloc((u32)room, &pos);
-        memcpy(dst, src, bytes);
-        l2->pos = pos;
-        s_geo_st.refresh++;
+        if (dst) {
+            memcpy(dst, src, bytes);
+            l2->pos = pos;
+            s_geo_st.refresh++;
+        }
     }
     s_geo_st.hit++;
     s_geo_st.reuseb += bytes;
@@ -2651,6 +2681,7 @@ static void eng_geo_store(eng_geo_probe* pr, int indexed, u32 n_draw, const u32*
     if (total > s_geo_size / 8u) return;
     u64 pos;
     u8* dst = eng_geo_alloc((u32)((total + 15u) & ~15ull), &pos);
+    if (!dst) return;
     memcpy(dst, dc.verts, vbytes);
     if (ib) memcpy(dst + ((vbytes + 15u) & ~15u), indices, ib);
     geo_l2* l2 = eng_geo_way_l2(s_geo_l2, pr->key);
@@ -2714,11 +2745,11 @@ static void eng_geo_frame(void)
     const double f = 600.0;
     fprintf(stderr, "[rsx engine] GEO_MEMO per frame: draws %.0f eligible %.0f hit %.0f"
                     " miss(new %.0f changed %.0f) volatile-skip %.0f | hashed %.1f MB"
-                    " reused %.1f MB stored %.1f MB refreshed %.0f\n",
+                    " reused %.1f MB stored %.1f MB refreshed %.0f | direct %.0f refused %.1f\n",
             s_geo_st.draws / f, s_geo_st.elig / f, s_geo_st.hit / f, s_geo_st.miss1 / f,
             s_geo_st.miss2 / f, s_geo_st.volskip / f, s_geo_st.hashb / f / 1048576.0,
             s_geo_st.reuseb / f / 1048576.0, s_geo_st.storeb / f / 1048576.0,
-            s_geo_st.refresh / f);
+            s_geo_st.refresh / f, s_geo_st.direct / f, s_geo_st.refused / f);
     memset(&s_geo_st, 0, sizeof s_geo_st);
 }
 
@@ -3341,8 +3372,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 (unsigned)rs.stencil_enable, rsx_dsp_reg(&g.rsx, 0x1FECu), (unsigned long long)g.ps_hash, tx);
     }
     if (!geo_hit) eng_geo_store(&geo, indexed, n_draw, draw_indices);
-    g.be->draw(g.be->user, topology, verts, uploaded, layout.stride,
-               indexed ? draw_indices : NULL, indexed ? n_draw : 0);
+    if (geo_hit && eng_geo_direct(geo_hit)) {
+        s_geo_st.direct++;
+        g.be->draw_arena(g.be->user, topology, geo_hit->pos, uploaded, layout.stride,
+                         indexed ? geo_hit->pos + ((geo_hit->vbytes + 15u) & ~15u) : 0,
+                         indexed ? n_draw : 0);
+    } else {
+        g.be->draw(g.be->user, topology, verts, uploaded, layout.stride,
+                   indexed ? draw_indices : NULL, indexed ? n_draw : 0);
+    }
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */

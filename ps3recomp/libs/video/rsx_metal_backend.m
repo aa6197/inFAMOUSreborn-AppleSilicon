@@ -2211,6 +2211,15 @@ static id<MTLCommandBuffer> s_eng_flight_cb[ENG_FLIGHT];
 static u32 s_eng_flight_serial[ENG_FLIGHT];
 static int s_eng_encoding;
 
+/* The geometry memo's ring (rsx_draw_engine.c arena_create), one shared
+ * buffer that memo hits draw from instead of being copied into the stage.
+ * Each commit notes the lowest ring position its draws read, so the engine
+ * can overwrite old positions without waiting on newer work. */
+static id<MTLBuffer> s_eng_arena;
+static u64 s_eng_arena_size;
+static u64 s_eng_rec_minpos = UINT64_MAX;       /* the commit being recorded */
+static u64 s_eng_flight_minpos[ENG_FLIGHT];
+
 /* Completion handlers can run after a later waited commit returned. */
 static void eng_note_done(u32 serial)
 {
@@ -2277,6 +2286,7 @@ typedef struct {
     u32   resolve_dst;          /* ENG_REC_DEPTH_RESOLVE target texture */
     u32   resolve_color;        /* 1: the A8R8G8B8 colour copy, not R32F */
     u32   copy_src;             /* ENG_REC_COPY: copy_src -> resolve_dst */
+    u8    arena;                /* draw: vb_off/ib_off are in s_eng_arena, not the stage */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -2592,7 +2602,10 @@ static void eng_shutdown(void* user)
         if (s_eng_flight_cb[i]) [s_eng_flight_cb[i] waitUntilCompleted];
         s_eng_flight_cb[i] = nil;
         s_eng_flight_serial[i] = 0;
+        s_eng_flight_minpos[i] = UINT64_MAX;
     }
+    /* s_eng_arena stays: the engine keeps writing to it across a reset. */
+    s_eng_rec_minpos = UINT64_MAX;
     memset(s_eng_obj_use, 0, sizeof s_eng_obj_use);
     s_eng_ring_cur = 0;
     s_eng_stage = NULL;
@@ -3173,6 +3186,66 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
     r->vertex_count = vertex_count;
     r->ib_off       = ib_off;
     r->index_count  = indices ? index_count : 0;
+    r->arena        = 0;
+}
+
+static void* eng_arena_create(void* user, u64 bytes)
+{
+    (void)user;
+    if (!s_dev || !bytes || bytes > 0xFFFFFFF0ull || bytes > [s_dev maxBufferLength])
+        return NULL;
+    if (!s_eng_arena) {
+        s_eng_arena = [s_dev newBufferWithLength:(NSUInteger)bytes
+                                         options:MTLResourceStorageModeShared];
+        if (!s_eng_arena) return NULL;
+        s_eng_arena.label = @"geometry memo";
+        s_eng_arena_size = bytes;
+    }
+    return s_eng_arena_size == bytes ? [s_eng_arena contents] : NULL;
+}
+
+/* The engine is about to overwrite ring positions below `below`. */
+static int eng_arena_retire(void* user, u64 below)
+{
+    (void)user;
+    if (s_eng_rec_minpos < below) return 0;     /* the batch not yet committed reads one */
+    const u32 done = atomic_load_explicit(&s_eng_done_serial, memory_order_acquire);
+    id<MTLCommandBuffer> wait = nil;
+    u32 wait_serial = 0;
+    for (u32 i = 0; i < ENG_FLIGHT; i++) {
+        const u32 sn = s_eng_flight_serial[i];
+        if (!s_eng_flight_cb[i] || sn <= done || sn >= s_eng_serial) continue;
+        if (s_eng_flight_minpos[i] < below && sn > wait_serial) {
+            wait = s_eng_flight_cb[i]; wait_serial = sn;
+        }
+    }
+    if (wait) {         /* commits finish in order: the newest one covers the rest */
+        static u32 n;
+        if (n++ < 3)
+            fprintf(stderr, "[rsx engine/metal] geometry memo wraps onto frame %u: waiting\n",
+                    wait_serial);
+        [wait waitUntilCompleted];
+    }
+    return 1;
+}
+
+static void eng_draw_arena(void* user, rsx_topology topology, u64 vb_pos, u32 vertex_count,
+                           u32 stride, u64 ib_pos, u32 index_count)
+{
+    (void)user;
+    if (!vertex_count || !stride || !s_eng_arena) return;
+    if (!eng_rec_room()) { s_eng_dropped++; return; }
+    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+    *r = s_eng_pending;
+    r->kind         = ENG_REC_DRAW;
+    r->topology     = topo_to_metal(topology);
+    r->vb_off       = (u32)(vb_pos % s_eng_arena_size);
+    r->stride       = stride;
+    r->vertex_count = vertex_count;
+    r->ib_off       = index_count ? (u32)(ib_pos % s_eng_arena_size) : 0;
+    r->index_count  = index_count;
+    r->arena        = 1;
+    if (vb_pos < s_eng_rec_minpos) s_eng_rec_minpos = vb_pos;
 }
 
 static void eng_clear_color(void* user, u32 surface, const float rgba[4])
@@ -3220,6 +3293,7 @@ typedef struct {
     MTLScissorRect sc; int sc_set;
     int vb_set, vcb_set, fcb_set;
     u32 vb_off, vcb_off, fcb_off;
+    const void* vb_buf;         /* the stage, or s_eng_arena for a memo hit */
     const void* ftex[RSX_BE_MAX_TEXTURES];
     const void* fsamp[RSX_BE_MAX_TEXTURES];
     const void* vtex[RSX_BE_MAX_VERTEX_TEXTURES];
@@ -3262,10 +3336,13 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
             [enc setScissorRect:sc]; st->sc = sc; st->sc_set = 1;
         }
     }
-    /* One staging buffer per encoder: bind it once, then move the offset. */
-    if (!st->vb_set) {
-        [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
-        st->vb_set = 1; st->vb_off = r->vb_off;
+    /* One staging buffer per encoder: bind it once, then move the offset.
+     * Memo hits read the memo's own buffer instead. */
+    id<MTLBuffer> vbuf = r->arena ? s_eng_arena : stage;
+    const void* vbp = (__bridge const void*)vbuf;
+    if (!st->vb_set || st->vb_buf != vbp) {
+        [enc setVertexBuffer:vbuf offset:r->vb_off atIndex:MTL_VB_INDEX];
+        st->vb_set = 1; st->vb_off = r->vb_off; st->vb_buf = vbp;
     } else if (st->vb_off != r->vb_off) {
         [enc setVertexBufferOffset:r->vb_off atIndex:MTL_VB_INDEX];
         st->vb_off = r->vb_off;
@@ -3324,7 +3401,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         [enc drawIndexedPrimitives:r->topology
                         indexCount:r->index_count
                          indexType:MTLIndexTypeUInt32
-                       indexBuffer:stage
+                       indexBuffer:vbuf
                  indexBufferOffset:r->ib_off];
     else
         [enc drawPrimitives:r->topology
@@ -3723,6 +3800,7 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
             }];
             s_eng_flight_cb[serial % ENG_FLIGHT] = cb;
             s_eng_flight_serial[serial % ENG_FLIGHT] = serial;
+            s_eng_flight_minpos[serial % ENG_FLIGHT] = s_eng_rec_minpos;
             [cb commit];
         } else {
             [cb commit];
@@ -3740,6 +3818,7 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
             s_eng_dropped = 0;
         }
         s_eng_rec_count  = 0;
+        s_eng_rec_minpos = UINT64_MAX;
         s_eng_stage_used = 0;
         s_eng_vcb_valid  = 0;
         eng_collect_retired_objects();
@@ -3854,6 +3933,9 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil  = eng_clear_depth_stencil,
     .present              = eng_present,
     .readback             = eng_readback,
+    .arena_create         = eng_arena_create,
+    .arena_retire         = eng_arena_retire,
+    .draw_arena           = eng_draw_arena,
 };
 
 /* ---- public API ---------------------------------------------------------- */
