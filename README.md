@@ -47,8 +47,8 @@ You need:
    ```
 2. Get the code
    ```bash
-   git clone -b apple-port https://github.com/SubhanHabib/inFAMOUSreborn.git
-   cd inFAMOUSreborn
+   git clone https://github.com/SubhanHabib/inFAMOUSreborn-AppleSilicon.git
+   cd inFAMOUSreborn-AppleSilicon
    ```
 3. Build the installer
    ```bash
@@ -105,7 +105,7 @@ Known issues:
 - The iPad runs at about half speed
 - Only tested on one Mac so far. Older chips (M1, M2) may not reach 30 fps
 
-Please report bugs here, not on inFAMOUSreborn. The original project doesn't support forks.
+Please report bugs here, not on inFAMOUSreborn. This port isn't part of the original project.
 
 For the nerdy stuff (what was changed for ARM and Metal, speed tests, every switch) see [PORT_LOG.md](PORT_LOG.md).
 
