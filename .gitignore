@@ -22,6 +22,7 @@ BCES00220_guest_memory_*/
 # Regenerated from the player's own game by the installer
 infamous-recomp/recompiled/
 infamous-recomp/spu-images/
+infamous-recomp/import/eboot_key.h
 infamous-recomp/assets/
 infamous-recomp/spu/**
 !infamous-recomp/spu/jobmods_extra_map.json

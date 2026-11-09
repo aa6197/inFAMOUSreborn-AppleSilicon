@@ -633,6 +633,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # link language from the generated C would leave the C++ standard library out.
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
+# Disc import (Apple port): turns the player's disc image or game folder into
+# the folder the runtime reads (import/disc_import.h). CommonCrypto is part of
+# libSystem; zlib unpacks the compressed sections of EBOOT.BIN.
+if(APPLE)
+    target_sources(${PROJECT_NAME} PRIVATE import/disc_import.c)
+    target_link_libraries(${PROJECT_NAME} PRIVATE z)
+endif()
+
 # ---------------------------------------------------------------------------
 # iOS / iPadOS app (Apple port; -DCMAKE_SYSTEM_NAME=iOS, Xcode generator)
 # ---------------------------------------------------------------------------
