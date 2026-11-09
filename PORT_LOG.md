@@ -4,6 +4,16 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
+- **End-user release (new):** prebuilt Mac app and iPad .ipa with no game
+  files. The player picks their own disc image or game folder at first
+  start; the app unpacks it, decrypts EBOOT.BIN and checks it. See entry
+  "End-user release: in-app disc import". Make the files with
+  `infamous-recomp/tools/release_apple.sh` → `$WORK_DIR/dist/<ver>`.
+- **Legal points for the user's lawyer** (not decided by me): the
+  prebuilt binary holds code translated from the game; it embeds the
+  EBOOT metadata key (`import/eboot_key.h`, git-ignored, never commit);
+  at3_standalone (LGPL 2.1) is linked statically; the repo has no
+  top-level licence.
 - Milestone: **M9 done on the real iPad** (iPad Pro 11 M4, iPadOS 27.2):
   gameplay + pause menu, 330 s, no crash. M10 (iPhone) is done in the
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
@@ -33,6 +43,72 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-09 — End-user release: in-app disc import
+
+### Result
+
+A player downloads the app, picks their own disc, and plays. No dev
+tools, no RPCS3, no terminal.
+
+- **Importer** `infamous-recomp/import/disc_import.c` (Apple only):
+  - reads a plain ISO, an encrypted ISO (+ `.dkey`/`.key` next to it, or
+    asks for one), or a game folder;
+  - checks the title id and the EBOOT.BIN hash, decrypts the SELF with
+    the embedded metadata key, checks the EBOOT.elf hash;
+  - clones files on the same APFS volume, copies otherwise;
+  - checks free space first.
+- The key header `import/eboot_key.h` is git-ignored. A build without it
+  still runs; the importer then only takes a folder that has EBOOT.elf.
+  `import/import_cli.c make-key` makes the header (needs the APP key).
+- **Mac app** `mac/mac_app.mm` + `tools/make_mac_app.sh`:
+  - data in `~/Library/Application Support/inFamous`
+    (`INFAMOUS_DATA_DIR` overrides);
+  - first-run import window when no game is found;
+  - test switches `INFAMOUS_IMPORT_TEST=<src>`, `INFAMOUS_UI_SNAPSHOT=<dir>`.
+- **Mac threading fix:** the Metal window code does `dispatch_sync` to
+  the main queue, so in windowed mode the guest now runs on a 64 MB
+  "game-main" thread and the main thread runs `[NSApp run]`
+  (`port_mac_run_game`). Headless runs and Windows are unchanged.
+- **macOS release build** `build-mac-release`: static deps for macOS 13
+  (`$WORK_DIR/tools/build_mac_deps.sh` → `$WORK_DIR/deps/macosx`),
+  `-DPS3RECOMP_MAC_SDL3=ON` (static SDL3). Links system libs only.
+- **iPad import screen** `ios/ios_import.mm`: same flow, document picker,
+  data in Documents (Files → On My iPad → inFamous).
+- **Release script** `tools/release_apple.sh [ver] [out]`:
+  - Mac zip (ad-hoc signed, not notarized);
+  - .ipa: ad-hoc signed, keeps only the two kernel entitlements,
+    no provisioning profile (it lists team and device ids);
+  - stops if any bundle has game-like files or a big non-program file;
+  - writes THIRD_PARTY_NOTICES.txt and SHA256SUMS.txt.
+- README: download and install steps first, "Build it yourself" after.
+
+### Checks
+
+| test | result |
+|---|---|
+| Mac release zip, unzipped fresh, real ISO from the T7 | import ok, window open, 12450 flips at 290 s (timeout), no crash, audio real time |
+| Mac dev app, windowed | 3520 flips at 74 s, audio real time |
+| Simulator (iPad), folder import via the picker | imported to Documents, reached the title screen |
+| iPad device build with the import screen | builds, installs, finds the existing game, boots (Metal, audio real time) |
+| release bundles | no game files; Mac exe links system libs only, minos 13.0 |
+
+- The iPad run (20261109-095824-import-build) showed the app switcher
+  the whole time: someone else was using the iPad. The game ran in the
+  background, so there is no picture from it. I stopped using the iPad.
+
+### Open
+
+- The iPad import screen on a real device needs the user's hands.
+- Free Apple ID sideloading: the two entitlements are untested. Without
+  extended virtual addressing the app can't reserve 4 GB.
+- Mac has no keyboard/mouse controls yet: a controller is needed.
+- No app icon. Bundle id is still `local.subs.infamous`.
+- Not notarized (that uploads the app to Apple: ask the user first).
+- Windows prebuilt with import: later.
+- Legal points: see "Now".
 
 ---
 
