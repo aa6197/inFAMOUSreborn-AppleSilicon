@@ -1162,6 +1162,8 @@ volatile int g_ui_fps_cap = -2;
 int (*volatile g_uiov_paused_fn)(void) = 0;
 volatile unsigned long long g_pause_menu_built_ms = 0;
 volatile int g_uiov_request = 0;
+volatile int g_uiov_menu_open = 0;   /* cellPad.c keyboard/mouse (macOS): no overlay menu is ever open */
+volatile int g_ui_mouse_speed = 0;   /* cellPad.c: 0 = PAD_MOUSE_SPEED env or its default */
 int  uiov_dialog_available(void) { return 0; }
 unsigned long long uiov_last_draw_ms(void) { return 0; }
 void uiov_dialog_open(const char* m, int k, int d) { (void)m; (void)k; (void)d; }

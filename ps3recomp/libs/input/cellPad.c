@@ -157,6 +157,7 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     if (val > 255) val = 255;
     return (u8)val;
 }
+#endif /* PAD_BACKEND_XINPUT (closed around the keyboard + mouse block below, reopened after it) */
 
 /* Keyboard fallback for port 0.
  *
@@ -175,6 +176,21 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
  * so a title that reads the stick instead is playable too. */
 
+/* macOS (Apple port): the same keyboard + mouse pad as Windows (v150 PAD_KBM below), with the keys, mouse and focus
+ * reported by the app's AppKit event monitors (pad_host_kbm.h, infamous-recomp/mac/mac_kbm.mm) instead of
+ * GetAsyncKeyState / raw input. iOS keeps its touch pad. */
+#if defined(__APPLE__)
+  #include <TargetConditionals.h>
+  #if TARGET_OS_OSX
+    #define PAD_KBM_MAC 1
+    #include "pad_host_kbm.h"
+  #endif
+#endif
+#ifndef PAD_KBM_MAC
+  #define PAD_KBM_MAC 0
+#endif
+
+#if (PAD_BACKEND_XINPUT && defined(_WIN32)) || PAD_KBM_MAC
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
@@ -184,6 +200,10 @@ static int pad_host_window_focused(void)
     GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
 }
+#else
+static volatile int s_mac_focused = 0;   /* ps3_pad_host_focus */
+static int pad_host_window_focused(void) { return s_mac_focused; }
+#endif
 
 /* v150 KEYBOARD + MOUSE (PAD_KBM, default 1; 0 = the old key map below).
  *   W/A/S/D = left stick (walk), hold Shift = run (full deflection)
@@ -415,6 +435,7 @@ static u8 pad_axis(float v)   /* v in -127..127 -> 0..255, 128 = centre */
     if (r > 255) r = 255;
     return (u8)r;
 }
+#ifdef _WIN32
 static void pad_poll_kbm(int merge)
 {
     PadHostState* hs = &s_host_state[0];
@@ -674,7 +695,224 @@ static void pad_poll_keyboard(int merge)
           printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
           fflush(stdout); } }
 }
-#endif
+#else  /* PAD_KBM_MAC */
+/* macOS host input (pad_host_kbm.h). Held keys plus a tap latch: off Windows there is no 250 Hz poll thread (the
+ * guest's own cellPadGetData polls, ~30 times a second), so a key that goes down and up between two polls still
+ * counts as down for one poll. */
+static volatile unsigned char s_mac_key[256], s_mac_tap[256];
+static unsigned char s_mac_snap[256];   /* this poll's keys: held or tapped (pad_poll_kbm only) */
+int ps3_pad_host_kbm_enabled(void) { return pad_kbm_on() && !getenv("PAD_NO_KEYBOARD"); }
+void ps3_pad_host_key(int vk, int down)
+{
+    if (vk <= 0 || vk > 255) return;
+    s_mac_key[vk] = down ? 1 : 0;
+    if (down) s_mac_tap[vk] = 1;
+}
+void ps3_pad_host_focus(int focused)
+{
+    if (!focused) { memset((void*)s_mac_key, 0, sizeof s_mac_key); memset((void*)s_mac_tap, 0, sizeof s_mac_tap); }
+    s_mac_focused = focused ? 1 : 0;
+}
+void ps3_pad_host_mouse_move(long dx, long dy)
+{
+    InterlockedExchangeAdd(&g_pad_raw_mdx, dx);
+    InterlockedExchangeAdd(&g_pad_raw_mdy, dy);
+    g_pad_raw_ok = 1;   /* device deltas, as the Windows raw-input path */
+}
+void ps3_pad_host_wheel(long w) { InterlockedExchangeAdd(&g_pad_raw_wheel, w); }
+int  ps3_pad_host_mouse_wanted(void) { return g_pad_mouse_captured; }
+
+/* The Windows pad_poll_kbm above, key for key, with these differences: keys come from the app (s_mac_snap), the
+ * mouse is always the raw-delta path, and the app hides and holds the pointer while g_pad_mouse_captured is set
+ * (no SetCursorPos). The app reports left clicks only inside the game view (the Windows client-rect test). */
+static void pad_poll_kbm(int merge)
+{
+    PadHostState* hs = &s_host_state[0];
+    static float s_mx = 0.0f, s_my = 0.0f;
+    static int s_sens = -1, s_inv = 0, s_dz = 0, s_walk = 0;
+    if (s_sens < 0) { s_sens = pad_envi("PAD_MOUSE_SENS", 6); s_inv = pad_envi("PAD_MOUSE_INVERT_Y", 0);
+                      s_dz = pad_envi("PAD_MOUSE_DZ", 22); s_walk = pad_envi("PAD_KBM_WALK", 64); }
+    const int focused = pad_host_window_focused();
+    const long raw_dx = InterlockedExchange(&g_pad_raw_mdx, 0), raw_dy = InterlockedExchange(&g_pad_raw_mdy, 0);
+    const long raw_wheel = InterlockedExchange(&g_pad_raw_wheel, 0);
+    for (int i = 0; i < 256; i++)
+        s_mac_snap[i] = (unsigned char)(s_mac_key[i] | __atomic_exchange_n(&s_mac_tap[i], 0, __ATOMIC_ACQ_REL));
+    if (!focused) {
+        s_pad_kbm_map_active = 0;
+        g_pad_mouse_captured = 0;
+        s_mx = s_my = 0.0f;
+        if (!merge) {
+            hs->buttons = 0;
+            hs->analog_lx = hs->analog_ly = 128;
+            hs->analog_rx = hs->analog_ry = 128;
+            hs->trigger_l2 = hs->trigger_r2 = 0;
+            hs->connected = 1;
+        }
+        return;
+    }
+#define KD(vk) (s_mac_snap[(vk) & 0xFF] != 0)
+    /* v155 MENU MODE: Esc = Start (opens/closes the pause menu) and frees the mouse pointer until Esc again or a
+     * left click in the game view. */
+    static int s_menu_free = 0, s_esc_prev = 0, s_lmb_block = 0;
+    {
+        const int esc = KD(PAD_VK_ESCAPE);
+        extern volatile int g_uiov_menu_open;
+        if (esc && !s_esc_prev && !g_uiov_menu_open) s_menu_free = !s_menu_free;
+        s_esc_prev = esc;
+        if (s_menu_free && KD(PAD_VK_LBUTTON)) { s_menu_free = 0; s_lmb_block = 1; }   /* the recapturing click is not a shot */
+        if (s_lmb_block && !KD(PAD_VK_LBUTTON)) s_lmb_block = 0;
+    }
+    /* v196 MENU KEYS: while paused W/A/S/D = d-pad, Enter = Cross, Backspace = Circle (decided per key press). */
+    extern int (*volatile g_uiov_paused_fn)(void);
+    static int s_mk_mode[5];   /* W A S D Enter: 0 up, 1 game/map meaning, 2 menu meaning */
+    const int paused_now = g_uiov_paused_fn ? g_uiov_paused_fn() : 0;
+    /* Tab opens the world map (pending window while the pause probe notices; see the Windows comment). */
+    static int s_map_mode = 0, s_tab_prev = 0;
+    static unsigned long long s_map_pending_until = 0;
+    const int tab_now = KD(PAD_VK_TAB);
+    const unsigned long long input_now = GetTickCount64();
+    if (tab_now && !s_tab_prev) {
+        s_map_mode = !s_map_mode;
+        s_map_pending_until = s_map_mode ? input_now + 1500 : 0;
+    }
+    s_tab_prev = tab_now;
+    if (s_map_mode && (KD('C') || KD(PAD_VK_ESCAPE) || KD(PAD_VK_BACK))) s_map_mode = 0;
+    if (s_map_mode && !paused_now && input_now >= s_map_pending_until) s_map_mode = 0;
+    const int map_now = s_map_mode && (paused_now || input_now < s_map_pending_until);
+    s_pad_kbm_map_active = map_now;
+    static const int mk_vk[5] = { 'W', 'A', 'S', 'D', PAD_VK_RETURN };
+    for (int i = 0; i < 5; i++) {
+        if (!KD(mk_vk[i])) s_mk_mode[i] = 0;
+        else if (!s_mk_mode[i]) s_mk_mode[i] = (paused_now && !map_now) ? 2 : 1;
+    }
+#define MK_GAME(i) (s_mk_mode[i] == 1)
+#define MK_MENU(i) (s_mk_mode[i] == 2)
+    u16 btns = 0;
+    if (MK_MENU(0)) btns |= CELL_PAD_CTRL_UP;
+    if (MK_MENU(1)) btns |= CELL_PAD_CTRL_LEFT;
+    if (MK_MENU(2)) btns |= CELL_PAD_CTRL_DOWN;
+    if (MK_MENU(3)) btns |= CELL_PAD_CTRL_RIGHT;
+    if (MK_MENU(4)) btns |= CELL_PAD_CTRL_CROSS;
+    if (paused_now && KD(PAD_VK_BACK)) btns |= CELL_PAD_CTRL_CIRCLE;
+    if (KD(PAD_VK_CONTROL)) btns |= CELL_PAD_CTRL_UP;       /* Precision power/mode */
+    if (paused_now && !map_now && KD(PAD_VK_UP)) btns |= CELL_PAD_CTRL_UP; /* menu navigation only */
+    if (KD(PAD_VK_DOWN))    btns |= CELL_PAD_CTRL_DOWN;
+    if (KD(PAD_VK_LEFT))    btns |= CELL_PAD_CTRL_LEFT;
+    if (KD(PAD_VK_RIGHT))   btns |= CELL_PAD_CTRL_RIGHT;
+    if (KD(PAD_VK_SPACE))   btns |= CELL_PAD_CTRL_CROSS;
+    if (KD('C'))            btns |= CELL_PAD_CTRL_CIRCLE;
+    if (KD('F'))            btns |= CELL_PAD_CTRL_SQUARE;
+    if (KD('E'))            btns |= CELL_PAD_CTRL_TRIANGLE;
+    if (!s_menu_free && KD(PAD_VK_RBUTTON)) btns |= CELL_PAD_CTRL_L1;
+    if (!s_menu_free && !s_lmb_block && KD(PAD_VK_LBUTTON)) btns |= CELL_PAD_CTRL_R1;
+    if (KD('Q'))            btns |= CELL_PAD_CTRL_L2;
+    if (KD('R'))            btns |= CELL_PAD_CTRL_R2;
+    if (KD('V'))            btns |= CELL_PAD_CTRL_L3;
+    if (!s_menu_free && KD(PAD_VK_MBUTTON)) btns |= CELL_PAD_CTRL_R3;
+    if (MK_GAME(4) || KD(PAD_VK_ESCAPE)) btns |= CELL_PAD_CTRL_START;   /* v155: Esc = Start (pause) */
+    if (KD(PAD_VK_TAB))     btns |= CELL_PAD_CTRL_SELECT;
+    /* left stick */
+    float lx = 0.0f, ly = 0.0f;
+    if (MK_GAME(1)) lx -= 1.0f;
+    if (MK_GAME(3)) lx += 1.0f;
+    if (MK_GAME(0)) ly -= 1.0f;   /* PS3: up = 0 */
+    if (MK_GAME(2)) ly += 1.0f;
+#undef MK_GAME
+#undef MK_MENU
+    const int keyboard_moving = (lx != 0.0f || ly != 0.0f);
+    s_kbm_lstick_keys = keyboard_moving;   /* v236 */
+    if (keyboard_moving) {
+        const float mag = KD(PAD_VK_SHIFT) ? 127.0f : (float)s_walk;
+        const float n = (lx != 0.0f && ly != 0.0f) ? 0.70710678f : 1.0f;
+        lx *= mag * n; ly *= mag * n;
+    }
+    /* mouse -> right stick. Hold Alt (Option) to free the pointer. */
+    const int alt = KD(PAD_VK_MENU);
+    const int clicks = KD(PAD_VK_LBUTTON) || KD(PAD_VK_RBUTTON) || KD(PAD_VK_MBUTTON);
+#undef KD
+    int have_mouse = 0;
+    extern volatile int g_uiov_menu_open;
+    if (!alt && !s_menu_free && !g_uiov_menu_open) {
+        if (g_pad_mouse_captured && pad_mouse_direct()) {
+            if (map_now) {
+                s_mx = s_mx * 0.6f + (float)raw_dx * (float)s_sens;
+                s_my = s_my * 0.6f + (float)(s_inv ? -raw_dy : raw_dy) * (float)s_sens;
+            } else {
+                InterlockedExchangeAdd(&s_mdx, raw_dx);
+                InterlockedExchangeAdd(&s_mdy, raw_dy);
+                s_mx = s_my = 0.0f;
+            }
+        } else if (g_pad_mouse_captured) {
+            s_mx = s_mx * 0.6f + (float)raw_dx * (float)s_sens;
+            s_my = s_my * 0.6f + (float)(s_inv ? -raw_dy : raw_dy) * (float)s_sens;
+        } else { s_mx = s_my = 0.0f; }
+        g_pad_mouse_captured = 1;   /* the app hides and holds the pointer (ps3_pad_host_mouse_wanted) */
+        have_mouse = 1;
+    }
+    if (!have_mouse) { g_pad_mouse_captured = 0; s_mx = s_my = 0.0f; }
+    float rx = 0.0f, ry = 0.0f;
+    if (s_mx > 0.5f || s_mx < -0.5f) rx = (s_mx > 0 ? 1.0f : -1.0f) * (float)s_dz + s_mx;
+    if (s_my > 0.5f || s_my < -0.5f) ry = (s_my > 0 ? 1.0f : -1.0f) * (float)s_dz + s_my;
+    const int mouse_motion = (rx != 0.0f || ry != 0.0f);
+    static float s_map_zoom = 0.0f;
+    static unsigned long long s_map_zoom_until = 0;
+    if (map_now && raw_wheel) {
+        s_map_zoom = raw_wheel > 0 ? -127.0f : 127.0f;
+        s_map_zoom_until = input_now + 100;
+    }
+    if (!map_now || input_now >= s_map_zoom_until) s_map_zoom = 0.0f;
+    if (map_now) {
+        if (mouse_motion) { lx = rx; ly = ry; }
+        rx = 0.0f; ry = s_map_zoom;             /* wheel -> right-stick vertical zoom */
+    }
+    const int map_panning = map_now && mouse_motion;
+    const int moving = keyboard_moving || map_panning;
+    const int looking = (!map_now && mouse_motion) || (map_now && ry != 0.0f);
+    /* v193: keyboard/mouse activity -> keyboard/mouse prompts (mouse jitter of a few counts is ignored) */
+    { const long am = (raw_dx < 0 ? -raw_dx : raw_dx) + (raw_dy < 0 ? -raw_dy : raw_dy);
+      if (btns || moving || am > 3 || clicks) pad_note_device(1);
+      else if (g_input_kbm < 0 && !merge) pad_note_device(1); }
+
+    if (merge) {   /* a controller owns port 0: add the keys, take the sticks only while used */
+        hs->buttons |= btns;
+        if (moving)  { hs->analog_lx = pad_axis(lx); hs->analog_ly = pad_axis(ly); }
+        if (looking) { hs->analog_rx = pad_axis(rx); hs->analog_ry = pad_axis(ry); }
+        if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+    } else {
+        hs->buttons = btns;
+        hs->connected = 1;
+        hs->analog_lx = pad_axis(lx); hs->analog_ly = pad_axis(ly);
+        hs->analog_rx = pad_axis(rx); hs->analog_ry = pad_axis(ry);
+        hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+        hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    }
+    const u16 b = hs->buttons;
+    hs->press_up       = (b & CELL_PAD_CTRL_UP)       ? 255 : 0;
+    hs->press_down     = (b & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+    hs->press_left     = (b & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+    hs->press_right    = (b & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+    hs->press_triangle = (b & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+    hs->press_circle   = (b & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+    hs->press_cross    = (b & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+    hs->press_square   = (b & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+    hs->press_l1       = (b & CELL_PAD_CTRL_L1)       ? 255 : 0;
+    hs->press_r1       = (b & CELL_PAD_CTRL_R1)       ? 255 : 0;
+    { static int said = 0; if (!said && (btns || moving || looking)) { said = 1;
+        printf("[cellPad] v150 keyboard/mouse input active on port 0%s (macOS)\n", merge ? " (merged with controller)" : ""); fflush(stdout); } }
+}
+
+static void pad_poll_keyboard(int merge)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off || !pad_kbm_on()) return;   /* PAD_KBM=0: the old key map is Windows-only */
+    pad_poll_kbm(merge);
+}
+#endif /* _WIN32 / PAD_KBM_MAC */
+#endif /* keyboard + mouse */
+
+#if PAD_BACKEND_XINPUT
 
 /* v221B PAD_XI_REPROBE_MS (default 1000; 0 = old): XInputGetState on an EMPTY slot is a device enumeration
  * (tens to hundreds of us each -- Microsoft's guidance is to re-check empty slots only every few seconds), and the
@@ -1202,6 +1440,11 @@ static void pad_poll_backend_do(void)
     pad_poll_sdl2();
 #elif PAD_BACKEND_SDL3
     pad_poll_sdl3();
+#endif
+#if PAD_KBM_MAC
+    /* macOS keyboard + mouse (pad_host_kbm.h): a connected controller owns port 0, the keys merge in. */
+    s_pad_xinput_merged = s_host_state[0].connected;
+    pad_poll_keyboard(s_host_state[0].connected);
 #endif
 #ifdef _WIN32
     if (cost) QueryPerformanceCounter(&t1);
@@ -2346,8 +2589,8 @@ s32 cellPadClearBuf(u32 port_no)
     return CELL_OK;
 }
 
-#ifndef _WIN32
-void ps3_pad_mouse_inject(u32 ctrl) { (void)ctrl; }   /* v151: KBM is Windows-only */
+#if !defined(_WIN32) && !PAD_KBM_MAC
+void ps3_pad_mouse_inject(u32 ctrl) { (void)ctrl; }   /* v151: KBM is Windows and macOS only */
 void ps3_pad_rstick_read(u32 site, u32 which, u32 kind) { (void)site; (void)which; (void)kind; }   /* v236 */
 void ps3_pad_mouse_cam_spring(u32 cam) { (void)cam; }
 int  ps3_pad_mouse_raw_turn(void) { return 0; }
