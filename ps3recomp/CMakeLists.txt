@@ -28,6 +28,9 @@ set(PS3RECOMP_IOS OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(PS3RECOMP_IOS ON)
 endif()
+# macOS (Apple port): use static SDL3 for pads and audio instead of SDL2.
+# Release builds turn it on; off keeps the SDL2 path (Homebrew).
+option(PS3RECOMP_MAC_SDL3 "macOS: SDL3 (static) pad and audio backends instead of SDL2" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -193,6 +196,18 @@ elseif(PS3RECOMP_IOS)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         PS3RECOMP_AUDIO_USE_SDL3=1 PS3RECOMP_PAD_USE_SDL3=1)
     message(STATUS "  SDL3:         ${SDL3_VERSION} (iOS: input + audio backends)")
+    find_package(Threads REQUIRED)
+    target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
+elseif(APPLE AND PS3RECOMP_MAC_SDL3)
+    # macOS release builds (Apple port): the same SDL3 backends as iOS, linked
+    # statically, so the app carries no Homebrew dylibs and can target an
+    # older macOS. No app shell pumps SDL events here, so cellPad updates the
+    # gamepads itself (PS3RECOMP_PAD_SDL3_UPDATE), as the SDL2 path does.
+    find_package(SDL3 CONFIG REQUIRED)
+    target_link_libraries(ps3recomp_runtime PUBLIC SDL3::SDL3-static)
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        PS3RECOMP_AUDIO_USE_SDL3=1 PS3RECOMP_PAD_USE_SDL3=1 PS3RECOMP_PAD_SDL3_UPDATE=1)
+    message(STATUS "  SDL3:         ${SDL3_VERSION} (macOS, static: input + audio backends)")
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
 else()

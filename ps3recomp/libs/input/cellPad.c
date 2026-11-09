@@ -6,7 +6,8 @@
  * Backend selection:
  *   - Windows default: XInput (no extra dependencies)
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
- *   - If PS3RECOMP_PAD_USE_SDL3 is defined: SDL3 gamepads (the iOS build)
+ *   - If PS3RECOMP_PAD_USE_SDL3 is defined: SDL3 gamepads (the iOS build, and
+ *     macOS with PS3RECOMP_MAC_SDL3)
  *
  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
  */
@@ -1046,6 +1047,9 @@ static void pad_poll_sdl3(void)
 {
     static unsigned long long s_next_scan = 0;
     const unsigned long long now = GetTickCount64();
+#if defined(PS3RECOMP_PAD_SDL3_UPDATE)
+    SDL_UpdateGamepads();   /* macOS: no app shell pumps SDL events (iOS: ios_shell.mm does) */
+#endif
     if (now >= s_next_scan) { s_next_scan = now + 500; pad_sdl3_open_new(); }
 
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
