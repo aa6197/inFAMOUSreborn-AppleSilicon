@@ -59,7 +59,10 @@ tools, no RPCS3, no terminal.
   - checks the title id and the EBOOT.BIN hash, decrypts the SELF with
     the embedded metadata key, checks the EBOOT.elf hash;
   - clones files on the same APFS volume, copies otherwise;
-  - checks free space first.
+  - checks free space first. It counts purgeable space too
+    (`kCFURLVolumeAvailableCapacityForImportantUsageKey`): on the test
+    iPad statfs said 6.5 GB free while iOS could make 142 GB free, so the
+    old check would have refused every import there.
 - The key header `import/eboot_key.h` is git-ignored. A build without it
   still runs; the importer then only takes a folder that has EBOOT.elf.
   `import/import_cli.c make-key` makes the header (needs the APP key).
@@ -77,6 +80,14 @@ tools, no RPCS3, no terminal.
   `-DPS3RECOMP_MAC_SDL3=ON` (static SDL3). Links system libs only.
 - **iPad import screen** `ios/ios_import.mm`: same flow, document picker,
   data in Documents (Files → On My iPad → inFamous).
+  - test switches (launch env): `INFAMOUS_DATA_DIR=<dir>` keeps the game
+    folder there instead of Documents (relative = inside Documents);
+    `INFAMOUS_IMPORT_TEST=<src>` imports that file or folder without
+    the picker (relative = inside Documents).
+  - device test recipe: copy the ISO in with `devicectl device copy to
+    ... --destination Documents/imptest-src/inFamous.iso`, then
+    `ios_device.sh run 330 ipad-import INFAMOUS_DATA_DIR=imptest
+    INFAMOUS_IMPORT_TEST=imptest-src/inFamous.iso GCM_FLIPCOUNT=1`.
 - **Release script** `tools/release_apple.sh [ver] [out]`:
   - Mac zip (ad-hoc signed, not notarized);
   - .ipa: ad-hoc signed, keeps only the two kernel entitlements,
@@ -92,16 +103,22 @@ tools, no RPCS3, no terminal.
 | Mac release zip, unzipped fresh, real ISO from the T7 | import ok, window open, 12450 flips at 290 s (timeout), no crash, audio real time |
 | Mac dev app, windowed | 3520 flips at 74 s, audio real time |
 | Simulator (iPad), folder import via the picker | imported to Documents, reached the title screen |
-| iPad device build with the import screen | builds, installs, finds the existing game, boots (Metal, audio real time) |
+| **real iPad**, real ISO (copied into the app), test switch | import screen showed progress, import ok in about 30 s, booted from the new copy, title screen, 7450 flips at 305 s, no crash |
+| iPad device build, game already in Documents | skips the import screen, boots |
 | release bundles | no game files; Mac exe links system libs only, minos 13.0 |
 
-- The iPad run (20261109-095824-import-build) showed the app switcher
-  the whole time: someone else was using the iPad. The game ran in the
-  background, so there is no picture from it. I stopped using the iPad.
+- Real iPad run: `runs/20261109-101719-ipad-import`.
+- An earlier iPad run (20261109-095824-import-build) showed the app
+  switcher the whole time (the iPad was in use), so it has no picture.
 
 ### Open
 
-- The iPad import screen on a real device needs the user's hands.
+- On the real iPad the Files picker step itself is untested (the test
+  switch skips it; the Simulator test covered it). Picking from iCloud
+  Drive or a USB drive needs the user's hands.
+- Test copies on the iPad (about 15 GB): Documents/imptest and
+  Documents/imptest-src. devicectl can't delete; use Files → On My iPad
+  → inFamous.
 - Free Apple ID sideloading: the two entitlements are untested. Without
   extended virtual addressing the app can't reserve 4 GB.
 - Mac has no keyboard/mouse controls yet: a controller is needed.
