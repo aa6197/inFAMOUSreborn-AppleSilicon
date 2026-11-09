@@ -644,10 +644,13 @@ endif()
 # macOS: mac/mac_app.mm sets up a .app bundle (tools/release_apple.sh makes
 # one from this binary) and shows the first-run import window when no game
 # path is given and none is found. Runs with a game path are unchanged.
+# mac/mac_kbm.mm adds keyboard + mouse controls (cellPad.c pad_host_kbm.h).
 if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     enable_language(OBJCXX)
-    target_sources(${PROJECT_NAME} PRIVATE mac/mac_app.mm)
-    set_property(SOURCE mac/mac_app.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
+    target_sources(${PROJECT_NAME} PRIVATE mac/mac_app.mm mac/mac_kbm.mm)
+    set_property(SOURCE mac/mac_app.mm mac/mac_kbm.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
+    # mac_kbm.mm: keyboard + mouse controls, fed to cellPad.c (pad_host_kbm.h)
+    set_property(SOURCE mac/mac_kbm.mm APPEND PROPERTY INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/input")
     target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers")
 endif()
 

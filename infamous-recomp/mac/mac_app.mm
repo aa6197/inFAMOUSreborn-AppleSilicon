@@ -371,6 +371,8 @@ static void start_app(void)
  * thread, as before. */
 struct PortMacGame { int (*fn)(void*); void* arg; };
 
+extern "C" void port_mac_kbm_install(void);
+
 static void* port_mac_game_thread(void* p)
 {
     pthread_setname_np("game-main");
@@ -397,6 +399,7 @@ extern "C" int port_mac_run_game(int (*fn)(void*), void* arg)
     }
     @autoreleasepool {
         start_app();
+        port_mac_kbm_install();   /* keyboard + mouse controls (mac_kbm.mm) */
     }
     [NSApp run];   /* never returns: the game thread, Quit or closing the window ends the process */
     return 0;
