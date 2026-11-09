@@ -29,7 +29,10 @@ Read this first every session. Newest entry on top.
   back-to-back profile pairs or ABBA runs.
 - Next speed work: the texture check (no exact cut found yet), the
   geometry hash (XXH3) and `sink_end` on the RSX thread.
-- Still needs the user: real taps on the touch pad, and a real controller.
+- **Mac keyboard + mouse (new):** same keys as Windows (WASD, mouse look,
+  Space, Esc pause). See entry "Mac keyboard + mouse controls".
+- Still needs the user: real taps on the touch pad, a real controller,
+  and a real keyboard + mouse on the Mac (pointer hold, focus).
 - M5 is **parked**: 3D is still too bright on near surfaces. Audio is
   now clean (it was choppy only because the game ran slow).
   Open items are in the M5 entry below.
@@ -43,6 +46,62 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+---
+
+## 2026-11-09 — Mac keyboard + mouse controls
+
+### Result
+
+A Mac player with no controller can play with keyboard and mouse.
+
+- **Same pad as Windows:** `cellPad.c` now runs the Windows v150
+  keyboard + mouse pad on macOS too (bindings, direct mouse look, map,
+  menu keys, merge with a controller).
+- **Input comes from the app:** `mac/mac_kbm.mm` uses AppKit local event
+  monitors and reports keys, mouse, wheel and focus through
+  `ps3recomp/libs/input/pad_host_kbm.h` (Windows key codes).
+- **Pointer:** hidden and held while the game wants mouse look. Esc or
+  Option frees it, a click grabs it again. Cmd shortcuts still work.
+- **Controller wins:** a connected pad owns port 0, the keys merge in,
+  the sticks follow the keyboard/mouse only while they move.
+- **Windows is unchanged:** `unifdef` with `_WIN32` gives the same
+  `cellPad.c` apart from one comment. iOS keeps its touch pad.
+- Switches: `PAD_KBM=0` or `PAD_NO_KEYBOARD=1` = off.
+  `INFAMOUS_KBM_TEST=1` = accept input posted to the process in the
+  background and never hold the real pointer (for tests).
+- Test tool: `$WORK_DIR/tools/rmouse <pid> move <dx> <dy>` or
+  `click <button>` (postToPid, like `rkey`).
+
+### Tests (build-mac, windowed, `INFAMOUS_KBM_TEST=1`, no controller)
+
+| step | input | result |
+|---|---|---|
+| title | Enter | new game starts (cutscene) |
+| tutorial "look at the helicopter" | mouse up | camera looks up, tutorial moves on |
+| tutorial "look left" | mouse left | camera turns, tutorial moves on |
+| gameplay | W held | Cole walks forward |
+| gameplay | Esc | pause menu opens |
+| pause menu | Down arrow, S, S | cursor moves down 3 items |
+| pause menu | Backspace | menu closes |
+
+- `[mousediag]` shows the mouse writes every frame (x about 1.2-1.6).
+- Runs: `runs/20261109-102447-kbm`, `-103012-kbm2`, `-103507-kbm3`
+  (frames deleted).
+- At the first tutorial step the real right stick barely turns the
+  camera either; that is the game, not the mouse.
+
+### Open
+
+- Not tested by me: real pointer hold, real key focus, and a real
+  controller plugged in with keys (all need a person at the Mac).
+- Mouse speed: NSEvent deltas are accelerated points, not raw counts.
+  Tune with `PAD_MOUSE_SPEED` (default 450) or `PAD_MOUSE_SENS`.
+  Raw input via GCMouse could follow.
+- Key prompts still show controller icons (the keyboard icon set,
+  `kbm_prompts`, is not built on Mac).
+- The Mac release build (SDL3 pads): `cellPad.c` compiles with
+  `PS3RECOMP_PAD_USE_SDL3`, but that build and the `.app` were not run.
 
 ---
 
@@ -121,7 +180,6 @@ tools, no RPCS3, no terminal.
   → inFamous.
 - Free Apple ID sideloading: the two entitlements are untested. Without
   extended virtual addressing the app can't reserve 4 GB.
-- Mac has no keyboard/mouse controls yet: a controller is needed.
 - No app icon. Bundle id is still `local.subs.infamous`.
 - Not notarized (that uploads the app to Apple: ask the user first).
 - Windows prebuilt with import: later.

@@ -78,12 +78,19 @@ Your own file isn't changed.
 ## Playing
 
 - Connect a controller: MFi, Xbox, DualShock 4 and DualSense should all work
-- **On Mac you need a controller for now.** Keyboard controls aren't done yet
+- **On Mac you can also use keyboard and mouse** (same keys as the Windows build):
+  - Move: W A S D. Hold Shift to run
+  - Look: mouse. The pointer hides while you play
+  - Jump: Space. Shock bolt: left click. Aim: right click
+  - Triangle / Square / Circle: E / F / C. L2 / R2: Q / R. L3 / R3: V / middle click
+  - Start (pause): Enter or Esc. Esc also frees the pointer. Click the game to grab it again
+  - Map: Tab. In menus: W / S or arrows to move, Enter to pick, Backspace to go back
+  - A connected controller still works and wins
 - On iPad, touch controls show up when no controller is connected
 - Your saves and settings are kept in the app's folder. Mac: `~/Library/Application Support/inFamous`. iPad: Files → On My iPad → inFamous
 - The game runs in English
 
-Controllers and touch controls have only been lightly tested. If yours doesn't work, open an issue and say which one.
+Controllers, touch and keyboard controls have only been lightly tested. If yours doesn't work, open an issue and say which one.
 
 ## Status
 
