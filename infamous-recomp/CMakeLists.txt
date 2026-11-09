@@ -640,6 +640,15 @@ if(APPLE)
     target_sources(${PROJECT_NAME} PRIVATE import/disc_import.c)
     target_link_libraries(${PROJECT_NAME} PRIVATE z)
 endif()
+# macOS: mac/mac_app.mm sets up a .app bundle (tools/release_apple.sh makes
+# one from this binary) and shows the first-run import window when no game
+# path is given and none is found. Runs with a game path are unchanged.
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    enable_language(OBJCXX)
+    target_sources(${PROJECT_NAME} PRIVATE mac/mac_app.mm)
+    set_property(SOURCE mac/mac_app.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers")
+endif()
 
 # ---------------------------------------------------------------------------
 # iOS / iPadOS app (Apple port; -DCMAKE_SYSTEM_NAME=iOS, Xcode generator)

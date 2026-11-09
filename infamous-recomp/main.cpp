@@ -944,6 +944,13 @@ static void configure_stdout_buffering(void)
         setvbuf(stdout, stdout_buffer, _IOFBF, sizeof stdout_buffer);
     }
 }
+#if defined(__APPLE__) && !defined(PORT_IOS)
+/* mac/mac_app.mm: the .app bundle set-up and the first-run disc import. */
+extern "C" void        port_mac_app_init(void);
+extern "C" const char* port_mac_find_game(char* out, size_t len);
+extern "C" int         port_mac_run_game(int (*fn)(void*), void* arg);
+#endif
+static int run_guest_entry(void* entry_p);
 #if defined(PORT_IOS)
 /* iOS: UIKit owns the process main thread; the app shell (ios/ios_shell.mm)
  * runs this on a big-stack thread of its own. */
@@ -952,6 +959,11 @@ extern "C" int port_game_main(int argc, char** argv)
 int main(int argc, char** argv)
 #endif
 {
+#if defined(__APPLE__) && !defined(PORT_IOS)
+    /* Inside a .app only: working folder, logs, launch.env. Before stdout is
+     * touched and before settings.ini is read from the working folder. */
+    port_mac_app_init();
+#endif
 #ifdef _WIN32
     /* v241C LOG_ASYNC drain helper process (see v241c_la): nothing else runs in it */
     if (argc >= 2 && strcmp(argv[1], "--v241c-logdrain") == 0) return v241c_la::helper_main(argc, argv);
@@ -1003,6 +1015,12 @@ int main(int argc, char** argv)
     char* default_argv[3] = {0};
     if (argc < 2) {
         const char* elf = find_default_elf(argv[0]);
+#if defined(__APPLE__) && !defined(PORT_IOS)
+        /* No game next to the program: the imported one in the app's folder,
+         * or the first-run window that imports the player's disc. */
+        static char mac_elf[1024];
+        if (!elf) elf = port_mac_find_game(mac_elf, sizeof mac_elf);
+#endif
         if (!elf) {
             printf("usage: %s <PPU ELF>\n", argv[0]);
             return 2;
@@ -1081,6 +1099,19 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
+#if defined(__APPLE__) && !defined(PORT_IOS)
+    /* The game on a thread of its own, the AppKit loop on this one (see mac_app.mm). */
+    static uint32_t mac_entry;
+    mac_entry = entry;
+    return port_mac_run_game(run_guest_entry, &mac_entry);
+#else
+    return run_guest_entry(&entry);
+#endif
+}
+
+static int run_guest_entry(void* entry_p)
+{
+    const uint32_t entry = *(const uint32_t*)entry_p;
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
