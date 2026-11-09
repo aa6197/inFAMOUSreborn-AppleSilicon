@@ -9,7 +9,7 @@
  * vault lists them). It prints only this file's metadata key and IV, which
  * is all the app needs; the APP key itself never goes into the build.
  *
- * Build: clang -O2 -o import_cli import_cli.c disc_import.c -lz */
+ * Build: clang -O2 -o import_cli import_cli.c disc_import.c -lz -framework CoreFoundation */
 #include "disc_import.h"
 
 #include <stdio.h>

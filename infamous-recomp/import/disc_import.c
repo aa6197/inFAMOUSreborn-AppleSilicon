@@ -18,6 +18,7 @@
 #include "disc_import.h"
 
 #include <CommonCrypto/CommonCrypto.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <copyfile.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -165,11 +166,28 @@ static void remove_tree(const char* p)
     removefile_state_free(s);
 }
 
+/* Space the import may use. statfs counts only blocks that are free now;
+ * iPadOS and macOS also clear purgeable data (caches, offloaded files) when
+ * an app needs room, and "important usage" counts that too. On an iPad the
+ * two can differ by 100+ GB. Unknown: UINT64_MAX (let the write fail). */
 static uint64_t free_bytes(const char* dir)
 {
+    uint64_t have = UINT64_MAX;
     struct statfs st;
-    if (statfs(dir, &st) != 0) return UINT64_MAX;   /* unknown: let the write fail instead */
-    return (uint64_t)st.f_bavail * st.f_bsize;
+    if (statfs(dir, &st) == 0) have = (uint64_t)st.f_bavail * st.f_bsize;
+    CFURLRef u = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8*)dir, (CFIndex)strlen(dir), true);
+    if (u) {
+        CFTypeRef n = NULL;
+        if (CFURLCopyResourcePropertyForKey(u, kCFURLVolumeAvailableCapacityForImportantUsageKey, &n, NULL) && n) {
+            int64_t v = 0;
+            if (CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)n, kCFNumberSInt64Type, &v)
+                && v > 0 && (have == UINT64_MAX || (uint64_t)v > have))
+                have = (uint64_t)v;
+            CFRelease(n);
+        }
+        CFRelease(u);
+    }
+    return have;
 }
 
 static int read_whole(const char* path, uint8_t** out, size_t* n)

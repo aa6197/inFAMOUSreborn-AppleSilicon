@@ -635,10 +635,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
 # Disc import (Apple port): turns the player's disc image or game folder into
 # the folder the runtime reads (import/disc_import.h). CommonCrypto is part of
-# libSystem; zlib unpacks the compressed sections of EBOOT.BIN.
+# libSystem; zlib unpacks the compressed sections of EBOOT.BIN; CoreFoundation
+# gives the free space that counts purgeable data.
 if(APPLE)
     target_sources(${PROJECT_NAME} PRIVATE import/disc_import.c)
-    target_link_libraries(${PROJECT_NAME} PRIVATE z)
+    target_link_libraries(${PROJECT_NAME} PRIVATE z "-framework CoreFoundation")
 endif()
 # macOS: mac/mac_app.mm sets up a .app bundle (tools/release_apple.sh makes
 # one from this binary) and shows the first-run import window when no game
