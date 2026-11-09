@@ -18,7 +18,9 @@
  *
  * Game data is never in the bundle. The ELF path comes from the first launch
  * argument (Simulator: a host path) or from Documents/BCES00220 (main.cpp
- * find_default_elf). The bundle carries launch.env, the launcher environment
+ * find_default_elf). With neither, the first-run screen (ios_import.mm) asks
+ * for the player's disc image or game folder and imports it there, then the
+ * game starts. The bundle carries launch.env, the launcher environment
  * from installer/infamous.toml; anything already set (SIMCTL_CHILD_*) wins.
  */
 #include <SDL3/SDL.h>
@@ -39,6 +41,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <string>
+
 extern "C" int  port_game_main(int argc, char** argv);   /* main.cpp */
 extern "C" void port_app_set_paused(int paused);         /* main.cpp */
 extern "C" int  port_app_rsx_parked(void);               /* main.cpp */
@@ -46,6 +50,8 @@ extern "C" void rsx_metal_backend_set_layer(void* ca_metal_layer);
 extern "C" void rsx_metal_backend_wait_idle(void);
 extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
 extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
+extern "C" void port_ios_import_show(void* uiwindow, const char* dest_root, void (^done)(void));   /* ios_import.mm */
+extern "C" int  di_installed(const char* dest_root, char* elf_out, size_t elf_out_len);              /* import/disc_import.c */
 
 static void update_touch_pad(void)
 {
@@ -213,6 +219,22 @@ static void* game_thread(void*)
     return NULL;
 }
 
+/* The desktop build runs the guest on the process main thread (8 MB
+ * on macOS, more on Windows); iOS gives other threads 512 KB. */
+static void start_game_thread(void)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64u * 1024 * 1024);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_t gt;
+    if (pthread_create(&gt, &attr, game_thread, NULL) != 0) {
+        fprintf(stderr, "[ios] could not start the game thread\n");
+        exit(1);
+    }
+    pthread_attr_destroy(&attr);
+}
+
 /* Runs on the main thread, inside the UIKit callback, before it returns:
  * iOS gives the app only a moment once it has left the screen. */
 static bool SDLCALL app_events(void*, SDL_Event* e)
@@ -309,20 +331,22 @@ int main(int argc, char* argv[])
         pthread_create(&ct, NULL, cpu_logger, NULL);
         pthread_detach(ct);
 
-        /* The desktop build runs the guest on the process main thread (8 MB
-         * on macOS, more on Windows); iOS gives other threads 512 KB. */
         s_game_argc = argc;
         s_game_argv = argv;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 64u * 1024 * 1024);
-        pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
-        pthread_t gt;
-        if (pthread_create(&gt, &attr, game_thread, NULL) != 0) {
-            fprintf(stderr, "[ios] could not start the game thread\n");
-            return 1;
+        /* No game path given (a normal launch) and no finished import in
+         * Documents: ask for the player's copy first (ios_import.mm). */
+        if (argc < 2 && !di_installed(docs.fileSystemRepresentation, NULL, 0) && uiwin) {
+            fprintf(stderr, "[ios] no game in Documents: showing the import screen\n");
+            std::string dest = docs.fileSystemRepresentation;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                port_ios_import_show(uiwin, dest.c_str(), ^{
+                    fprintf(stderr, "[ios] import done: starting the game\n");
+                    start_game_thread();
+                });
+            });
+        } else {
+            start_game_thread();
         }
-        pthread_attr_destroy(&attr);
     }
 
     const Uint64 t0 = SDL_GetTicks();
