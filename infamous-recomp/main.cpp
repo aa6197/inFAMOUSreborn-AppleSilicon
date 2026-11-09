@@ -601,6 +601,13 @@ static const char* find_default_elf(const char* argv0)
 #if defined(PORT_IOS)
     /* iOS: the game folder is copied into the app's Documents (Files app /
      * Finder file sharing). The bundle itself never carries game data. */
+    const char* data = getenv("INFAMOUS_DATA_DIR");   /* ios_shell.mm: absolute */
+    if (data && *data) {
+        snprintf(g_default_elf, sizeof(g_default_elf), "%s/BCES00220/PS3_GAME/USRDIR/EBOOT.elf", data);
+        FILE* f = fopen(g_default_elf, "rb");
+        if (f) { fclose(f); return g_default_elf; }
+        return NULL;
+    }
     const char* home = getenv("HOME");
     static const char* ios_rel[] = {
         "/Documents/BCES00220/PS3_GAME/USRDIR/EBOOT.elf",

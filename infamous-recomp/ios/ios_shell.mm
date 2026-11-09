@@ -287,6 +287,18 @@ int main(int argc, char* argv[])
 
         load_launch_env();
 
+        /* INFAMOUS_DATA_DIR (testing): keep the game folder there instead of
+         * in Documents; absolute, or relative to Documents. main.cpp
+         * (find_default_elf) reads the absolute path back. */
+        NSString* data = docs;
+        if (const char* dd = getenv("INFAMOUS_DATA_DIR"); dd && *dd) {
+            NSString* d = [NSString stringWithUTF8String:dd];
+            data = d.isAbsolutePath ? d : [docs stringByAppendingPathComponent:d];
+            [NSFileManager.defaultManager createDirectoryAtPath:data withIntermediateDirectories:YES attributes:nil error:nil];
+            setenv("INFAMOUS_DATA_DIR", data.fileSystemRepresentation, 1);
+            fprintf(stderr, "[ios] data folder: %s\n", data.fileSystemRepresentation);
+        }
+
         SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");
         /* Landscape only. Without this, SDL's view-frame code (UIKit_ComputeViewFrame) reads the old
          * statusBarOrientation, which on iPadOS 27 says portrait, and swaps the view to 970x1408 on the
@@ -335,9 +347,9 @@ int main(int argc, char* argv[])
         s_game_argv = argv;
         /* No game path given (a normal launch) and no finished import in
          * Documents: ask for the player's copy first (ios_import.mm). */
-        if (argc < 2 && !di_installed(docs.fileSystemRepresentation, NULL, 0) && uiwin) {
-            fprintf(stderr, "[ios] no game in Documents: showing the import screen\n");
-            std::string dest = docs.fileSystemRepresentation;
+        if (argc < 2 && !di_installed(data.fileSystemRepresentation, NULL, 0) && uiwin) {
+            fprintf(stderr, "[ios] no game in %s: showing the import screen\n", data.fileSystemRepresentation);
+            std::string dest = data.fileSystemRepresentation;
             dispatch_async(dispatch_get_main_queue(), ^{
                 port_ios_import_show(uiwin, dest.c_str(), ^{
                     fprintf(stderr, "[ios] import done: starting the game\n");

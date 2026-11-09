@@ -26,7 +26,8 @@
     UIProgressView* _bar;
     UILabel*        _status;
     UILabel*        _error;
-    NSURL*          _source;     /* security-scoped while held */
+    NSURL*          _source;     /* security-scoped while held (_scoped) */
+    BOOL            _scoped;
     NSURL*          _key;        /* a copy in tmp (asCopy:YES) */
     BOOL            _pickingKey;
     volatile int    _stop;
@@ -103,6 +104,26 @@ static UIButton* make_button(NSString* title, BOOL filled)
     ]];
 }
 
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+    /* INFAMOUS_IMPORT_TEST=<path> (testing): import that disc image or folder
+     * without the picker. A relative path starts in Documents. */
+    static BOOL s_tested;
+    const char* t = getenv("INFAMOUS_IMPORT_TEST");
+    if (s_tested || !t || !*t) return;
+    s_tested = YES;
+    NSString* p = [NSString stringWithUTF8String:t];
+    if (!p.isAbsolutePath)
+        p = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                stringByAppendingPathComponent:p];
+    fprintf(stderr, "[import] test switch: %s\n", p.fileSystemRepresentation);
+    [self releaseSource];
+    _key = nil;
+    _source = [NSURL fileURLWithPath:p];
+    [self probeAndImport];
+}
+
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return NO; }
 
@@ -127,7 +148,9 @@ static UIButton* make_button(NSString* title, BOOL filled)
 
 - (void)releaseSource
 {
-    if (_source) { [_source stopAccessingSecurityScopedResource]; _source = nil; }
+    if (_source && _scoped) [_source stopAccessingSecurityScopedResource];
+    _source = nil;
+    _scoped = NO;
 }
 
 - (void)pickSource
@@ -160,7 +183,8 @@ static UIButton* make_button(NSString* title, BOOL filled)
     }
     [self releaseSource];
     _key = nil;
-    if (![u startAccessingSecurityScopedResource])
+    _scoped = [u startAccessingSecurityScopedResource];
+    if (!_scoped)
         fprintf(stderr, "[import] no security scope for %s (may still be readable)\n", u.path.UTF8String);
     _source = u;
     [self probeAndImport];
