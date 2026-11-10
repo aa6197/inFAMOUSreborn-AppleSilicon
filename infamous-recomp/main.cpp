@@ -214,6 +214,7 @@ static DWORD WINAPI frame_clock(LPVOID)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 #if defined(__APPLE__)
+    pthread_setname_np("rsx fifo");   /* Instruments, IOS_CPU_LOG_SECS */
     /* Apple port: same reason as above, but on Apple chips priority (QoS) also picks the core
      * type. At the default QoS the iPad Pro M4 (3 P + 6 E cores) ran this thread on E cores
      * ~24% of the time while it was the limit (88% busy). ABOVE_NORMAL maps to

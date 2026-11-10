@@ -2956,17 +2956,22 @@ static void spurs_v97_pcore_apply(u32 wid, const char* who, int want)
 }
 /* v241A: V241A_WAITPC (w1/w6/w8/w9 lanes restricted to the P-cores while the PPU waits on them) was A/B'd in b930:
  * -0.96 fps, 1% low -3.1, 0.1% low -4.1 -> REJECTED and removed. */
-struct LaneWorkerArg { struct LanePool* lp; u32 idx; };
+struct LaneWorkerArg { struct LanePool* lp; u32 idx;
+#if defined(__APPLE__)
+    u32 wid;   /* thread name only */
+#endif
+};
 static DWORD WINAPI spurs_lane_worker(LPVOID p)
 {
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     { extern void ps3_prof_register_spu_thread(void); ps3_prof_register_spu_thread(); }   /* v63 PS3_PROF_MAIN */
+    struct LaneWorkerArg* wa = (struct LaneWorkerArg*)p;
 #if defined(__APPLE__)
     spurs_apple_lane_qos();
+    { char nm[32]; snprintf(nm, sizeof nm, "spurs w%u lane %u", (unsigned)wa->wid, (unsigned)wa->idx); pthread_setname_np(nm); }   /* Instruments, IOS_CPU_LOG_SECS */
 #endif
-    struct LaneWorkerArg* wa = (struct LaneWorkerArg*)p;
     struct LanePool* lp = wa->lp;
     long my = 0;
     int last_busy = 0;   /* v96a: last lane run found work -> spin for the next pass first */
@@ -3129,6 +3134,9 @@ static struct LanePool* spurs_lane_pool(u32 wid, u32 nl)
         for (u32 i = 0; i < lp->nworkers; i++) {
             struct LaneWorkerArg* wa = (struct LaneWorkerArg*)malloc(sizeof *wa);
             wa->lp = lp; wa->idx = i;
+#if defined(__APPLE__)
+            wa->wid = wid;
+#endif
             CreateThread(NULL, 1u << 20, spurs_lane_worker, wa, 0, NULL);
         }
         s_lp[wid] = lp; s_lp_all[wid] = lp;
@@ -4078,6 +4086,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 #endif
     { extern void ps3_prof_register_spu_thread(void); ps3_prof_register_spu_thread(); }   /* v63 PS3_PROF_MAIN */
     struct SpursKArg* ka = (struct SpursKArg*)p;
+#if defined(__APPLE__)
+    { char nm[32]; snprintf(nm, sizeof nm, "spurs kernel %u/%u", (unsigned)ka->part, (unsigned)ka->nparts); pthread_setname_np(nm); }   /* Instruments, IOS_CPU_LOG_SECS */
+#endif
     struct SpursInst* si = ka->si;
     const u32 k_part = ka->part, k_nparts = ka->nparts;
 #ifdef _WIN32
