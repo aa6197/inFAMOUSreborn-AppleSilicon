@@ -97,6 +97,10 @@ typedef struct {
     int cwritten;          /* a draw with a colour mask != 0 targeted it   */
     u32 feedback;          /* copy sampled by a draw that writes it, or 0  */
     u32 fb_serial;         /* the bind that last refreshed `feedback`      */
+    u32 fb_last;           /* FEEDBACK_RUN: the bind that last sampled it  */
+    u32 fb_run;            /*   draws since the snapshot was refreshed     */
+    u32 fb_fp;             /*   that draw's fragment program               */
+    u32 fb_frame;          /*   and its frame                              */
 } eng_surface;
 
 typedef struct {
@@ -756,14 +760,54 @@ static u32 eng_zdepth_color_copy(u32 slot, u32 w, u32 h)
 
 static u32 s_bind_serial;
 
+/* FEEDBACK_RUN=<N>, FEEDBACK_RUN_ANYFP, read as the D3D12 backend reads them
+ * (rsx_d3d12_backend.c v156/v157): 0 or 1 refreshes the snapshot before every
+ * such draw (exact); N > 1 lets a run of consecutive draws that sample the
+ * target they write share one snapshot for up to N draws. inFamous' G-buffer
+ * decals are ~170 such draws a city frame, each sampling two targets, and the
+ * shipped launch env sets 1000. A copy is also a pass break on a tile GPU. */
+static int s_fb_run = -1, s_fb_anyfp = 1;
+static int eng_feedback_run(void)
+{
+    if (s_fb_run < 0) {
+        const char* e = getenv("FEEDBACK_RUN");
+        s_fb_run = e ? atoi(e) : 0;
+        if (s_fb_run < 0) s_fb_run = 0;
+        const char* a = getenv("FEEDBACK_RUN_ANYFP");
+        s_fb_anyfp = (a && *a == '0') ? 0 : 1;
+        fprintf(stderr, "[rsx engine] feedback snapshot refreshed every %d draw(s) of a %s run "
+                        "(FEEDBACK_RUN; FEEDBACK_RUN_ANYFP=%d)\n",
+                s_fb_run > 1 ? s_fb_run : 1, s_fb_anyfp ? "consecutive-feedback-draw" : "same-FP",
+                s_fb_anyfp);
+    }
+    return s_fb_run;
+}
+
 /* The input of a draw that samples a target it is writing: a copy made right
  * before it, once per draw however many units read it (the D3D12 backend's
- * feedback snapshot, refreshed before every such draw: FEEDBACK_RUN=0). */
+ * feedback snapshot), or the run's copy under FEEDBACK_RUN. */
 static u32 eng_surface_feedback(u32 slot)
 {
     eng_surface* s = &g.surfaces[slot];
     if (!s->handle || !g.be->surface_copy) return 0;
     if (s->feedback && s->fb_serial == s_bind_serial) return s->feedback;
+    const int run = eng_feedback_run();
+    u32 fp = 0;
+    if (run > 1) {
+        u32 fp_loc = 0;
+        fp = rsx_dsp_fragment_program(&g.rsx, &fp_loc) | 1u;
+        if (s->feedback && s->fb_frame == g.frames && s->fb_last + 1u == s_bind_serial &&
+            (s_fb_anyfp || s->fb_fp == fp) && s->fb_run + 1u < (u32)run) {
+            s->fb_run++;
+            s->fb_last = s->fb_serial = s_bind_serial;
+            s->fb_fp = fp;
+            return s->feedback;
+        }
+    }
+    s->fb_run = 0;
+    s->fb_last = s_bind_serial;
+    s->fb_fp = fp;
+    s->fb_frame = g.frames;
     const u32 c = g.be->surface_copy(g.be->user, s->handle, s->feedback);
     if (!c) return 0;
     if (!s->feedback) {
