@@ -32,6 +32,9 @@
 #import <UIKit/UIKit.h>
 
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <os/proc.h>
 #include <pthread/qos.h>
 #include <pthread.h>
@@ -210,8 +213,8 @@ static void* memory_logger(void*)
     if (secs < 1) secs = 1;
     for (;;) {
         /* thermal: 0 nominal, 1 fair, 2 serious, 3 critical (the OS slows the CPU from 2 up) */
-        fprintf(stderr, "[ios-mem] available %zu MB, thermal %ld\n", os_proc_available_memory() >> 20,
-                (long)NSProcessInfo.processInfo.thermalState);
+        fprintf(stderr, "[ios-mem] available %zu MB, thermal %ld, low power mode %d\n", os_proc_available_memory() >> 20,
+                (long)NSProcessInfo.processInfo.thermalState, (int)NSProcessInfo.processInfo.lowPowerModeEnabled);
         sleep((unsigned)secs);
     }
     return NULL;
@@ -230,6 +233,38 @@ static const char* qos_name(qos_class_t q)
     case QOS_CLASS_BACKGROUND:       return "BG";
     default:                         return "--";
     }
+}
+
+/* Same interval, whole process (rusage v6): how the CPU time splits between the P cores and the
+ * E cores, their clock and IPC, and how many threads on average were ready but waiting for a core
+ * (runnable time counts running + waiting). libproc.h is not in the iOS SDK; the call is. */
+extern "C" int proc_pid_rusage(int pid, int flavor, rusage_info_t* buffer);
+static void log_core_split(unsigned secs)
+{
+    static struct rusage_info_v6 prev;
+    static int have_prev;
+    struct rusage_info_v6 r;
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t*)&r) != 0) return;
+    if (have_prev) {
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        const double ns = (double)tb.numer / tb.denom;   /* rusage times are mach ticks */
+        const double all = ((r.ri_user_time + r.ri_system_time) - (prev.ri_user_time + prev.ri_system_time)) * ns;
+        const double p = ((r.ri_user_ptime + r.ri_system_ptime) - (prev.ri_user_ptime + prev.ri_system_ptime)) * ns;
+        const double e = all - p;
+        const double pcyc = (double)(r.ri_pcycles - prev.ri_pcycles);
+        const double ecyc = (double)((r.ri_cycles - r.ri_pcycles) - (prev.ri_cycles - prev.ri_pcycles));
+        const double pins = (double)(r.ri_pinstructions - prev.ri_pinstructions);
+        const double eins = (double)((r.ri_instructions - r.ri_pinstructions) - (prev.ri_instructions - prev.ri_pinstructions));
+        const double run = (r.ri_runnable_time - prev.ri_runnable_time) * ns;
+        const double wall = secs * 1e9;
+        fprintf(stderr, "[ios-cpu] P cores %.0f%% / E cores %.0f%% (100 = one core), P %.2f GHz IPC %.2f, "
+                        "E %.2f GHz IPC %.2f, waiting for a core %.2f threads\n",
+                100.0 * p / wall, 100.0 * e / wall,
+                p > 0 ? pcyc / p : 0.0, pcyc > 0 ? pins / pcyc : 0.0,
+                e > 0 ? ecyc / e : 0.0, ecyc > 0 ? eins / ecyc : 0.0,
+                (run - all) / wall);
+    }
+    prev = r; have_prev = 1;
 }
 
 static void* cpu_logger(void*)
@@ -284,13 +319,169 @@ static void* cpu_logger(void*)
         for (int a = 0; a < nr && o < (int)sizeof line - 64; a++)
             o += snprintf(line + o, sizeof line - o, " %s %d (%s)%s", rows[a].name, rows[a].pct, rows[a].qos, a + 1 < nr ? "," : "");
         fprintf(stderr, "%s\n", line);
+        log_core_split((unsigned)secs);
     }
     return NULL;
+}
+
+/* IOS_FREQ_PROBE=<n> (default 0 = off): every n s, one user-interactive thread runs 10^9 dependent
+ * adds (one cycle each) and logs the clock it got, by its own CPU time. Shows whether a busy thread
+ * can still get a high clock while the game runs, or whether the cores are held low. */
+static void* freq_probe(void*)
+{
+    pthread_setname_np("ios-freq");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    const char* e = getenv("IOS_FREQ_PROBE");
+    const int secs = (e && *e) ? atoi(e) : 0;
+    if (secs < 1) return NULL;
+    for (;;) {
+        sleep((unsigned)secs);
+        const uint64_t n = 1000000000ull;
+        uint64_t x = 0;
+        const uint64_t c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        for (uint64_t i = 0; i < n; i += 8) {
+#if defined(__aarch64__)
+            __asm__ volatile("add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n"
+                             "add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1" : "+r"(x));
+#endif
+        }
+        const uint64_t c1 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), w1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        fprintf(stderr, "[ios-freq] busy thread got %.2f GHz (on its CPU time), ran %.0f%% of the wall time\n",
+                (double)n / (double)(c1 - c0), 100.0 * (double)(c1 - c0) / (double)(w1 - w0));
+    }
+    return NULL;
+}
+
+/* IOS_CPU_STRESS=<secs> (default 0 = off): before the game starts, run 1, 2, ... (one per core)
+ * busy user-interactive threads for <secs> each and log the clock each step got, with the P/E split.
+ * Shows the clock the device gives a given number of busy cores without the game's GPU work. */
+struct StressArg { volatile int* stop; uint64_t adds; uint64_t cpu_ns; };
+static void* stress_worker(void* a)
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    StressArg* sa = (StressArg*)a;
+    const uint64_t c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t x = 0;
+    /* IOS_CPU_STRESS_ILP=1: six independent integer adds and four independent vector FMAs per step,
+     * so the core runs near its full width and draws game-like power (the game runs at IPC ~4.6 on
+     * the P cores). The per-thread GHz figure is then meaningless; read the P/E GHz from rusage. */
+    static const int ilp = [] { const char* v = getenv("IOS_CPU_STRESS_ILP"); return v && v[0] == '1'; }();
+    while (!__atomic_load_n(sa->stop, __ATOMIC_RELAXED)) {
+        for (int i = 0; i < 10000000; i += 8) {
+#if defined(__aarch64__)
+            if (ilp)
+                __asm__ volatile("add x9,x9,#1\n add x10,x10,#1\n add x11,x11,#1\n"
+                                 "add x12,x12,#1\n add x13,x13,#1\n add x14,x14,#1\n"
+                                 "fmla v16.4s,v20.4s,v21.4s\n fmla v17.4s,v20.4s,v21.4s\n"
+                                 "fmla v18.4s,v20.4s,v21.4s\n fmla v19.4s,v20.4s,v21.4s"
+                                 ::: "x9", "x10", "x11", "x12", "x13", "x14",
+                                     "v16", "v17", "v18", "v19");
+            else
+            __asm__ volatile("add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n"
+                             "add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1\n add %0,%0,#1" : "+r"(x));
+#endif
+        }
+        sa->adds += 10000000;
+    }
+    sa->cpu_ns = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0;
+    return NULL;
+}
+
+/* IOS_GPU_STRESS=<iters> (with IOS_CPU_STRESS): keep the GPU busy during the CPU steps with a compute
+ * kernel (<iters> multiply-adds per GPU thread, 256K threads per command buffer, the CPU waits for each
+ * one), plus IOS_GPU_STRESS_SLEEP_MS=<ms> between buffers. Does GPU use alone lower the CPU clock? */
+static volatile int s_gpu_stress_stop;
+static void* gpu_stress(void*)
+{
+    pthread_setname_np("ios-gpu-stress");
+    const int iters = atoi(getenv("IOS_GPU_STRESS"));
+    const char* sl = getenv("IOS_GPU_STRESS_SLEEP_MS");
+    const int sleep_ms = (sl && *sl) ? atoi(sl) : 0;
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    NSString* src = [NSString stringWithFormat:@
+        "#include <metal_stdlib>\nusing namespace metal;\n"
+        "kernel void spin(device float* o [[buffer(0)]], uint id [[thread_position_in_grid]]) {"
+        " float x = float(id) * 1e-6f; for (int i = 0; i < %d; i++) x = fma(x, 1.0001f, 0.5f) * 0.9999f; o[id] = x; }", iters];
+    NSError* err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+    id<MTLComputePipelineState> ps = lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"spin"] error:&err] : nil;
+    if (!ps) { fprintf(stderr, "[ios-stress] GPU kernel failed: %s\n", err.localizedDescription.UTF8String); return NULL; }
+    const NSUInteger n = 256 * 1024;
+    id<MTLBuffer> out = [dev newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModePrivate];
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    uint64_t busy = 0, t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), cbs = 0;
+    while (!s_gpu_stress_stop) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:ps];
+            [ce setBuffer:out offset:0 atIndex:0];
+            [ce dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            busy += (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9); cbs++;
+        }
+        if (sleep_ms > 0) usleep((useconds_t)sleep_ms * 1000);
+    }
+    const double wall = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+    fprintf(stderr, "[ios-stress] GPU busy %.0f%% of the time, %.2f ms per buffer\n", 100.0 * busy / wall,
+            cbs ? busy / 1e6 / cbs : 0.0);
+    return NULL;
+}
+
+static void cpu_stress_ladder(void)
+{
+    const char* e = getenv("IOS_CPU_STRESS");
+    const int secs = (e && *e) ? atoi(e) : 0;
+    if (secs < 1) return;
+    pthread_t gt = 0;
+    if (const char* g = getenv("IOS_GPU_STRESS"); g && atoi(g) > 0) pthread_create(&gt, NULL, gpu_stress, NULL);
+    const int ncpu = (int)NSProcessInfo.processInfo.activeProcessorCount;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    const double tick_ns = (double)tb.numer / tb.denom;
+    /* IOS_CPU_STRESS_N=<n> IOS_CPU_STRESS_REPEAT=<r>: only n threads, r steps in a row (does the clock
+     * hold over minutes?). */
+    const char* en = getenv("IOS_CPU_STRESS_N");
+    const char* er = getenv("IOS_CPU_STRESS_REPEAT");
+    const int fixed_n = (en && *en) ? atoi(en) : 0;
+    const int steps = fixed_n > 0 ? ((er && *er) ? atoi(er) : 1) : ncpu;
+    for (int step = 1; step <= steps; step++) {
+        const int n = fixed_n > 0 ? fixed_n : step;
+        enum { MAXW = 32 };
+        pthread_t th[MAXW]; StressArg sa[MAXW]; volatile int stop = 0;
+        struct rusage_info_v6 r0, r1;
+        proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t*)&r0);
+        const uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        for (int i = 0; i < n && i < MAXW; i++) {
+            sa[i] = StressArg{ &stop, 0, 0 };
+            pthread_create(&th[i], NULL, stress_worker, &sa[i]);
+        }
+        sleep((unsigned)secs);
+        __atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
+        for (int i = 0; i < n && i < MAXW; i++) pthread_join(th[i], NULL);
+        const double wall = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0);
+        proc_pid_rusage(getpid(), RUSAGE_INFO_V6, (rusage_info_t*)&r1);
+        double lo = 1e9, hi = 0, sum = 0;
+        for (int i = 0; i < n && i < MAXW; i++) {
+            const double g = sa[i].cpu_ns ? (double)sa[i].adds / (double)sa[i].cpu_ns : 0;
+            lo = g < lo ? g : lo; hi = g > hi ? g : hi; sum += g;
+        }
+        const double all = ((r1.ri_user_time + r1.ri_system_time) - (r0.ri_user_time + r0.ri_system_time)) * tick_ns;
+        const double p = ((r1.ri_user_ptime + r1.ri_system_ptime) - (r0.ri_user_ptime + r0.ri_system_ptime)) * tick_ns;
+        const double pc = (double)(r1.ri_pcycles - r0.ri_pcycles);
+        const double ec = (double)((r1.ri_cycles - r1.ri_pcycles) - (r0.ri_cycles - r0.ri_pcycles));
+        fprintf(stderr, "[ios-stress] %d busy threads: %.2f GHz each (min %.2f, max %.2f); P cores %.0f%% at %.2f GHz, "
+                        "E cores %.0f%% at %.2f GHz\n", n, sum / n, lo, hi,
+                100.0 * p / wall, p > 0 ? pc / p : 0.0, 100.0 * (all - p) / wall, all - p > 0 ? ec / (all - p) : 0.0);
+    }
+    if (gt) { s_gpu_stress_stop = 1; pthread_join(gt, NULL); }
 }
 
 static void* game_thread(void*)
 {
     pthread_setname_np("game-main");
+    cpu_stress_ladder();
     int rc = port_game_main(s_game_argc, s_game_argv);
     fprintf(stderr, "[ios] game main returned %d\n", rc);
     SDL_Event ev;
@@ -365,6 +556,7 @@ int main(int argc, char* argv[])
                 pi.operatingSystemVersionString.UTF8String, (unsigned long)pi.activeProcessorCount,
                 pi.physicalMemory >> 20, os_proc_available_memory() >> 20);
         fprintf(stderr, "[ios] documents: %s\n", docs.fileSystemRepresentation);
+        fprintf(stderr, "[ios] low power mode %d, thermal %ld\n", (int)pi.lowPowerModeEnabled, (long)pi.thermalState);
 
         load_launch_env();
 
@@ -424,6 +616,9 @@ int main(int argc, char* argv[])
         pthread_t ct;
         pthread_create(&ct, NULL, cpu_logger, NULL);
         pthread_detach(ct);
+        pthread_t ft;
+        pthread_create(&ft, NULL, freq_probe, NULL);
+        pthread_detach(ft);
 
         s_game_argc = argc;
         s_game_argv = argv;
