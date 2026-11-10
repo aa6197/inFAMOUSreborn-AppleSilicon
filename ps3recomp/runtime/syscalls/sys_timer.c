@@ -306,6 +306,42 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
     }
 #else
+#if defined(__APPLE__)
+    /* Apple: the same split as the Windows path above. The game polls its job counters with
+     * usleep(1..5) (lr 0x00116824, ~30k/s on the main thread). nanosleep() turns each one into
+     * a kernel timer + two context switches: on the M4 iPad the main thread spent ~30% of its
+     * busy time inside that syscall, and the wake-up comes late, so every job wait stretches.
+     * Sleeps under 1 ms wait on the clock instead, as on Windows: with PS3_SHORT_SLEEP_SPIN=0
+     * (the launch default) sched_yield() until the deadline (Windows: SwitchToThread); with it
+     * unset or 1, sleeps of 50 us or less spin (isb, Windows: PAUSE). PS3_SHORT_SLEEP_NANO=1
+     * restores nanosleep for every length. */
+    {
+        static int s_mode = -1;   /* 0 = nanosleep, 1 = yield loop, 2 = spin <= 50 us, else yield */
+        if (s_mode < 0) {
+            const char* n = getenv("PS3_SHORT_SLEEP_NANO");
+            const char* e = getenv("PS3_SHORT_SLEEP_SPIN");
+            s_mode = (n && *n == '1') ? 0 : (!e || *e != '0') ? 2 : 1;
+            fprintf(stderr, "[timer] <1ms sleeps use %s (PS3_SHORT_SLEEP_SPIN / _NANO)\n",
+                    s_mode == 0 ? "nanosleep" : s_mode == 1 ? "clock + sched_yield" :
+                                  "clock + isb spin (<=50us), sched_yield");
+        }
+        if (s_mode && usec > 0 && usec < 1000) {
+            const uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + usec * 1000ull;
+            if (s_mode == 2 && usec <= 50) {
+                do {
+#if defined(__aarch64__)
+                    __asm__ __volatile__("isb sy" ::: "memory");
+#else
+                    __builtin_ia32_pause();
+#endif
+                } while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < end);
+            } else {
+                do sched_yield(); while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < end);
+            }
+            return CELL_OK;
+        }
+    }
+#endif
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
