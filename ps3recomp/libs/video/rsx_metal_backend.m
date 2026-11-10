@@ -72,6 +72,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <strings.h>
+#include <pthread.h>
 
 /* ------------------------------------------------------------------------- */
 
@@ -353,6 +354,7 @@ static void mtl_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 }
 
 static int create_depth(void);
+static void eng_enc_drain(void);
 
 /* Is this raw RSX offset one of the buffers cellGcmSetDisplayBuffer
  * registered? The D3D12 backend takes the same private hook to tell a draw
@@ -375,7 +377,10 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     if (!w || !h || (w == s_width && h == s_height)) return;
     s_width = w; s_height = h;
 #if !TARGET_OS_IPHONE
-    /* On iOS the drawable follows the app's view; the present letterboxes. */
+    /* On iOS the drawable follows the app's view; the present letterboxes.
+     * The encoder thread (ENC_THREAD) may be asking the layer for a drawable:
+     * let it finish first. */
+    eng_enc_drain();
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
 #endif
     if (s_depth && create_depth() != 0)
@@ -2209,7 +2214,12 @@ static u32 s_eng_serial = 1;              /* the commit being recorded */
 static _Atomic u32 s_eng_done_serial;     /* last commit known finished */
 static id<MTLCommandBuffer> s_eng_flight_cb[ENG_FLIGHT];
 static u32 s_eng_flight_serial[ENG_FLIGHT];
-static int s_eng_encoding;
+/* The serial of the commit being encoded, for eng_obj_enc. Only the thread
+ * that encodes touches it: the RSX thread, or the encoder thread (ENC_THREAD). */
+static u32 s_eng_enc_serial;
+static u32 s_eng_obj_born[ENG_MAX_OBJECTS];      /* s_eng_serial when the slot was filled */
+static u32 s_eng_obj_retire_sn[ENG_MAX_OBJECTS]; /* ENC_THREAD: last commit that may name it */
+static u32 s_eng_obj_retired_n;                  /* ENC_THREAD: retired slots not yet free */
 
 /* The geometry memo's ring (rsx_draw_engine.c arena_create), one shared
  * buffer that memo hits draw from instead of being copied into the stage.
@@ -2289,7 +2299,8 @@ typedef struct {
     u8    arena;                /* draw: vb_off/ib_off are in s_eng_arena, not the stage */
 } EngRecord;
 
-static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+static EngRecord s_eng_rec0[ENG_MAX_RECORDS];
+static EngRecord* s_eng_rec = s_eng_rec0;   /* the buffer being recorded */
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
 
@@ -2303,6 +2314,7 @@ typedef struct {
     id<MTLBuffer>        buf;
     id<MTLCommandBuffer> last_cb;
     u32                  cap;
+    u32                  last_serial;   /* ENC_THREAD: the last commit that read it */
 } EngStageSlot;
 static EngStageSlot s_eng_ring[ENG_STAGE_RING];
 static u32 s_eng_ring_cur;
@@ -2316,6 +2328,141 @@ static u8  s_eng_vcb_tail[64];
 
 /* What the bind_* calls have accumulated for the next draw. */
 static EngRecord s_eng_pending;
+
+/* ---- encoder thread (Apple port) ------------------------------------------
+ * PS3RECOMP_METAL_ENC_THREAD=1 moves the Metal side of each commit -- the
+ * replay of the records into a command buffer, the present and the commit --
+ * off the RSX thread onto a thread of its own. On an iPad Pro (M4) a quarter
+ * of the RSX thread's time was inside the Metal driver, encoding.
+ *
+ * The RSX thread records into one of ENG_ENC_BUFS record buffers and hands
+ * the buffer over at each commit; it only waits when every buffer is still
+ * queued. Serials are given out at the handoff, so every wait on the GPU
+ * (waited commits, stage slot reuse, geometry memo wraps, uploads) becomes a
+ * wait on s_eng_done_serial, and the RSX thread never touches a command
+ * buffer. PS3RECOMP_METAL_ENC_QOS=ui|in|ut|0 sets the thread's QoS (default:
+ * the RSX thread's). */
+#define ENG_ENC_BUFS 3u
+typedef struct {
+    const EngRecord* recs;
+    u32              count;
+    u32              serial;
+    int              pipelined;
+    id<MTLBuffer>    stage;
+    id<MTLTexture>   present;     /* the surface to show, or nil: no present */
+    id<MTLTexture>   zfallback;   /* s_depth at the handoff */
+} EngBatch;
+static int s_enc_on;
+static int s_enc_started;
+static EngRecord* s_enc_bufs[ENG_ENC_BUFS];
+static EngBatch s_enc_q[ENG_ENC_BUFS];
+static u32 s_enc_head, s_enc_tail;                              /* under s_enc_mu */
+static pthread_mutex_t s_enc_mu   = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_enc_work = PTHREAD_COND_INITIALIZER;   /* a batch was queued */
+static pthread_cond_t  s_enc_cv   = PTHREAD_COND_INITIALIZER;   /* a batch encoded, a commit done */
+static _Atomic u32 s_eng_encoded_serial;                        /* last batch fully encoded */
+
+/* PS3RECOMP_METAL_ENC_STATS=1: every 10 s, where each side waited (ms). */
+enum { ENC_W_ROOM, ENC_W_COMMIT, ENC_W_STAGE, ENC_W_FLIGHT, ENC_W_MEMO, ENC_W_UPLOAD,
+       ENC_W_DRAIN, ENC_E_ENCODE, ENC_E_INFLIGHT, ENC_E_DRAWABLE, ENC_E_IDLE, ENC_N };
+static int s_enc_stats;
+static u64 s_enc_t[ENC_N];
+static u32 s_enc_n[ENC_N];
+static u64 eng_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+/* PS3RECOMP_METAL_GPU_STATS=1 (Apple port): every 10 s, how long the GPU ran our command buffers
+ * (sum of GPUEndTime - GPUStartTime; buffers that overlap count twice) and how many there were.
+ * The iPad shares one power budget between CPU and GPU: GPU time costs CPU clock there. */
+static int s_gpu_stats = -1;
+static _Atomic u64 s_gpu_busy_ns, s_gpu_next_ns;
+static _Atomic u32 s_gpu_cbs;
+/* Pass stats (same switch), counted by the thread that encodes: render passes, blit copies, depth
+ * resolves, draws, and the attachment pixels each pass loads from / stores to memory. On a tile GPU
+ * (all Apple GPUs) every loaded or stored pixel is memory traffic. */
+static _Atomic u64 s_gs_pass, s_gs_copy, s_gs_resolve, s_gs_draw, s_gs_load_px, s_gs_store_px;
+static void eng_gs_pass(MTLRenderPassDescriptor* rp, u32 ncolor)
+{
+    if (s_gpu_stats != 1) return;
+    u64 ld = 0, st = 0;
+    for (u32 k = 0; k < ncolor; k++) {
+        id<MTLTexture> t = rp.colorAttachments[k].texture;
+        if (!t) continue;
+        const u64 px = (u64)[t width] * [t height];
+        if (rp.colorAttachments[k].loadAction == MTLLoadActionLoad) ld += px;
+        if (rp.colorAttachments[k].storeAction == MTLStoreActionStore) st += px;
+    }
+    id<MTLTexture> z = rp.depthAttachment.texture;
+    if (z) {
+        const u64 px = (u64)[z width] * [z height];
+        if (rp.depthAttachment.loadAction == MTLLoadActionLoad) ld += px;
+        if (rp.depthAttachment.storeAction == MTLStoreActionStore) st += px;
+    }
+    atomic_fetch_add(&s_gs_pass, 1);
+    atomic_fetch_add(&s_gs_load_px, ld);
+    atomic_fetch_add(&s_gs_store_px, st);
+}
+static void eng_gpu_commit(id<MTLCommandBuffer> cb)
+{
+    if (s_gpu_stats < 0) {
+        const char* e = getenv("PS3RECOMP_METAL_GPU_STATS");
+        s_gpu_stats = (e && *e == '1');
+        atomic_store(&s_gpu_next_ns, eng_now_ns() + 10000000000ull);
+    }
+    if (s_gpu_stats) {
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            const double d = c.GPUEndTime - c.GPUStartTime;
+            if (d > 0) atomic_fetch_add(&s_gpu_busy_ns, (u64)(d * 1e9));
+            atomic_fetch_add(&s_gpu_cbs, 1u);
+            const u64 now = eng_now_ns();
+            u64 due = atomic_load(&s_gpu_next_ns);
+            if (now >= due && atomic_compare_exchange_strong(&s_gpu_next_ns, &due, now + 10000000000ull)) {
+                const u64 b = atomic_exchange(&s_gpu_busy_ns, 0);
+                const u32 n = atomic_exchange(&s_gpu_cbs, 0u);
+                const double win = 10e9 + (double)(now - due);
+                fprintf(stderr, "[rsx metal] GPU busy %.0f%% over %.1f s, %u command buffers, %.2f ms each\n",
+                        100.0 * (double)b / win, win / 1e9, n, n ? (double)b / 1e6 / n : 0.0);
+                const double sec = win / 1e9;
+                fprintf(stderr, "[rsx metal] per second: %.0f passes, %.0f copies, %.0f depth resolves, %.0f draws, "
+                                "%.0f Mpx loaded, %.0f Mpx stored\n",
+                        atomic_exchange(&s_gs_pass, 0) / sec, atomic_exchange(&s_gs_copy, 0) / sec,
+                        atomic_exchange(&s_gs_resolve, 0) / sec, atomic_exchange(&s_gs_draw, 0) / sec,
+                        atomic_exchange(&s_gs_load_px, 0) / sec / 1e6, atomic_exchange(&s_gs_store_px, 0) / sec / 1e6);
+            }
+        }];
+    }
+    [cb commit];
+}
+static void eng_enc_stat(int k, u64 t0)
+{
+    if (!s_enc_stats) return;
+    __atomic_fetch_add(&s_enc_t[k], eng_now_ns() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&s_enc_n[k], 1u, __ATOMIC_RELAXED);
+}
+
+/* Wait until commit `serial` has finished on the GPU. Only for serials
+ * already handed to the encoder thread. */
+static void eng_wait_done_k(u32 serial, int k)
+{
+    if (atomic_load_explicit(&s_eng_done_serial, memory_order_acquire) >= serial) return;
+    const u64 t0 = s_enc_stats ? eng_now_ns() : 0;
+    pthread_mutex_lock(&s_enc_mu);
+    while (atomic_load_explicit(&s_eng_done_serial, memory_order_acquire) < serial)
+        pthread_cond_wait(&s_enc_cv, &s_enc_mu);
+    pthread_mutex_unlock(&s_enc_mu);
+    eng_enc_stat(k, t0);
+}
+#define eng_wait_done(sn) eng_wait_done_k((sn), ENC_W_COMMIT)
+
+/* Wait until every batch handed over has been encoded and committed. */
+static void eng_enc_drain(void)
+{
+    if (!s_enc_started) return;
+    const u64 t0 = s_enc_stats ? eng_now_ns() : 0;
+    pthread_mutex_lock(&s_enc_mu);
+    while (s_enc_head != s_enc_tail) pthread_cond_wait(&s_enc_cv, &s_enc_mu);
+    pthread_mutex_unlock(&s_enc_mu);
+    eng_enc_stat(ENC_W_DRAIN, t0);
+}
 
 /* The blit and depth-resolve helpers, and their sampler. */
 static id<MTLLibrary>             s_eng_helper_lib;
@@ -2370,10 +2517,11 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_free[--s_eng_obj_free_count];
     } else {
         if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
-        slot = s_eng_obj_count++;
+        slot = __atomic_fetch_add(&s_eng_obj_count, 1u, __ATOMIC_RELAXED);
     }
     s_eng_obj[slot] = t;
     s_eng_obj_use[slot] = 0;
+    s_eng_obj_born[slot] = s_eng_serial;
     s_eng_obj_bc[slot] = 0;
     return slot + 1;
 }
@@ -2381,7 +2529,14 @@ static u32 eng_obj_add(id<MTLTexture> t)
 static id<MTLTexture> eng_obj(u32 handle)
 {
     if (!handle || handle > s_eng_obj_count) return nil;
-    if (s_eng_encoding) s_eng_obj_use[handle - 1] = s_eng_serial;
+    return s_eng_obj[handle - 1];
+}
+
+/* eng_obj for the encode: notes that the commit being encoded reads it. */
+static id<MTLTexture> eng_obj_enc(u32 handle)
+{
+    if (!handle || handle > __atomic_load_n(&s_eng_obj_count, __ATOMIC_RELAXED)) return nil;
+    s_eng_obj_use[handle - 1] = s_eng_enc_serial;
     return s_eng_obj[handle - 1];
 }
 
@@ -2389,6 +2544,21 @@ static id<MTLTexture> eng_obj(u32 handle)
 static void eng_obj_wait_idle(u32 handle)
 {
     if (!handle || handle > s_eng_obj_count) return;
+    if (s_enc_on) {
+        /* Nothing handed over can name an object made since the last
+         * handoff. Otherwise let the encoder catch up, then wait for the
+         * last commit that read it. */
+        if (s_eng_obj_born[handle - 1] == s_eng_serial) return;
+        eng_enc_drain();
+        const u32 u = s_eng_obj_use[handle - 1];
+        if (!u || u <= atomic_load_explicit(&s_eng_done_serial, memory_order_acquire)) return;
+        static u32 m;
+        if (m++ < 3)
+            fprintf(stderr, "[rsx engine/metal] upload into a texture frame %u still reads:"
+                            " waiting\n", u);
+        eng_wait_done_k(u, ENC_W_UPLOAD);
+        return;
+    }
     const u32 use = s_eng_obj_use[handle - 1];
     if (!use || use >= s_eng_serial ||
         use <= atomic_load_explicit(&s_eng_done_serial, memory_order_acquire)) return;
@@ -2407,6 +2577,20 @@ static void eng_obj_wait_idle(u32 handle)
  * Submitted command buffers retain the objects for the GPU's remaining work. */
 static void eng_collect_retired_objects(void)
 {
+    if (s_enc_on) {
+        /* A slot is free once the encoder has resolved every batch that
+         * could name it. */
+        if (!s_eng_obj_retired_n) return;
+        const u32 enc = atomic_load_explicit(&s_eng_encoded_serial, memory_order_acquire);
+        for (u32 i = 0; i < s_eng_obj_count; ++i) {
+            if (!s_eng_obj_retired[i] || s_eng_obj_retire_sn[i] > enc) continue;
+            s_eng_obj_retired[i] = 0;
+            s_eng_obj[i] = nil;
+            s_eng_obj_free[s_eng_obj_free_count++] = i;
+            s_eng_obj_retired_n--;
+        }
+        return;
+    }
     if (s_eng_rec_count) return;
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
         if (!s_eng_obj_retired[i]) continue;
@@ -2422,6 +2606,11 @@ static void eng_obj_release(void* user, u32 handle)
     if (!handle || handle > s_eng_obj_count || !s_eng_obj[handle - 1] ||
         s_eng_obj_retired[handle - 1]) return;
     s_eng_obj_retired[handle - 1] = 1;
+    if (s_enc_on) {
+        /* The batch being recorded may name it; else the last one handed over. */
+        s_eng_obj_retire_sn[handle - 1] = s_eng_rec_count ? s_eng_serial : s_eng_serial - 1u;
+        s_eng_obj_retired_n++;
+    }
     /* Any view cut from this object stops being valid with it. */
     for (u32 i = 0; i < s_eng_view_count; i++)
         if (s_eng_view[i].surface == handle) {
@@ -2559,6 +2748,16 @@ static int eng_init(void* user, u32 width, u32 height)
         const char* e = getenv("PS3RECOMP_METAL_HEADLESS_SYNC");
         s_eng_hl_sync = (e && *e && *e != '0');
     }
+    if (!s_enc_started) {   /* ENC_THREAD; the thread starts at the first commit */
+        const char* e = getenv("PS3RECOMP_METAL_ENC_THREAD");
+        s_enc_on = (e && *e && *e != '0');
+        s_enc_bufs[0] = s_eng_rec0;
+        for (u32 i = 1; i < ENG_ENC_BUFS && s_enc_on; i++)
+            if (!s_enc_bufs[i] &&
+                !(s_enc_bufs[i] = (EngRecord*)calloc(ENG_MAX_RECORDS, sizeof(EngRecord))))
+                s_enc_on = 0;
+        s_eng_rec = s_eng_rec0;
+    }
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
     if (!s_eng_helper_lib) {
@@ -2581,6 +2780,12 @@ static int eng_init(void* user, u32 width, u32 height)
 static void eng_shutdown(void* user)
 {
     (void)user;
+    if (s_enc_on) {
+        eng_enc_drain();
+        if (s_eng_serial > 1) eng_wait_done(s_eng_serial - 1u);
+        for (u32 i = 0; i < ENG_STAGE_RING; i++) s_eng_ring[i].last_serial = 0;
+        s_eng_obj_retired_n = 0;
+    }
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
@@ -2684,6 +2889,42 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
        bytesPerImage:0];
 }
 
+/* PS3RECOMP_METAL_RT_PRIVATE=1: colour targets in GPU-only (Private) memory and
+ * without PixelFormatView. A target the CPU can map (the default storage mode:
+ * Shared on iOS, Managed on macOS) or one that may be viewed as another format
+ * gets no lossless framebuffer compression on Apple GPUs, so every pass that
+ * loads or stores it moves the full uncompressed bytes. The views this file
+ * makes of a colour target only change the swizzle, which needs no
+ * PixelFormatView. The CPU then reaches the target through a blit: the seed on
+ * creation and eng_readback. */
+static int eng_rt_private(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_METAL_RT_PRIVATE");
+        on = (e && e[0] == '1') ? 1 : 0;
+        if (on) fprintf(stderr, "[rsx engine/metal] colour targets: private, compressible\n");
+    }
+    return on;
+}
+
+static u32 eng_format_bytes(MTLPixelFormat f)
+{
+    switch (f) {
+    case MTLPixelFormatR8Unorm:     return 1;
+    case MTLPixelFormatRG8Unorm:    return 2;
+    case MTLPixelFormatR16Unorm:    return 2;
+    case MTLPixelFormatRGBA8Unorm:  return 4;
+    case MTLPixelFormatBGRA8Unorm:  return 4;
+    case MTLPixelFormatRG16Unorm:   return 4;
+    case MTLPixelFormatRG16Float:   return 4;
+    case MTLPixelFormatR32Float:    return 4;
+    case MTLPixelFormatRGBA16Float: return 8;
+    case MTLPixelFormatRGBA32Float: return 16;
+    default:                        return 0;
+    }
+}
+
 static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                    const void* seed, u32 seed_row_bytes)
 {
@@ -2697,12 +2938,60 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
      * TEXTURE_CONTROL1 crossbar as a view swizzle. */
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
+    const int priv = eng_rt_private();
+    if (priv) {
+        td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+    }
     id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
     if (!t) return 0;
-    if (seed && seed_row_bytes)
+    if (seed && seed_row_bytes && priv) {
+        /* Committed now, so it runs ahead of every pass recorded after it. */
+        id<MTLBuffer> sb = [s_dev newBufferWithBytes:seed length:(NSUInteger)seed_row_bytes * h
+                                             options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = sb ? [s_queue commandBuffer] : nil;
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        if (b) {
+            [b copyFromBuffer:sb sourceOffset:0 sourceBytesPerRow:seed_row_bytes
+                sourceBytesPerImage:(NSUInteger)seed_row_bytes * h
+                         sourceSize:MTLSizeMake(w, h, 1)
+                          toTexture:t destinationSlice:0 destinationLevel:0
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [b endEncoding];
+            [cb commit];
+        }
+    } else if (seed && seed_row_bytes) {
         [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                withBytes:seed bytesPerRow:seed_row_bytes];
+    }
     return eng_obj_add(t);
+}
+
+/* getBytes for any texture: a GPU-only one goes through a blit into a shared
+ * buffer. The caller has already drained the queue. */
+static void eng_tex_read(id<MTLTexture> t, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
+{
+    if ([t storageMode] != MTLStorageModePrivate) {
+        [t getBytes:out bytesPerRow:out_pitch fromRegion:MTLRegionMake2D(x, y, w, h)
+        mipmapLevel:0];
+        return;
+    }
+    const u32 bpp = eng_format_bytes([t pixelFormat]);
+    if (!bpp) return;
+    const NSUInteger row = (NSUInteger)w * bpp;
+    id<MTLBuffer> rb = [s_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = rb ? [s_queue commandBuffer] : nil;
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    if (!b) return;
+    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
+            sourceSize:MTLSizeMake(w, h, 1) toBuffer:rb destinationOffset:0
+destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [b endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    const u8* src = (const u8*)[rb contents];
+    for (u32 r = 0; r < h; r++)
+        memcpy((u8*)out + (size_t)r * out_pitch, src + (size_t)r * row, row);
 }
 
 static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
@@ -2992,7 +3281,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
     if (!ds) return 0;
 
-    const u32 slot = s_eng_pipe_count++;
+    const u32 slot = __atomic_fetch_add(&s_eng_pipe_count, 1u, __ATOMIC_RELAXED);
     s_eng_pipe[slot].pso = pso;
     s_eng_pipe[slot].ds  = ds;
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
@@ -3210,6 +3499,22 @@ static int eng_arena_retire(void* user, u64 below)
     (void)user;
     if (s_eng_rec_minpos < below) return 0;     /* the batch not yet committed reads one */
     const u32 done = atomic_load_explicit(&s_eng_done_serial, memory_order_acquire);
+    if (s_enc_on) {     /* the flight table is filled at the handoff */
+        u32 wait_serial = 0;
+        for (u32 i = 0; i < ENG_FLIGHT; i++) {
+            const u32 sn = s_eng_flight_serial[i];
+            if (!sn || sn <= done || sn >= s_eng_serial) continue;
+            if (s_eng_flight_minpos[i] < below && sn > wait_serial) wait_serial = sn;
+        }
+        if (wait_serial) {
+            static u32 m;
+            if (m++ < 3)
+                fprintf(stderr, "[rsx engine/metal] geometry memo wraps onto frame %u: waiting\n",
+                        wait_serial);
+            eng_wait_done_k(wait_serial, ENC_W_MEMO);
+        }
+        return 1;
+    }
     id<MTLCommandBuffer> wait = nil;
     u32 wait_serial = 0;
     for (u32 i = 0; i < ENG_FLIGHT; i++) {
@@ -3309,7 +3614,7 @@ static void eng_enc_state_reset(EngEncState* st)
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                             id<MTLBuffer> stage, EngEncState* st)
 {
-    if (!r->pipeline || r->pipeline > s_eng_pipe_count) return;
+    if (!r->pipeline || r->pipeline > __atomic_load_n(&s_eng_pipe_count, __ATOMIC_RELAXED)) return;
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
     if (!p->pso) return;
     const void* pso = (__bridge const void*)p->pso;
@@ -3366,7 +3671,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         }
     }
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj(r->tex[u]);
+        id<MTLTexture> t = eng_obj_enc(r->tex[u]);
         if (!t) t = s_null_tex;
         const void* tp = (__bridge const void*)t;
         if (st->ftex[u] != tp) {
@@ -3380,7 +3685,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         }
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj(r->vtex[u]);
+        id<MTLTexture> t = eng_obj_enc(r->vtex[u]);
         if (!t) t = s_null_tex;
         const void* tp = (__bridge const void*)t;
         if (st->vtex[u] != tp) {
@@ -3420,29 +3725,31 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
  * is what keeps a mid-frame clear ordered against the draws around it. */
-static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
+                               const EngRecord* recs, u32 count, id<MTLTexture> zfb)
 {
     u32 i = 0;
-    while (i < s_eng_rec_count) {
-        if (s_eng_rec[i].kind == ENG_REC_COPY) {
+    while (i < count) {
+        if (recs[i].kind == ENG_REC_COPY) {
             /* Back-to-back copies share one blit encoder. */
             id<MTLBlitCommandEncoder> b = nil;
-            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_COPY) {
-                const EngRecord* r = &s_eng_rec[i++];
-                id<MTLTexture> src = eng_obj(r->copy_src);
-                id<MTLTexture> dst = eng_obj(r->resolve_dst);
+            while (i < count && recs[i].kind == ENG_REC_COPY) {
+                const EngRecord* r = &recs[i++];
+                id<MTLTexture> src = eng_obj_enc(r->copy_src);
+                id<MTLTexture> dst = eng_obj_enc(r->resolve_dst);
                 if (!src || !dst) continue;
                 if (!b) b = [cb blitCommandEncoder];
                 if (!b) break;
                 [b copyFromTexture:src toTexture:dst];
+                if (s_gpu_stats == 1) atomic_fetch_add(&s_gs_copy, 1);
             }
             if (b) [b endEncoding];
             continue;
         }
-        if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
-            const EngRecord* r = &s_eng_rec[i++];
-            id<MTLTexture> src = eng_obj(r->depth);
-            id<MTLTexture> dst = eng_obj(r->resolve_dst);
+        if (recs[i].kind == ENG_REC_DEPTH_RESOLVE) {
+            const EngRecord* r = &recs[i++];
+            id<MTLTexture> src = eng_obj_enc(r->depth);
+            id<MTLTexture> dst = eng_obj_enc(r->resolve_dst);
             id<MTLRenderPipelineState> pso = r->resolve_color ? s_eng_zcolor_pso : s_eng_depth_pso;
             if (!src || !dst || !pso) continue;
             id<MTLTexture> sv = r->resolve_color
@@ -3454,6 +3761,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
+            if (s_gpu_stats == 1) { atomic_fetch_add(&s_gs_resolve, 1); eng_gs_pass(rp, 1); }
             [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
             if (sv) [e setFragmentTexture:sv atIndex:1];
@@ -3474,9 +3782,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u32 cd = 0, ds_flags = 0;
         float cdepth = 1.0f;
         u8 cstencil = 0;
-        while (i < s_eng_rec_count && (s_eng_rec[i].kind == ENG_REC_CLEAR_COLOR ||
-                                       s_eng_rec[i].kind == ENG_REC_CLEAR_DS)) {
-            const EngRecord* r = &s_eng_rec[i];
+        while (i < count && (recs[i].kind == ENG_REC_CLEAR_COLOR ||
+                                       recs[i].kind == ENG_REC_CLEAR_DS)) {
+            const EngRecord* r = &recs[i];
             if (r->kind == ENG_REC_CLEAR_COLOR) {
                 u32 k = 0;
                 while (k < n_cc && cc_surf[k] != r->rt[0]) k++;
@@ -3504,9 +3812,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         u32 nrt = n_cc;
         for (u32 k = 0; k < n_cc; k++) rt[k] = cc_surf[k];
         u32 depth = have_clear_ds ? cd : 0;
-        if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-            (!have_clear_ds || s_eng_rec[i].depth == cd)) {
-            const EngRecord* d = &s_eng_rec[i];
+        if (i < count && recs[i].kind == ENG_REC_DRAW &&
+            (!have_clear_ds || recs[i].depth == cd)) {
+            const EngRecord* d = &recs[i];
             int covered = 1;
             for (u32 k = 0; k < n_cc && covered; k++) {
                 int found = 0;
@@ -3528,18 +3836,18 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
         id<MTLTexture> tex[RSX_BE_MAX_COLOR_TARGETS];
         u32 attach = 0;
         for (u32 k = 0; k < nrt; k++) {
-            id<MTLTexture> t = eng_obj(rt[k]);
+            id<MTLTexture> t = eng_obj_enc(rt[k]);
             if (!t) break;
             if (attach && ([t width]  != [tex[0] width] ||
                            [t height] != [tex[0] height])) break;
             tex[attach++] = t;
         }
-        id<MTLTexture> zbuf = eng_obj(depth);
-        if (!attach && !zbuf) { if (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW) i++; continue; }
+        id<MTLTexture> zbuf = eng_obj_enc(depth);
+        if (!attach && !zbuf) { if (i < count && recs[i].kind == ENG_REC_DRAW) i++; continue; }
         /* A pipeline always declares the depth attachment, so a draw pass
          * always has to have one; the display's shared buffer is the fallback
          * for a guest that never declared a zeta. */
-        if (attach && !zbuf) zbuf = s_depth;
+        if (attach && !zbuf) zbuf = zfb;
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         for (u32 k = 0; k < attach; k++) {
@@ -3582,19 +3890,22 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * skips those draws rather than encoding a mismatch. */
         if (!enc || attach != nrt) {
             if (enc) [enc endEncoding];
-            while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-                   eng_record_targets_are(&s_eng_rec[i], rt, nrt)) i++;
+            while (i < count && recs[i].kind == ENG_REC_DRAW &&
+                   eng_record_targets_are(&recs[i], rt, nrt)) i++;
             continue;
         }
+        eng_gs_pass(rp, attach);
+        const u32 i_first = i;
         EngEncState st;
         eng_enc_state_reset(&st);
-        while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
-               eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
-               (s_eng_rec[i].depth == depth ||
-                (!s_eng_rec[i].depth && zbuf == s_depth))) {
-            eng_encode_draw(enc, &s_eng_rec[i], stage, &st);
+        while (i < count && recs[i].kind == ENG_REC_DRAW &&
+               eng_record_targets_are(&recs[i], rt, nrt) &&
+               (recs[i].depth == depth ||
+                (!recs[i].depth && zbuf == zfb))) {
+            eng_encode_draw(enc, &recs[i], stage, &st);
             i++;
         }
+        if (s_gpu_stats == 1) atomic_fetch_add(&s_gs_draw, i - i_first);
         [enc endEncoding];
     }
 }
@@ -3763,8 +4074,189 @@ static void eng_stage_next(void)
  * vtable path uses, because waiting on every frame is the one pattern where
  * a driver cannot hide its encoding work. Headless runs pipeline like a
  * window does. */
+/* ---- encoder thread (ENC_THREAD) ----------------------------------------- */
+
+/* Encode and commit one handed-over batch: what eng_encode_and_commit_ex
+ * does after its waits. A present with no drawable (the compositor is busy)
+ * still commits its draws, without the present. */
+static void eng_enc_run(const EngBatch* b)
+{
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = nil;
+        id<MTLTexture> dst = nil;
+        u64 t0 = s_enc_stats ? eng_now_ns() : 0;
+        if (b->pipelined) {
+            dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+            eng_enc_stat(ENC_E_INFLIGHT, t0);
+        }
+        if (b->present) {
+            if (s_headless) {
+                dst = s_offscreen;
+            } else {
+                if (s_enc_stats) t0 = eng_now_ns();
+                drawable = [s_layer nextDrawable];
+                eng_enc_stat(ENC_E_DRAWABLE, t0);
+                if (drawable) dst = [drawable texture];
+            }
+        }
+        if (s_enc_stats) t0 = eng_now_ns();
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        s_eng_enc_serial = b->serial;
+        eng_encode_records(cb, b->stage, b->recs, b->count, b->zfallback);
+        s_eng_enc_serial = 0;
+        if (b->present && dst) eng_blit_to_display(cb, b->present, dst);
+        if (drawable) [cb presentDrawable:drawable];
+        const u32 serial = b->serial;
+        const int pipelined = b->pipelined;
+        dispatch_semaphore_t sem = s_inflight;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+            (void)_unused;
+            pthread_mutex_lock(&s_enc_mu);
+            eng_note_done(serial);
+            pthread_cond_broadcast(&s_enc_cv);
+            pthread_mutex_unlock(&s_enc_mu);
+            if (pipelined) dispatch_semaphore_signal(sem);
+        }];
+        eng_gpu_commit(cb);
+        eng_enc_stat(ENC_E_ENCODE, t0);
+    }
+}
+
+static void* eng_enc_main(void* arg)
+{
+    (void)arg;
+    pthread_setname_np("rsx_encode");
+    for (;;) {
+        const u64 t0 = s_enc_stats ? eng_now_ns() : 0;
+        pthread_mutex_lock(&s_enc_mu);
+        while (s_enc_head == s_enc_tail) pthread_cond_wait(&s_enc_work, &s_enc_mu);
+        eng_enc_stat(ENC_E_IDLE, t0);
+        EngBatch* b = &s_enc_q[s_enc_head % ENG_ENC_BUFS];
+        pthread_mutex_unlock(&s_enc_mu);
+        eng_enc_run(b);
+        pthread_mutex_lock(&s_enc_mu);
+        b->stage = nil;
+        b->present = nil;
+        b->zfallback = nil;
+        atomic_store_explicit(&s_eng_encoded_serial, b->serial, memory_order_release);
+        s_enc_head++;
+        pthread_cond_broadcast(&s_enc_cv);
+        pthread_mutex_unlock(&s_enc_mu);
+    }
+    return NULL;
+}
+
+/* Started from the RSX thread, so the default QoS is that thread's. */
+static void eng_enc_start(void)
+{
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    qos_class_t q = qos_class_self();
+    const char* e = getenv("PS3RECOMP_METAL_ENC_QOS");
+    if (e && *e) {
+        q = !strcmp(e, "ui") ? QOS_CLASS_USER_INTERACTIVE :
+            !strcmp(e, "in") ? QOS_CLASS_USER_INITIATED :
+            !strcmp(e, "ut") ? QOS_CLASS_UTILITY : QOS_CLASS_UNSPECIFIED;
+    }
+    if (q != QOS_CLASS_UNSPECIFIED) pthread_attr_set_qos_class_np(&at, q, 0);
+    {
+        const char* st = getenv("PS3RECOMP_METAL_ENC_STATS");
+        s_enc_stats = (st && *st && *st != '0');
+    }
+    pthread_t t;
+    if (pthread_create(&t, &at, eng_enc_main, NULL) == 0) {
+        pthread_detach(t);
+        s_enc_started = 1;
+        fprintf(stderr, "[rsx engine/metal] encoder thread on (QoS 0x%x)\n", (unsigned)q);
+    } else {
+        fprintf(stderr, "[rsx engine/metal] encoder thread failed to start; encoding inline\n");
+        s_enc_on = 0;
+    }
+    pthread_attr_destroy(&at);
+}
+
+/* eng_encode_and_commit_ex with ENC_THREAD: hand the records over, then do
+ * the waits the inline commit would have done, as waits on serials. */
+static void eng_commit_async(id<MTLTexture> present_dst, int nowait)
+{
+    const int pipelined = (present_dst || nowait) && (!s_headless || !s_eng_hl_sync);
+    const int staged = s_eng_stage_used != 0;
+    const u32 serial = s_eng_serial++;
+    /* The geometry memo's wrap check reads this table; the commit ENG_FLIGHT
+     * back must be finished before its entry is reused. */
+    const u32 fi = serial % ENG_FLIGHT;
+    if (s_eng_flight_serial[fi]) eng_wait_done_k(s_eng_flight_serial[fi], ENC_W_FLIGHT);
+    s_eng_flight_serial[fi] = serial;
+    s_eng_flight_minpos[fi] = s_eng_rec_minpos;
+
+    pthread_mutex_lock(&s_enc_mu);
+    EngBatch* b = &s_enc_q[s_enc_tail % ENG_ENC_BUFS];
+    b->recs      = s_eng_rec;
+    b->count     = s_eng_rec_count;
+    b->serial    = serial;
+    b->pipelined = pipelined;
+    b->stage     = staged ? s_eng_ring[s_eng_ring_cur].buf : nil;
+    b->present   = present_dst;
+    b->zfallback = s_depth;
+    s_enc_tail++;
+    pthread_cond_signal(&s_enc_work);
+    /* The next record buffer is the one the oldest queued batch holds. */
+    if (s_enc_tail - s_enc_head > ENG_ENC_BUFS - 1u) {
+        const u64 t0 = s_enc_stats ? eng_now_ns() : 0;
+        while (s_enc_tail - s_enc_head > ENG_ENC_BUFS - 1u)
+            pthread_cond_wait(&s_enc_cv, &s_enc_mu);
+        eng_enc_stat(ENC_W_ROOM, t0);
+    }
+    pthread_mutex_unlock(&s_enc_mu);
+    s_eng_rec = s_enc_bufs[s_enc_tail % ENG_ENC_BUFS];
+
+    if (!pipelined) {
+        eng_wait_done(serial);          /* the slot is reused as it is */
+    } else if (staged) {
+        s_eng_ring[s_eng_ring_cur].last_serial = serial;
+        s_eng_ring_cur = (s_eng_ring_cur + 1u) % ENG_STAGE_RING;
+        EngStageSlot* sl = &s_eng_ring[s_eng_ring_cur];
+        if (sl->last_serial) { eng_wait_done_k(sl->last_serial, ENC_W_STAGE); sl->last_serial = 0; }
+        s_eng_stage = sl->buf ? (u8*)[sl->buf contents] : NULL;
+        s_eng_stage_cap = sl->cap;
+    }
+    if (s_eng_dropped) {
+        fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+                s_eng_dropped, ENG_MAX_RECORDS);
+        s_eng_dropped = 0;
+    }
+    s_eng_rec_count  = 0;
+    s_eng_rec_minpos = UINT64_MAX;
+    s_eng_stage_used = 0;
+    s_eng_vcb_valid  = 0;
+    eng_collect_retired_objects();
+    if (s_enc_stats) {
+        static u64 last; static u32 commits;
+        const u64 now = eng_now_ns();
+        commits++;
+        if (!last) last = now;
+        if (now - last >= 10000000000ull) {
+            static const char* nm[ENC_N] = { "room", "commit", "stage", "flight", "memo",
+                "upload", "drain", "E:encode", "E:inflight", "E:drawable", "E:idle" };
+            char line[512]; int o = 0;
+            for (int k = 0; k < ENC_N; k++) {
+                const u64 t = __atomic_exchange_n(&s_enc_t[k], 0, __ATOMIC_RELAXED);
+                const u32 n = __atomic_exchange_n(&s_enc_n[k], 0u, __ATOMIC_RELAXED);
+                o += snprintf(line + o, sizeof line - (size_t)o, " %s %u/%llums", nm[k], n,
+                              (unsigned long long)(t / 1000000u));
+            }
+            fprintf(stderr, "[enc-stats] %.1fs %u commits:%s\n", (now - last) / 1e9, commits, line);
+            last = now; commits = 0;
+        }
+    }
+}
+
 static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
 {
+    if (s_enc_on) {
+        if (!s_enc_started) eng_enc_start();
+        if (s_enc_on) { eng_commit_async(present_dst, nowait); return; }
+    }
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
         id<MTLTexture> dst = nil;
@@ -3785,9 +4277,9 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
 
         id<MTLBuffer> stage = s_eng_stage_used ? s_eng_ring[s_eng_ring_cur].buf : nil;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        s_eng_encoding = 1;
-        eng_encode_records(cb, stage);
-        s_eng_encoding = 0;
+        s_eng_enc_serial = s_eng_serial;
+        eng_encode_records(cb, stage, s_eng_rec, s_eng_rec_count, s_depth);
+        s_eng_enc_serial = 0;
         const u32 serial = s_eng_serial++;
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
@@ -3801,9 +4293,9 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
             s_eng_flight_cb[serial % ENG_FLIGHT] = cb;
             s_eng_flight_serial[serial % ENG_FLIGHT] = serial;
             s_eng_flight_minpos[serial % ENG_FLIGHT] = s_eng_rec_minpos;
-            [cb commit];
+            eng_gpu_commit(cb);
         } else {
-            [cb commit];
+            eng_gpu_commit(cb);
             [cb waitUntilCompleted];
             eng_note_done(serial);
         }
@@ -3853,13 +4345,13 @@ static void eng_dump_frame(id<MTLTexture> src)
     if (!w || !h || w > 16384 || h > 16384) return;
     unsigned char* rgba = malloc(w * h * 4);
     if (!rgba) return;
+    eng_enc_drain();
     if (!s_headless || !s_eng_hl_sync) {
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         [fence commit];
         [fence waitUntilCompleted];
     }
-    [src getBytes:rgba bytesPerRow:w * 4
-      fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    eng_tex_read(src, 0, 0, (u32)w, (u32)h, rgba, (u32)w * 4);
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
@@ -3892,12 +4384,12 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     if (!t || !out || !out_pitch || !w || !h) return;
     if (x + w > [t width] || y + h > [t height]) return;
     {   /* Presents may still be in flight: let the queue drain first. */
+        eng_enc_drain();
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         [fence commit];
         [fence waitUntilCompleted];
     }
-    [t getBytes:out bytesPerRow:out_pitch
-     fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
+    eng_tex_read(t, x, y, w, h, out, out_pitch);
 }
 
 static const rsx_draw_backend s_engine_backend = {
@@ -4052,10 +4544,11 @@ void rsx_metal_backend_set_layer(void* ca_metal_layer)
 void rsx_metal_backend_wait_idle(void)
 {
     if (!s_queue) return;
+    eng_enc_drain();    /* ENC_THREAD: batches handed over but not yet committed */
     @autoreleasepool {
         /* One queue, so its last command buffer completes after all earlier ones. */
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        [cb commit];
+        eng_gpu_commit(cb);
         [cb waitUntilCompleted];
     }
 }
@@ -4225,7 +4718,7 @@ void rsx_metal_backend_present(void)
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
-            [cb commit];
+            eng_gpu_commit(cb);
             [cb waitUntilCompleted];
         } else {
             dispatch_semaphore_t sem = s_inflight;
@@ -4233,7 +4726,7 @@ void rsx_metal_backend_present(void)
                 (void)_unused;
                 dispatch_semaphore_signal(sem);
             }];
-            [cb commit];        /* no wait: the CPU goes on to the next frame */
+            eng_gpu_commit(cb);        /* no wait: the CPU goes on to the next frame */
         }
 
         if (s_dropped_records) {
