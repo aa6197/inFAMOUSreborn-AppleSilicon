@@ -4088,6 +4088,15 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     struct SpursKArg* ka = (struct SpursKArg*)p;
 #if defined(__APPLE__)
     { char nm[32]; snprintf(nm, sizeof nm, "spurs kernel %u/%u", (unsigned)ka->part, (unsigned)ka->nparts); pthread_setname_np(nm); }   /* Instruments, IOS_CPU_LOG_SECS */
+    /* SPURS_KERN_QOS (kernels of multi-SPU instances) / SPURS_KERN1_QOS (one-SPU instance: audio) =
+     * ut | in | ui: QoS for these kernel threads. Default: untouched. Test switch: on the iPad Pro M4
+     * the 3 P cores are full and run at ~1.8 GHz in gameplay while the E cores are 60% idle. */
+    { const char* e = getenv(ka->nparts > 1 ? "SPURS_KERN_QOS" : "SPURS_KERN1_QOS");
+      if (e && ((e[0] == 'u' && (e[1] == 't' || e[1] == 'i')) || (e[0] == 'i' && e[1] == 'n'))) {
+          pthread_set_qos_class_self_np((e[0] == 'u' && e[1] == 't') ? QOS_CLASS_UTILITY :
+                                        (e[0] == 'i') ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE, 0);
+          if (ka->part == 0) fprintf(stderr, "[spurs-kern] %s=%s\n", ka->nparts > 1 ? "SPURS_KERN_QOS" : "SPURS_KERN1_QOS", e);
+      } }
 #endif
     struct SpursInst* si = ka->si;
     const u32 k_part = ka->part, k_nparts = ka->nparts;
