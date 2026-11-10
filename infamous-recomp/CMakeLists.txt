@@ -902,6 +902,19 @@ if(MSVC)
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+    # Apple: the v30c inline guest loads/stores were only switched on in the MSVC branch above, so on
+    # macOS/iOS every lifted guest access was an out-of-line vm_read*/vm_write* call (~40% of the main
+    # thread's self time on the Mac). Same portable C fast paths as Windows (recompiled/ppu_recomp.h),
+    # plain-call fallback (the preserve_most wrappers are x86-64 only). PPU_INLINE_LOADS=0 at run time
+    # still sends every access out of line.
+    if(APPLE)
+        option(PORT_APPLE_INLINE_LOADS "Apple: inline guest loads/stores in the lifted PPU code" ON)
+        if(PORT_APPLE_INLINE_LOADS)
+            set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
+                COMPILE_DEFINITIONS "PPU_INLINE_LOADS;PPU_NO_PRESERVE_MOST")
+            message(STATUS "Lifted PPU:      inline guest loads/stores (PORT_APPLE_INLINE_LOADS=ON)")
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
