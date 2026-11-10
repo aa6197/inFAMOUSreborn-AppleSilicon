@@ -49,6 +49,40 @@ Read this first every session. Newest entry on top.
 
 ---
 
+## 2026-11-10 — iOS: "too old" screen for chips before A14
+
+### Result
+
+- The iOS build uses `-mcpu=apple-a14` (PORT_IOS_CPU), but the app
+  allows iOS 16, which still runs on A11–A13. Those devices could install
+  it and crash. Info.plist can't ask for an A14.
+- `ios/ios_shell.mm` now checks `hw.optional.arm.FEAT_FRINTTS` and
+  `FEAT_FlagM2` (A14+ only) at start. If either is 0 it shows a
+  "too old" screen (iPad: lists the first A14/M1 iPads; iPhone: "iPhone
+  12 or newer") and never starts the game. A missing sysctl doesn't block.
+- On only when PORT_IOS_CPU is apple-a14+ (`PORT_IOS_CPU_CHECK`, set on
+  ios_shell.mm only, so the lifted files don't rebuild).
+- Test switch: `INFAMOUS_CPU_TEST=old` fakes an old chip.
+- README: real device list for iPad and iPhone.
+- Scan of today's device binary (27.5 M instructions): no A14-only
+  instructions (frint32/64, axflag, xaflag) yet; it does use LSE (925)
+  and LDAPR (87), so A11 would crash for sure. The check keeps the line
+  at A14 so a later build can't crash on A12/A13.
+
+### Checks
+
+| test | result |
+|---|---|
+| Simulator iPad, `INFAMOUS_CPU_TEST=old` | "too old" screen, game not started |
+| Simulator iPad, normal | no cpu line, game starts |
+| real iPad (M4), normal, 60 s | no cpu line, game starts, 6.4 GB free |
+
+- Xcode trap: after a CMake change, the first `xcodebuild` regenerates
+  the project mid-build and compiles with the old flags. Build twice (or
+  re-run ios_configure.sh first).
+
+---
+
 ## 2026-11-09 — Mac keyboard + mouse controls
 
 ### Result

@@ -45,9 +45,14 @@ You need a Mac with Apple Silicon (M1 or newer) and macOS 13 or newer.
 
 You only do this once.
 
-### iPad
+### iPad and iPhone
 
-You need an iPad with an M-series chip (M1 or newer).
+You need iPadOS or iOS 16 or newer, and:
+
+- **iPad:** an A14 or M1 chip or newer. That's iPad Air (4th generation), iPad (10th generation), iPad mini (6th generation), iPad Pro with M1, or newer. Tested on an iPad Pro with M4
+- **iPhone:** iPhone 12 or newer. Not tested on a real iPhone yet, and it will likely run slower than on an iPad
+
+On an older device the app shows a "too old" message instead of starting.
 
 1. Download `inFamous-<version>-ios.ipa`
 2. Install it with [SideStore](https://sidestore.io), [AltStore](https://altstore.io) or [Sideloadly](https://sideloadly.io)
