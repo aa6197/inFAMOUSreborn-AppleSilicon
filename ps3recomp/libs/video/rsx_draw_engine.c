@@ -126,7 +126,10 @@ typedef struct {
     u32 span, span_levels; /* eng_texture_span for these levels (0 = none)   */
 } eng_texture;
 
-typedef struct { u64 key; u32 handle; u8 fixed; u64 ps_hash; } eng_pipeline;
+/* cuse: the vertex constants the pipeline's vertex shader reads (bit per
+ * vp_c[i]); cpart: cuse is complete (no relatively indexed read), so only
+ * those need staging (D3D12 VCB_PARTIAL, rsx_d3d12_backend.c:3360). */
+typedef struct { u64 key; u32 handle; u8 fixed; u8 cpart; u64 ps_hash; u32 cuse[16]; } eng_pipeline;
 
 typedef struct { u32 first, count; } eng_batch;
 
@@ -156,6 +159,8 @@ static struct {
     u32 dbt;
     /* The bound pipeline's pixel-shader HLSL hash (the shader-dump name). */
     u64 ps_hash;
+    /* The bound pipeline's used vertex constants, NULL = all (VCB_PARTIAL). */
+    const u32* vs_cuse;
     eng_texture textures[ENG_MAX_TEXTURES];
     u32 n_textures;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
@@ -1867,8 +1872,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (g.pipelines[n - 1u].key == key) {
             *out_fixed = g.pipelines[n - 1u].fixed;
             g.ps_hash = g.pipelines[n - 1u].ps_hash;
+            g.vs_cuse = g.pipelines[n - 1u].cpart ? g.pipelines[n - 1u].cuse : NULL;
             return g.pipelines[n - 1u].handle;
         }
+    g.vs_cuse = NULL;
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
@@ -1924,6 +1931,25 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
+    {   /* Which constants the vertex shader reads, from the HLSL it was built
+         * from, as the D3D12 backend does: every read is "vp_c[<n>]", or
+         * "vp_c[(" for a relatively indexed one, which needs them all. The
+         * declaration "vp_c[512]" is past the last entry. */
+        eng_pipeline* p = &g.pipelines[g.n_pipelines];
+        memset(p->cuse, 0, sizeof p->cuse);
+        int rel = 0;
+        for (const char* q = strstr(s_vs_hlsl, "vp_c["); q; q = strstr(q + 5, "vp_c[")) {
+            const char* r = q + 5;
+            if (*r >= '0' && *r <= '9') {
+                const unsigned long v = strtoul(r, NULL, 10);
+                if (v < 512u) p->cuse[v >> 5] |= 1u << (v & 31u);
+            } else {
+                rel = 1;
+            }
+        }
+        p->cpart = (u8)(!rel && eng_env_flag("VCB_PARTIAL", 1));
+        g.vs_cuse = p->cpart ? p->cuse : NULL;
+    }
     g.pipelines[g.n_pipelines].ps_hash = g.ps_hash =
         eng_fnv1a(s_ps_hlsl, (u32)strlen(s_ps_hlsl), 1469598103934665603ull);
     g.n_pipelines++;
@@ -3555,7 +3581,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (g.be->bind_vs_constants_split) {
         g.be->bind_vs_constants_split(g.be->user, g.rsx.constants,
                                       RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf,
-                                      g.rsx.constants_gen);
+                                      g.rsx.constants_gen, g.vs_cuse);
     } else {
         memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
         memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);

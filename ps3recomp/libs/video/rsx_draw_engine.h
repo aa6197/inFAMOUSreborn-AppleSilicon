@@ -194,9 +194,14 @@ typedef struct rsx_draw_backend {
      * (rsx_live_draw.c:7211-7213). NULL = bind_vs_constants on a joined copy.
      * a_gen changes whenever a's contents may have: a backend may bind what it
      * staged for an equal a_gen and equal b again (D3D12 VCB_DEDUP,
-     * rsx_d3d12_backend.c:7392). */
+     * rsx_d3d12_backend.c:7392).
+     * a_use: the 16-byte entries of a the bound vertex shader reads (bit i of
+     * a_use[i >> 5] for entry i, up to 512 entries), or NULL for all of them.
+     * The others may be left unstaged (D3D12 VCB_PARTIAL,
+     * rsx_d3d12_backend.c:7433); b stays at offset a_bytes either way. */
     void (*bind_vs_constants_split)(void* user, const void* a, u32 a_bytes,
-                                    const void* b, u32 b_bytes, u64 a_gen);
+                                    const void* b, u32 b_bytes, u64 a_gen,
+                                    const u32* a_use);
     void (*bind_textures)(void* user, const u32* textures,
                           const rsx_be_sampler_desc* samplers, u32 mask);
     void (*bind_vertex_textures)(void* user, const u32* textures,

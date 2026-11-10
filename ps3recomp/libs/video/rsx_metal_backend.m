@@ -3373,8 +3373,42 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
  * again. Every constant change bumps a_gen (a rewrite of the same value
  * does not); a commit forgets the block, since it recycles the arena. ~13k draws a frame each staged 8 KB, most of a
  * frame's staging. VCB_DEDUP=0 stages every draw's block, as before. */
+/* VCB_PARTIAL (rsx_d3d12_backend.c:7433): with a_use, only the entries the
+ * shader reads are copied, run by run; the rest of the slot keeps whatever
+ * the arena held, which nothing reads. Mac profile: the full 8 KB copy per
+ * draw was ~6.5% of the RSX thread. The staged block remembers which entries
+ * it holds, and a dedup hit needs them to cover this draw's.
+ * PS3RECOMP_METAL_VCB_POISON=1 fills the skipped entries with NaN, so a
+ * shader reading one shows up as broken geometry (a check, not for play). */
+static u32 s_eng_vcb_have[16];
+static void eng_vcb_copy_used(u8* dst, const u8* src, u32 n, const u32* use)
+{
+    static int poison = -1;
+    if (poison < 0) {
+        const char* e = getenv("PS3RECOMP_METAL_VCB_POISON");
+        poison = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (poison) memset(dst, 0xFF, (size_t)n * 16u);
+    u32 i = 0;
+    while (i < n) {
+        const u32 w = use[i >> 5] >> (i & 31u);
+        if (!w) { i = (i | 31u) + 1u; continue; }
+        i += (u32)__builtin_ctz(w);
+        u32 j = i + 1u;
+        while (j < n) {
+            const u32 z = ~use[j >> 5] >> (j & 31u);
+            if (z) { j += (u32)__builtin_ctz(z); break; }
+            j = (j | 31u) + 1u;
+        }
+        if (j > n) j = n;
+        memcpy(dst + (size_t)i * 16u, src + (size_t)i * 16u, (size_t)(j - i) * 16u);
+        i = j;
+    }
+}
+
 static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
-                                        const void* b, u32 b_bytes, u64 a_gen)
+                                        const void* b, u32 b_bytes, u64 a_gen,
+                                        const u32* a_use)
 {
     (void)user;
     static int dedup = -1;
@@ -3382,18 +3416,30 @@ static void eng_bind_vs_constants_split(void* user, const void* a, u32 a_bytes,
         const char* e = getenv("VCB_DEDUP");
         dedup = (e && *e == '0') ? 0 : 1;
     }
+    if (a_bytes > 512u * 16u || (a_bytes & 15u)) a_use = NULL;
     (void)eng_rec_room();
     eng_stage_flush_point();
     u32 off = 0, bytes = a_bytes + b_bytes;
     if (dedup && s_eng_vcb_valid && a_gen == s_eng_vcb_gen &&
         bytes == s_eng_vcb_bytes && b_bytes == s_eng_vcb_tail_bytes &&
         !memcmp(b, s_eng_vcb_tail, b_bytes)) {
-        s_eng_pending.vs_cb_off = s_eng_vcb_off;
-        s_eng_pending.vs_cb_bytes = bytes;
-        return;
+        int covered = 1;
+        for (u32 k = 0; k < 16u && covered; k++)
+            if ((a_use ? a_use[k] : 0xFFFFFFFFu) & ~s_eng_vcb_have[k]) covered = 0;
+        if (covered) {
+            s_eng_pending.vs_cb_off = s_eng_vcb_off;
+            s_eng_pending.vs_cb_bytes = bytes;
+            return;
+        }
     }
     if (bytes && eng_stage_reserve(bytes, &off)) {
-        memcpy(s_eng_stage + off, a, a_bytes);
+        if (a_use) {
+            eng_vcb_copy_used(s_eng_stage + off, (const u8*)a, a_bytes / 16u, a_use);
+            memcpy(s_eng_vcb_have, a_use, sizeof s_eng_vcb_have);
+        } else {
+            memcpy(s_eng_stage + off, a, a_bytes);
+            memset(s_eng_vcb_have, 0xFF, sizeof s_eng_vcb_have);
+        }
         memcpy(s_eng_stage + off + a_bytes, b, b_bytes);
         s_eng_vcb_valid = b_bytes <= sizeof s_eng_vcb_tail;
         s_eng_vcb_gen = a_gen;
