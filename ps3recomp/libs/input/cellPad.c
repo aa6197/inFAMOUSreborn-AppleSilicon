@@ -1368,6 +1368,16 @@ static void pad_shutdown_backend(void)
 
 #endif /* PAD_BACKEND_SDL3 */
 
+#if !PAD_BACKEND_SDL3
+/* The HLE NID table is generated from every cell* name in the libs, #if blocks included, so the
+ * touch-pad hook has to link in every build. Without SDL3 (macOS SDL2 build) there is no touch pad. */
+void cellPad_set_touch_state(int on, unsigned buttons, unsigned lx, unsigned ly,
+                             unsigned rx, unsigned ry)
+{
+    (void)on; (void)buttons; (void)lx; (void)ly; (void)rx; (void)ry;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
