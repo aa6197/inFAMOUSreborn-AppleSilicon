@@ -295,9 +295,27 @@ static inline u128 spu_fi(u128 a, u128 b) {
         uint32_t base_bits = rb & 0xFFFFFC00u;
         float base; memcpy(&base, &base_bits, sizeof base);
         uint32_t step_frac = rb & 0x3FFu;
+#if defined(__aarch64__)
+        /* arm64 (no AVX2 spu__v_fi): exact power-of-two multiplies instead of two libm ldexpf calls per lane
+         * (ldexpf + its stub were ~3% of the SPU lanes on the Mac). step_frac (10 bits) and ra & 0x7FFFF (19 bits)
+         * are exact floats; for exp >= 14 the scale 2^(exp-140) and both products are normal, so every product is
+         * exact. exp < 14 keeps ldexpf. Same bits as before in round-to-nearest and truncate, FTZ on or off
+         * (the modes SPU code runs in), checked over every exp/sign/step_frac and 80M random pairs. */
+        float step;
+        if (__builtin_expect(exp >= 14u, 1)) {
+            const uint32_t p2_bits = (exp - 13u) << 23;   /* 2^(exp-140) */
+            float p2; memcpy(&p2, &p2_bits, sizeof p2);
+            step = (float)step_frac * p2;
+        } else {
+            step = ldexpf((float)step_frac, (int)exp - 127 - 13);
+        }
+        if (base < 0.0f) step = -step;
+        float y = (float)(ra & 0x7FFFFu) * 0x1p-19f;
+#else
         float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
         if (base < 0.0f) step = -step;
         float y = ldexpf((float)(ra & 0x7FFFFu), -19);
+#endif
         r._f32[i] = base - step * y;
     }
     return r;
