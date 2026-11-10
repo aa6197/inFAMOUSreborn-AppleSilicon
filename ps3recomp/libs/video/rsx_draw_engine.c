@@ -1472,19 +1472,136 @@ static u32 eng_vtex_mask(void)
     return mask;
 }
 
+/* PROG_MEMO: what the per-draw program scans derive from the program bytes --
+ * the fragment program's size, texture mask and structure hash, the vertex
+ * program's length, input mask and hash -- kept per program address and reused
+ * only while the bytes still equal a stored copy (memcmp). Each of those is a
+ * function of exactly the bytes compared (every scan stops at its END
+ * instruction), so a hit returns what the scan would. iPad profile: the scans
+ * were ~7% of the RSX thread, redone on every draw.
+ * PS3RECOMP_ENGINE_PROG_MEMO=0 turns it off; PS3RECOMP_ENGINE_PROG_VERIFY=1
+ * redoes every scan on a hit and counts differences. RSX thread only. */
+typedef struct {
+    u32 instrs;                 /* 0 = empty */
+    u32 cap;
+    u8* bytes;
+    u32 in_mask;
+    u8  mask_ok, hash_ok;
+    u64 hash;                   /* XXH3 of the program, pipeline-key seed */
+} eng_vp_memo;
+typedef struct {
+    u32 loc, off, size;         /* size 0 = empty */
+    u32 cap;
+    u8* bytes;
+    u32 tex_mask;
+    u8  tex_ok, shash_ok;
+    u64 shash_seed, shash;      /* eng_fp_struct_hash for that seed */
+} eng_fp_memo;
+#define ENG_FP_MEMO 256u
+static eng_vp_memo s_vp_memo[RSX_DSP_VP_INSTR];
+static eng_fp_memo s_fp_memo[ENG_FP_MEMO];
+
+static int eng_prog_memo_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_flag("PS3RECOMP_ENGINE_PROG_MEMO", 1);
+    return on;
+}
+static int eng_prog_verify_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = eng_env_flag("PS3RECOMP_ENGINE_PROG_VERIFY", 0);
+    return on;
+}
+static void eng_prog_verify(const char* what, u64 memo, u64 scan)
+{
+    static u64 checks, bad;
+    checks++;
+    if (memo != scan && bad++ < 16)
+        fprintf(stderr, "[rsx engine] PROG_VERIFY: %s differs (memo 0x%llx, scan 0x%llx)\n",
+                what, (unsigned long long)memo, (unsigned long long)scan);
+    if ((checks % 100000u) == 0)
+        fprintf(stderr, "[rsx engine] PROG_VERIFY: %llu checked, %llu differ\n",
+                (unsigned long long)checks, (unsigned long long)bad);
+}
+static int eng_memo_store(u8** bytes, u32* cap, const u8* src, u32 n)
+{
+    if (*cap < n) {
+        u8* p = (u8*)realloc(*bytes, n);
+        if (!p) return 0;
+        *bytes = p;
+        *cap = n;
+    }
+    memcpy(*bytes, src, n);
+    return 1;
+}
+
+/* The memo entry for the vertex program at slot start, or NULL (memo off, no
+ * END instruction, out of memory): the caller then scans as before. */
+static eng_vp_memo* eng_vp_memo_get(u32 start, const u8* uc)
+{
+    if (!eng_prog_memo_on()) return NULL;
+    const u32 max_bytes = (RSX_DSP_VP_INSTR - start) * 16u;
+    eng_vp_memo* m = &s_vp_memo[start];
+    if (m->instrs && !memcmp(uc, m->bytes, (size_t)m->instrs * 16u)) {
+        if (eng_prog_verify_on())
+            eng_prog_verify("vp length", m->instrs, rsx_vp_program_size_instrs(uc, max_bytes));
+        return m;
+    }
+    m->instrs = 0;
+    m->mask_ok = m->hash_ok = 0;
+    const u32 instrs = rsx_vp_program_size_instrs(uc, max_bytes);
+    if (!instrs || !eng_memo_store(&m->bytes, &m->cap, uc, instrs * 16u)) return NULL;
+    m->instrs = instrs;
+    return m;
+}
+
+/* The same for the fragment program at (loc, off). *io_uc is the program's
+ * first 16 bytes on entry and, on success, the program's full span. */
+static eng_fp_memo* eng_fp_memo_get(u32 loc, u32 off, const u8** io_uc)
+{
+    if (!eng_prog_memo_on()) return NULL;
+    eng_fp_memo* m = &s_fp_memo[((off ^ (loc << 30)) * 2654435761u) >> 24];
+    if (m->size && m->off == off && m->loc == loc) {
+        const u8* p = eng_guest_ptr(NULL, loc, off, m->size);
+        if (p && !memcmp(p, m->bytes, m->size)) {
+            if (eng_prog_verify_on())
+                eng_prog_verify("fp size", m->size,
+                                rsx_fp_program_size(*io_uc, ENG_FP_MAX_BYTES));
+            *io_uc = p;
+            return m;
+        }
+    }
+    m->size = 0;
+    m->tex_ok = m->shash_ok = 0;
+    const u32 size = rsx_fp_program_size(*io_uc, ENG_FP_MAX_BYTES);
+    const u8* p = size ? eng_guest_ptr(NULL, loc, off, size) : NULL;
+    if (!p || !eng_memo_store(&m->bytes, &m->cap, p, size)) return NULL;
+    m->loc = loc;
+    m->off = off;
+    m->size = size;
+    *io_uc = p;
+    return m;
+}
+
 /* Are both of the guest's own programs resident? One answer, used by the
  * layout and by the pipeline, because they must not disagree: the built-in
  * program declares all sixteen inputs, so narrowing the layout for it would
- * leave the pipeline's vertex descriptor short of what the shader reads. */
+ * leave the pipeline's vertex descriptor short of what the shader reads.
+ * out_vm / out_fm get the PROG_MEMO entries (NULL when there is none). */
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
-                              const u8** out_fp, u32* out_fp_size)
+                              const u8** out_fp, u32* out_fp_size,
+                              eng_vp_memo** out_vm, eng_fp_memo** out_fm)
 {
     const u8* vp_uc = NULL;
     u32 vp_instrs = 0;
+    eng_vp_memo* vm = NULL;
+    eng_fp_memo* fm = NULL;
     const u32 start = rsx_dsp_vp_start(&g.rsx);
     if (start < RSX_DSP_VP_INSTR) {
         vp_uc = (const u8*)(g.rsx.vp + start * 4);
-        vp_instrs = rsx_vp_program_size_instrs(
+        vm = eng_vp_memo_get(start, vp_uc);
+        vp_instrs = vm ? vm->instrs : rsx_vp_program_size_instrs(
             vp_uc, (RSX_DSP_VP_INSTR - start) * 16u);
     }
 
@@ -1497,16 +1614,36 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         u32 fp_loc = 0;
         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
         fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
-        fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
-        if (!fp_uc) fp_size = 0;
+        fm = fp_uc ? eng_fp_memo_get(fp_loc, fp_off, &fp_uc) : NULL;
+        if (fm) {
+            fp_size = fm->size;
+        } else {
+            fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
+            if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+            if (!fp_uc) fp_size = 0;
+        }
     }
 
     if (out_vp) *out_vp = vp_uc;
     if (out_vp_instrs) *out_vp_instrs = vp_instrs;
     if (out_fp) *out_fp = fp_uc;
     if (out_fp_size) *out_fp_size = fp_size;
+    if (out_vm) *out_vm = vm;
+    if (out_fm) *out_fm = fm;
     return vp_instrs && fp_size;
+}
+
+/* rsx_fp_texture_mask through the memo. */
+static u32 eng_fp_tex_mask(eng_fp_memo* fm, const u8* uc, u32 size)
+{
+    if (fm && fm->tex_ok && !eng_prog_verify_on()) return fm->tex_mask;
+    const u32 mask = rsx_fp_texture_mask(uc, size);
+    if (fm) {
+        if (fm->tex_ok) eng_prog_verify("fp textures", fm->tex_mask, mask);
+        fm->tex_mask = mask;
+        fm->tex_ok = 1;
+    }
+    return mask;
 }
 
 /* The layout the active vertex program actually reads. An uncertain analysis
@@ -1516,11 +1653,21 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     u32 mask = 0xFFFFu;
     const u8* uc = NULL;
     u32 instrs = 0;
-    if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
-        rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
-        if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
-            analysis.exact && analysis.input_mask)
-            mask = analysis.input_mask;
+    eng_vp_memo* vm = NULL;
+    if (eng_guest_programs(&uc, &instrs, NULL, NULL, &vm, NULL)) {
+        if (vm && vm->mask_ok && !eng_prog_verify_on()) {
+            mask = vm->in_mask;
+        } else {
+            rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
+            if (rsx_vp_analyze_inputs(uc, instrs * 16u, &analysis) == (int)instrs &&
+                analysis.exact && analysis.input_mask)
+                mask = analysis.input_mask;
+            if (vm) {
+                if (vm->mask_ok) eng_prog_verify("vp inputs", vm->in_mask, mask);
+                vm->in_mask = mask;
+                vm->mask_ok = 1;
+            }
+        }
     }
     rsx_vertex_layout_plan_init(layout, mask);
 }
@@ -1626,22 +1773,24 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u8* vp_uc = NULL;
     const u8* fp_uc = NULL;
     u32 vp_instrs = 0, fp_size = 0;
+    eng_vp_memo* vm = NULL;
+    eng_fp_memo* fm = NULL;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
-    const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size, &vm, &fm);
 
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     /* Only units the program samples: a stale depth binding on an unused
      * unit must not make a second pipeline. */
     u32 shkey = 0;
     if (!fixed && g.shkey) {
-        const u32 used = rsx_fp_texture_mask(fp_uc, fp_size);
+        const u32 used = eng_fp_tex_mask(fm, fp_uc, fp_size);
         for (u32 u = 0; u < 4; u++)
             if (((g.shkey >> u) & 1u) && ((used >> u) & 1u))
                 shkey |= (1u << u) | (g.shkey & (7u << (4 + 3 * u)));
     }
     u32 texk = 0;
     if (!fixed && g.texk) {
-        const u32 used = rsx_fp_texture_mask(fp_uc, fp_size);
+        const u32 used = eng_fp_tex_mask(fm, fp_uc, fp_size);
         for (u32 u = 0; u < 8; u++)
             if ((used >> u) & 1u) texk |= g.texk & (3u << (2 * u));
     }
@@ -1669,8 +1818,32 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     } else {
         /* XXH3 over the program words, seeded with the running key: the
          * byte-wise FNV here was ~3% of the RSX thread. */
-        key = XXH3_64bits_withSeed(vp_uc, (size_t)vp_instrs * 16u, key);
-        key = eng_fp_struct_hash(fp_uc, fp_size, key);
+        /* Both through PROG_MEMO: the vertex hash always starts from the
+         * same seed, the fragment one is kept for the seed it was made with. */
+        if (vm && vm->hash_ok && !eng_prog_verify_on()) {
+            key = vm->hash;
+        } else {
+            const u64 h = XXH3_64bits_withSeed(vp_uc, (size_t)vp_instrs * 16u, key);
+            if (vm) {
+                if (vm->hash_ok) eng_prog_verify("vp hash", vm->hash, h);
+                vm->hash = h;
+                vm->hash_ok = 1;
+            }
+            key = h;
+        }
+        if (fm && fm->shash_ok && fm->shash_seed == key && !eng_prog_verify_on()) {
+            key = fm->shash;
+        } else {
+            const u64 h = eng_fp_struct_hash(fp_uc, fp_size, key);
+            if (fm) {
+                if (fm->shash_ok && fm->shash_seed == key)
+                    eng_prog_verify("fp hash", fm->shash, h);
+                fm->shash_seed = key;
+                fm->shash = h;
+                fm->shash_ok = 1;
+            }
+            key = h;
+        }
         if (!key) return 0;
         kw[0] = fp_ctrl & 0x40u;
         kw[1] = cube_mask;
