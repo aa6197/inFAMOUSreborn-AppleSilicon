@@ -274,7 +274,14 @@ set(PORT_PPU_VR_LIST "${CMAKE_CURRENT_SOURCE_DIR}/tools/v241B_vr_hot.txt" CACHE 
 # that PS3_AB parity / default lean). ALL = v245 production form: rewrite each listed function in place, retaining its
 # original symbol/PGO profile and removing the old twin plus per-call dispatcher. ALL requires the standard fast memory
 # model and fails closed before guest execution if diagnostics or incompatible limits disable it. OFF = no TU changes.
-set(PORT_PPU_MEMLEAN "OFF" CACHE STRING "Lifted PPU lean guest accessors (v243A/v245): OFF, AB or ALL")
+# Apple port: default ALL (the form the Windows installer builds). Mac lean mode, static scene: +8% flips/s
+# over the inline accessors alone (ABAB); iPad gameplay: no change. Other platforms keep OFF.
+if(APPLE AND PORT_PPU_REGCACHE)
+    set(_ppu_memlean_default "ALL")
+else()
+    set(_ppu_memlean_default "OFF")
+endif()
+set(PORT_PPU_MEMLEAN "${_ppu_memlean_default}" CACHE STRING "Lifted PPU lean guest accessors (v243A/v245): OFF, AB or ALL")
 set_property(CACHE PORT_PPU_MEMLEAN PROPERTY STRINGS OFF AB ALL)
 set(PORT_PPU_MEMLEAN_LIST "${CMAKE_CURRENT_SOURCE_DIR}/tools/v243A_mem_hot.txt" CACHE FILEPATH "Function list for PORT_PPU_MEMLEAN=AB/ALL (v243A/v245)")
 if(PORT_PPU_REGCACHE)
