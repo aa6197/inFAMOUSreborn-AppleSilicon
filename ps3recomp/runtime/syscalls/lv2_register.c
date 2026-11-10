@@ -696,6 +696,9 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#if defined(__APPLE__)
+    { char nm[32]; snprintf(nm, sizeof nm, "spu thread %u", (unsigned)t->tid); pthread_setname_np(nm); }   /* Instruments, IOS_CPU_LOG_SECS */
+#endif
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -735,6 +738,9 @@ static void* spu_fallback_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#if defined(__APPLE__)
+    { char nm[32]; snprintf(nm, sizeof nm, "spu thread %u", (unsigned)t->tid); pthread_setname_np(nm); }   /* Instruments, IOS_CPU_LOG_SECS */
+#endif
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);

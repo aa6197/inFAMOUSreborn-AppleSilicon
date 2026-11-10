@@ -120,6 +120,12 @@ static void* ppu_host_thread_proc(void* param)
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
 
+#if defined(__APPLE__)
+    /* Apple: name the host thread after the guest thread, so Instruments and the
+     * iOS per-thread CPU log (IOS_CPU_LOG_SECS) show which guest thread is busy. */
+    { char nm[64]; snprintf(nm, sizeof nm, "ppu %s", info->name); pthread_setname_np(nm); }
+#endif
+
 #ifdef _WIN32
     /* v183 AUDIO_THREAD_PCORE (default 1; 0 = off): keep the sound pipeline's PPU threads (brbDriver/brbClient =
      * the SPU mixer's driver, snd_stream_service_thread, Bink Audio) on the performance cores. They sleep ~97% of
