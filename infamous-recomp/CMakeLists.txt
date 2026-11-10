@@ -692,6 +692,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     # Only main.cpp changes under PORT_IOS: a target-wide define would also
     # change the compile command of every lifted TU.
     set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS PORT_IOS=1)
+    # Built for A14 or newer: ios_shell.mm checks the chip at start and shows
+    # "too old" instead of crashing on an older one.
+    if(PORT_IOS_CPU MATCHES "^apple-(a1[4-9]|m[0-9])")
+        set_property(SOURCE ios/ios_shell.mm APPEND PROPERTY COMPILE_DEFINITIONS PORT_IOS_CPU_CHECK=1)
+    endif()
 
     set_target_properties(${PROJECT_NAME} PROPERTIES
         MACOSX_BUNDLE TRUE

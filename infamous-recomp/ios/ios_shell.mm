@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <string>
@@ -52,6 +53,86 @@ extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
 extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
 extern "C" void port_ios_import_show(void* uiwindow, const char* dest_root, void (^done)(void));   /* ios_import.mm */
 extern "C" int  di_installed(const char* dest_root, char* elf_out, size_t elf_out_len);              /* import/disc_import.c */
+
+/* CPU check. The iOS build uses -mcpu=apple-a14 (CMakeLists.txt, PORT_IOS_CPU),
+ * so its code may use FRINT32/64 (FEAT_FRINTTS) and AXFLAG/XAFLAG (FEAT_FlagM2).
+ * A13 and older lack both and would crash on the first one. iOS 16 still runs
+ * on those chips and Info.plist can't ask for an A14, so check here and show a
+ * message instead. INFAMOUS_CPU_TEST=old (testing) fakes an old chip. */
+static bool cpu_supported(void)
+{
+#if defined(PORT_IOS_CPU_CHECK)
+    if (const char* t = getenv("INFAMOUS_CPU_TEST"); t && !strcmp(t, "old")) {
+        fprintf(stderr, "[ios] cpu: INFAMOUS_CPU_TEST=old\n");
+        return false;
+    }
+    static const char* const need[] = { "hw.optional.arm.FEAT_FRINTTS", "hw.optional.arm.FEAT_FlagM2" };
+    for (const char* n : need) {
+        int v = 0;
+        size_t len = sizeof v;
+        if (sysctlbyname(n, &v, &len, NULL, 0) != 0) {
+            fprintf(stderr, "[ios] cpu: no %s, not checked\n", n);   /* don't block on an unknown */
+            continue;
+        }
+        if (!v) {
+            fprintf(stderr, "[ios] cpu: %s = 0: chip older than A14\n", n);
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
+@interface PortTooOldController : UIViewController
+@end
+
+@implementation PortTooOldController
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    UILabel* title = [UILabel new];
+    title.font = [UIFont systemFontOfSize:34 weight:UIFontWeightBold];
+    title.textColor = UIColor.whiteColor;
+    title.text = @"inFamous";
+    UILabel* body = [UILabel new];
+    body.font = [UIFont systemFontOfSize:19 weight:UIFontWeightRegular];
+    body.textColor = [UIColor colorWithWhite:0.85 alpha:1];
+    body.numberOfLines = 0;
+    body.textAlignment = NSTextAlignmentCenter;
+    body.text = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad
+        ? @"Sorry, this iPad is too old to run the game.\n\n"
+           "It needs an A14 or M1 chip or newer: iPad Air (4th generation), "
+           "iPad (10th generation), iPad mini (6th generation), iPad Pro with M1, or newer."
+        : @"Sorry, this iPhone is too old to run the game.\n\n"
+           "It needs an iPhone 12 or newer.";
+    UIStackView* st = [[UIStackView alloc] initWithArrangedSubviews:@[ title, body ]];
+    st.axis = UILayoutConstraintAxisVertical;
+    st.alignment = UIStackViewAlignmentCenter;
+    st.spacing = 22;
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:st];
+    UILayoutGuide* g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [st.centerXAnchor constraintEqualToAnchor:g.centerXAnchor],
+        [st.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+        [st.widthAnchor constraintLessThanOrEqualToConstant:620],
+        [st.leadingAnchor constraintGreaterThanOrEqualToAnchor:g.leadingAnchor constant:24],
+        [st.trailingAnchor constraintLessThanOrEqualToAnchor:g.trailingAnchor constant:-24],
+        [body.widthAnchor constraintEqualToAnchor:st.widthAnchor],
+    ]];
+}
+@end
+
+static void show_too_old(UIWindow* win)
+{
+    PortTooOldController* c = [PortTooOldController new];
+    c.modalPresentationStyle = UIModalPresentationFullScreen;
+    UIViewController* root = win.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    [root presentViewController:c animated:NO completion:nil];
+}
 
 static void update_touch_pad(void)
 {
@@ -328,7 +409,8 @@ int main(int argc, char* argv[])
         }
         void* uiwin = win ? SDL_GetPointerProperty(SDL_GetWindowProperties(win),
                                                    SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL) : NULL;
-        if (uiwin) {
+        const bool cpu_ok = cpu_supported();
+        if (uiwin && cpu_ok) {
             port_touch_pad_attach(uiwin);
             update_touch_pad();
             s_uiwin = (__bridge UIWindow*)uiwin;
@@ -347,7 +429,13 @@ int main(int argc, char* argv[])
         s_game_argv = argv;
         /* No game path given (a normal launch) and no finished import in
          * Documents: ask for the player's copy first (ios_import.mm). */
-        if (argc < 2 && !di_installed(data.fileSystemRepresentation, NULL, 0) && uiwin) {
+        if (!cpu_ok) {
+            fprintf(stderr, "[ios] this device is too old (needs A14 / M1 or newer): not starting the game\n");
+            if (uiwin) {
+                UIWindow* w = (__bridge UIWindow*)uiwin;
+                dispatch_async(dispatch_get_main_queue(), ^{ show_too_old(w); });
+            }
+        } else if (argc < 2 && !di_installed(data.fileSystemRepresentation, NULL, 0) && uiwin) {
             fprintf(stderr, "[ios] no game in %s: showing the import screen\n", data.fileSystemRepresentation);
             std::string dest = data.fileSystemRepresentation;
             dispatch_async(dispatch_get_main_queue(), ^{
