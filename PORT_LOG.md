@@ -201,8 +201,8 @@ tools, no RPCS3, no terminal.
 | release bundles | no game files; Mac exe links system libs only, minos 13.0 |
 | Mac release zip remade 12:43 with keyboard + mouse, game already imported | "keyboard + mouse on", window open, ran 3 h 23 min (see note), no crash, audio median real time (187.5 blocks/s) |
 
-- Release files remade 2026-11-09 12:43 (after the keyboard + mouse
-  commits): mac.zip sha256 c22d60f5…, ipa 45b07ee1….
+- Release files remade 2026-11-10 12:54 (keyboard + mouse, CPU check):
+  mac.zip sha256 67b52ac3…, ipa 9fa57dc9….
 - Note: that last run used `timeout 150` without `-k`. The port ignores
   SIGTERM, so it ran until killed at 16:09. Always use `timeout -k 10`.
 
