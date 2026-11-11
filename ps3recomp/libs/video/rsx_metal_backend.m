@@ -4068,19 +4068,31 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
         }
         if (zbuf) {
             const int clear_here = have_clear_ds && depth == cd;
+            const int cl_d = clear_here && (ds_flags & RSX_BE_CLEAR_DEPTH);
+            const int cl_s = clear_here && (ds_flags & RSX_BE_CLEAR_STENCIL);
+            /* PS3RECOMP_METAL_ZFB_CLEAR (default 1; 0 = load and store it):
+             * a pass with no guest zeta borrows the shared buffer. D3D12
+             * clears that buffer (1.0 / 0) on every target switch and never
+             * reads it back, so do the same here: clear on load, discard on
+             * store. On a tile GPU that saves a full depth load + store per
+             * such pass. */
+            static int s_zfb_clear = -1;
+            if (s_zfb_clear < 0) {
+                const char* e = getenv("PS3RECOMP_METAL_ZFB_CLEAR");
+                s_zfb_clear = !(e && *e == '0');
+                fprintf(stderr, "[rsx metal] passes without a zeta: shared depth %s (PS3RECOMP_METAL_ZFB_CLEAR)\n",
+                        s_zfb_clear ? "cleared, not stored (as D3D12)" : "loaded and stored");
+            }
+            const int zfb_tmp = s_zfb_clear && zbuf == zfb;
             if (zbuf == zfb && s_gpu_stats == 1) atomic_fetch_add(&s_gs_zfb, 1);
             rp.depthAttachment.texture       = zbuf;
-            rp.depthAttachment.storeAction   = MTLStoreActionStore;
-            rp.depthAttachment.loadAction    =
-                (clear_here && (ds_flags & RSX_BE_CLEAR_DEPTH))
-                    ? MTLLoadActionClear : MTLLoadActionLoad;
-            rp.depthAttachment.clearDepth    = (double)cdepth;
+            rp.depthAttachment.storeAction   = zfb_tmp ? MTLStoreActionDontCare : MTLStoreActionStore;
+            rp.depthAttachment.loadAction    = (cl_d || zfb_tmp) ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.depthAttachment.clearDepth    = cl_d ? (double)cdepth : 1.0;
             rp.stencilAttachment.texture     = zbuf;
-            rp.stencilAttachment.storeAction = MTLStoreActionStore;
-            rp.stencilAttachment.loadAction  =
-                (clear_here && (ds_flags & RSX_BE_CLEAR_STENCIL))
-                    ? MTLLoadActionClear : MTLLoadActionLoad;
-            rp.stencilAttachment.clearStencil = cstencil;
+            rp.stencilAttachment.storeAction = zfb_tmp ? MTLStoreActionDontCare : MTLStoreActionStore;
+            rp.stencilAttachment.loadAction  = (cl_s || zfb_tmp) ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.stencilAttachment.clearStencil = cl_s ? cstencil : 0;
         }
         if (!attach) {
             rp.renderTargetWidth  = [zbuf width];
