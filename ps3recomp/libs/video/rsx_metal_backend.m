@@ -3657,8 +3657,22 @@ static void eng_enc_state_reset(EngEncState* st)
     st->cull = st->wind = -1;
 }
 
-static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
-                            id<MTLBuffer> stage, EngEncState* st)
+/* eng_obj_enc without ARC traffic, for eng_encode_draw. */
+static inline const void* eng_obj_enc_raw(u32 handle)
+{
+    if (!handle || handle > __atomic_load_n(&s_eng_obj_count, __ATOMIC_RELAXED)) return NULL;
+    s_eng_obj_use[handle - 1] = s_eng_enc_serial;
+    return (__bridge const void*)s_eng_obj[handle - 1];
+}
+
+/* Every object here is unretained: the object, sampler and pipeline tables
+ * and the caller own them for the whole encode, and the encoder retains what
+ * it is given. Strong locals cost a retain and a release per texture and
+ * sampler slot per draw -- ~80 atomic calls a draw, ~5-7% of the iPad RSX
+ * thread -- even when the state filter then sets nothing. */
+static void eng_encode_draw(__unsafe_unretained id<MTLRenderCommandEncoder> enc,
+                            const EngRecord* r,
+                            __unsafe_unretained id<MTLBuffer> stage, EngEncState* st)
 {
     if (!r->pipeline || r->pipeline > __atomic_load_n(&s_eng_pipe_count, __ATOMIC_RELAXED)) return;
     const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
@@ -3689,7 +3703,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     }
     /* One staging buffer per encoder: bind it once, then move the offset.
      * Memo hits read the memo's own buffer instead. */
-    id<MTLBuffer> vbuf = r->arena ? s_eng_arena : stage;
+    __unsafe_unretained id<MTLBuffer> vbuf = r->arena ? s_eng_arena : stage;
     const void* vbp = (__bridge const void*)vbuf;
     if (!st->vb_set || st->vb_buf != vbp) {
         [enc setVertexBuffer:vbuf offset:r->vb_off atIndex:MTL_VB_INDEX];
@@ -3717,28 +3731,28 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
         }
     }
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj_enc(r->tex[u]);
-        if (!t) t = s_null_tex;
-        const void* tp = (__bridge const void*)t;
+        const void* tp = eng_obj_enc_raw(r->tex[u]);
+        if (!tp) tp = (__bridge const void*)s_null_tex;
         if (st->ftex[u] != tp) {
-            [enc setFragmentTexture:t atIndex:(NSUInteger)u]; st->ftex[u] = tp;
+            [enc setFragmentTexture:(__bridge id<MTLTexture>)tp atIndex:(NSUInteger)u];
+            st->ftex[u] = tp;
         }
-        id<MTLSamplerState> sm = r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
-                                                 : s_default_sampler;
+        __unsafe_unretained id<MTLSamplerState> sm =
+            r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp : s_default_sampler;
         const void* sp = (__bridge const void*)sm;
         if (st->fsamp[u] != sp) {
             [enc setFragmentSamplerState:sm atIndex:(NSUInteger)u]; st->fsamp[u] = sp;
         }
     }
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
-        id<MTLTexture> t = eng_obj_enc(r->vtex[u]);
-        if (!t) t = s_null_tex;
-        const void* tp = (__bridge const void*)t;
+        const void* tp = eng_obj_enc_raw(r->vtex[u]);
+        if (!tp) tp = (__bridge const void*)s_null_tex;
         if (st->vtex[u] != tp) {
-            [enc setVertexTexture:t atIndex:MTL_VTEX_INDEX(u)]; st->vtex[u] = tp;
+            [enc setVertexTexture:(__bridge id<MTLTexture>)tp atIndex:MTL_VTEX_INDEX(u)];
+            st->vtex[u] = tp;
         }
-        id<MTLSamplerState> sm = r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp
-                                                  : s_default_sampler;
+        __unsafe_unretained id<MTLSamplerState> sm =
+            r->vsamp[u] >= 0 ? s_eng_samp[r->vsamp[u]].samp : s_default_sampler;
         const void* sp = (__bridge const void*)sm;
         if (st->vsamp[u] != sp) {
             [enc setVertexSamplerState:sm atIndex:MTL_VSAMP_INDEX(u)]; st->vsamp[u] = sp;
