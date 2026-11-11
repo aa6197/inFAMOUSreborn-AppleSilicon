@@ -90,6 +90,8 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 20 | 11-11 | Round 7: geometry prefetch hints (not kept) | 54.9 / 53.0 | 53.1 / 53.1 | -1.6% | RSX thread 96% -> 94% busy, no gain. iPad warmer this round (P 1.86 -> 1.81 GHz). |
 | 21 | 11-11 | Round 8: where the frame waits (diagnostic) | 55.6 (encode off) | 54.5 (encode on) |  | One run each. Game thread spends 25-30% in a wait loop, mostly on SPU jobs. |
 | 22 | 11-11 | Round 9: SPU threads on slow cores (not kept) | 55.7 / 55.2 | 52.8 / 51.3 | -6.1% | Fast cores freed (272% -> 151%, 1.89 -> 2.34 GHz) but SPU work got slower. |
+| 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
+| 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 
 ---
 
@@ -264,6 +266,40 @@ Round 9 (screen, one run each): SPURS kernel threads to utility QoS.
 - Next (round 10): MetalFX off, plus free P-core time without slowing the main SPU
   work: audio kernel only to E cores, shorter audio spin, and
   parking job waits sooner.
+
+Round 10 (screen, one run each except A and M):
+
+| run | flips/s | GPU busy |
+|---|---|---|
+| A default | 53.8 / 52.2 | 101% / 97% |
+| M `METALFX=0` | 54.9 / 54.8 | 82% |
+| B `SPURS_KERN1_QOS=ut` (audio to E) | 53.8 | 100% |
+| C `V242A_AUDSPIN=1` (audio spins 50 us) | 52.3 | |
+| D `PS3_SHORT_SLEEP_PARK=50:20` | 52.3 | |
+
+- MetalFX costs ~1.5 ms of GPU per frame and ~3.5% speed. It is
+  already a switch; the default stays on until the user picks.
+- Audio and job-wait changes: no gain.
+- The RSX thread is still 93–97% busy. The GPU sum is near 100%,
+  but buffers can overlap, so the real GPU load is not known yet.
+- New: `PS3RECOMP_METAL_ZFB_CLEAR` (default 1). Passes with no guest
+  zeta clear the shared depth instead of load + store, as D3D12 does.
+  Same picture on the Mac. Only ~2% of passes, so a small effect.
+
+Round 11 (ABBA, `PS3RECOMP_METAL_GPU_STATS=1`, MetalFX on):
+
+| run | flips/s | GPU busy |
+|---|---|---|
+| A1 `ZFB_CLEAR=0` | 51.9 | 99% |
+| B1 `ZFB_CLEAR=1` | 52.2 | 98% |
+| B2 `ZFB_CLEAR=1` | 51.7 | |
+| A2 `ZFB_CLEAR=0` | 49.5 | |
+
+- +2.5% on average, but the pairs say +0.6% and +4.4%.
+  A2 looks like a slow outlier. Call it noise.
+- Kept (default on): same as D3D12, same picture, not slower.
+- All four runs are 2-3 flips/s under round 10. The GPU stats
+  add some cost; the iPad may also have been warmer.
 
 ### Notes
 
