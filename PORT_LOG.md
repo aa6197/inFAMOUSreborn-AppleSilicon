@@ -19,7 +19,9 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed: **~40 flips/s hot, ~43 warm** in gameplay (hot ABBA,
+- iPad speed now (11-11, round 4): **48.3 / 49.1 flips/s** with the hop gate
+  and SPU vectors in registers. Full list: "### iPad speed history" below.
+  Older note: ~40 flips/s hot, ~43 warm in gameplay (hot ABBA,
   11-11). Was 27–28 hot on 11-10 and 20–21 on 11-09. Gains: short
   sleeps, NEON SPU helpers, RSX thread cuts. The iPad slows as it warms
   up (P cores ~1.8 GHz hot); only trust ABBA runs in the hot state. See
@@ -55,6 +57,127 @@ Read this first every session. Newest entry on top.
   - Decrypted image: no .dkey. EBOOT.BIN is a retail SELF; RPCS3 decrypts it.
 - Generated sources are in place in the repo (git-ignored). Don't regenerate
   unless needed; `install ... --no-build -y` re-checks them.
+
+
+### iPad speed history
+
+Flips/s on the iPad Pro (M4), same 330 s test, two runs per side,
+mirrored order. The iPad slows as it heats, so compare before vs
+after inside one row only. Data: `$WORK_DIR/perf/ipad_speed.csv`.
+Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
+
+| # | Date | Change | Before | After | Gain | Notes |
+|---|---|---|---|---|---|---|
+| 1 | 11-08 | First iPad run |  | 14.6–15 |  |  |
+| 2 | 11-08 | RSX thread at UI QoS |  | 15.5–15.8 |  |  |
+| 3 | 11-08 | RSX trims (geo memo, const blocks, pipeline key, tex span) | 16.2–16.6 | 20.2 / 21.5 | +27.1% |  |
+| 4 | 11-10 | Short sleeps yield |  | 27.9 / 26.3 |  | nanosleep mode was 24.0 |
+| 5 | 11-10 | PGO (profile-guided build) | 27.3 / 27.0 | 30.8 / 29.9 | +11.8% |  |
+| 6 | 11-10 | Program memo | 26.5 / 26.4 | 27.6 / 28.3 | +5.7% |  |
+| 7 | 11-10 | Partial vertex constants | 25.8 / 26.5 | 27.7 / 28.0 | +6.5% |  |
+| 8 | 11-10 | Inline loads/stores |  |  | +5.0% | +5%, run numbers not kept |
+| 9 | 11-11 | NEON SPU helpers | 32.1 / 28.6 | 38.4 / 37.3 | +24.7% | the big one |
+| 10 | 11-11 | RSX thread cuts | 38.1 / 37.0 | 40.6 / 40.4 | +7.9% | cool iPad hit 43.5 |
+| 11 | 11-11 | PGO v4 (retrained) |  |  | 0.0% | no gain |
+| 12 | 11-11 | Parallel hashes (TEXCS + GEOCS) |  | 41–42 |  | hot iPad |
+| 13 | 11-11 | Thread-local block | 50.9 / 51.2 | 51.3 / 50.9 | +0.1% | same speed; cooler iPad |
+| 14 | 11-11 | Park long waits | 49.3 / 51.5 | 51.0 / 50.3 | +0.5% | same speed, 3–5% less CPU |
+| 15 | 11-11 | Round 2: stack guard off + mfc, lpgate, lane QoS 0 |  | 51.1 / 45.9 | 0.0% | all neutral; serial mode 35.3 / 33.4 (bad) |
+| 16 | 11-11 | Round 3: hop gate | 43.6 / 43.5 | 46.3 / 46.6 | +6.7% | SPU PGO worth ~5.5% on top |
+| 17 | 11-11 | Round 4: SPU vectors in registers | 47.4 / 46.9 | 48.3 / 49.1 | +3.3% | Mac same: 79.3 / 79.6 |
+
+---
+
+## 2026-11-11 — iPad speed: hop gate, SPU vectors in registers
+
+All iPad numbers: `ios_ab.sh`-style 330 s gameplay runs, flips/s
+150–250 s, mirrored order (ABBA / ABCCBA). The iPad heats during a
+round, so the second half reads lower. Compare inside a round only.
+
+### Commits
+
+- 13c9205 `-fno-stack-protector` for the runtime on Apple (`PORT_NO_GS`).
+- 7c5883b `mfc_for` cache: one thread-local block on Apple (one
+  `_tlv_get_addr` call instead of two).
+- 107e5fd CMake knobs for the lifted SPU sources (Apple only):
+  `PORT_SPU_PGO=OFF` builds them without the PGO profile,
+  `PORT_SPU_EXTRA_OPTS` adds flags to them only.
+- daebe90 **hop gate**: the SPU hop path tested 3–4 globals per hop.
+  Now one word, `g_spu_hop_gate` (bit 0 = XFER slow path, bit 1 =
+  ibf off), rebuilt by `spu_hop_gate_sync()` after each writer.
+  `-DSPU_NO_HOP_GATE` = old tests.
+
+### Results
+
+Round 2 (ABCDDCBA):
+
+| Build | Run 1 | Run 2 |
+|---|---|---|
+| lpgate (laneprof test gated) | 50.1 | 46.8 |
+| nsp + mfc | 51.1 | 45.9 |
+| nsp + mfc, `SPURS_LANE_QOS=0` | 50.4 | 47.3 |
+| `V242A_SERIAL=1` | 35.3 | 33.4 |
+
+- All neutral except serial (bad: ~330–350% CPU, clocks go up but
+  fps goes down). lpgate not committed.
+
+Round 3 (ABCCBA):
+
+| Build | Run 1 | Run 2 |
+|---|---|---|
+| nsp + mfc, PGO everywhere | 47.5 | 44.4 |
+| hop gate, SPU without PGO | 46.3 | 46.6 |
+| old hop tests, SPU without PGO | 43.6 | 43.5 |
+
+- Hop gate **+6.7%** (same PGO setup on both sides).
+- SPU PGO is worth ~5.5% (row 1 vs row 3). The profile is stale
+  once SPU macros change, so retrain it after each SPU change.
+- Mac round 3 is not usable: load went 8 → 22 (Photos, media
+  analysis, storage scans).
+
+### Root cause: u128 in GPRs on arm64
+
+- AAPCS64 passes and returns the 16-byte `u128` union as two
+  64-bit GPRs (`[2 x i64]`), not as a vector register.
+- SROA then splits `u128` locals into GPR halves. Every helper call
+  moves data q → x → q (`fmov`, `mov.d`).
+- Fix, opt-in: `-DSPU_U128_VECARGS` (Apple arm64 + clang only).
+  Helper names become statement-expression macros. They `memcpy`
+  `u128` ↔ vector in the caller, around vector-typed bodies
+  (`spu__w_*`). Bodies are unchanged; x86 never sees it.
+- Bit-exact: new `tests/test_spu_vecargs.c`, 24.37M checks
+  (every immediate, every shift count per lane, LS read/write),
+  0 differ, with and without the flag.
+- Hot SPU file (`jobmod_50f371dc382d_e3D90`), asm counts:
+
+| | off | on |
+|---|---|---|
+| `fmov x,d` | 360 | 29 |
+| `mov.d` | 205 | 36 |
+| GPR spills (ldr / str) | 889 / 460 | 622 / 389 |
+| vector spills | 987 | 1029 |
+| instructions | 34400 | 32854 (−4.5%) |
+
+- The remaining vector spills are real register pressure: hot SPU
+  loops keep 50+ values live; arm64 has 32 q registers.
+
+Round 4 (ABBA, SPU without PGO on both):
+
+| | hop gate | + vecargs |
+|---|---|---|
+| iPad flips/s | 47.4 / 46.9 | **48.3 / 49.1** (+3.3%) |
+| iPad RSX thread busy | 87% | 90–93% |
+| Mac flips/s (load 12–16) | 74.9 / 79.2 | 79.3 / 79.6 (same) |
+
+- ef0540f header + test, f5055f0 `PORT_SPU_VECARGS` (CMake, Apple,
+  default ON). x86 / Windows preprocessed output unchanged.
+- The RSX thread is close to the limit again on the iPad.
+
+### Notes
+
+- `test_spu_helpers_v130_neon` with `-ffp-contract=off` shows 203,829
+  diffs with the old header too. Pre-existing, not from this work.
+  (The lifted SPU sources use clang's default contract by design.)
 
 ---
 
