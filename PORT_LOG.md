@@ -19,16 +19,18 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed: **20.2–21.5 flips/s** in gameplay (21:28–21:40), was
-  16.2–16.6 before the RSX-thread trim and 14.6 before the QoS changes.
-  Cuts: memo, constant blocks, in-place memo hits, one-pass pipeline
-  key, texture span/mask reuse (entry "RSX thread trim"). The iPad
-  sometimes runs the RSX thread on E cores only (~11 flips/s); check the
-  profile's P/E split. It also drifts slow over a session (22:57–23:22:
-  21.8 → 14.5 over four runs, both builds), so only trust
-  back-to-back profile pairs or ABBA runs.
-- Next speed work: the texture check (no exact cut found yet), the
-  geometry hash (XXH3) and `sink_end` on the RSX thread.
+- iPad speed: **~40 flips/s hot, ~43 warm** in gameplay (hot ABBA,
+  11-11). Was 27–28 hot on 11-10 and 20–21 on 11-09. Gains: short
+  sleeps, NEON SPU helpers, RSX thread cuts. The iPad slows as it warms
+  up (P cores ~1.8 GHz hot); only trust ABBA runs in the hot state. See
+  entry "iPad speed: short sleeps, NEON, RSX cuts".
+- The RSX thread is now the limit on the iPad (98–99% busy).
+- PGO on Apple: profile `$WORK_DIR/pgo/apple-v4.profdata` (not in git).
+  Mac +3%, iPad no gain. Build dirs `build-mac-pgo`, `build-ios-pgo`
+  (installed on the iPad).
+- Next speed work (iPad RSX thread, profile 11-11): texture checksum
+  (15.5%), `sink_end` (12.7%, spread out), XXH3 geometry hash (10.1%),
+  FIFO walk (8%).
 - **Mac keyboard + mouse (new):** same keys as Windows (WASD, mouse look,
   Space, Esc pause). See entry "Mac keyboard + mouse controls".
 - Still needs the user: real taps on the touch pad, a real controller,
@@ -48,6 +50,177 @@ Read this first every session. Newest entry on top.
   unless needed; `install ... --no-build -y` re-checks them.
 
 ---
+
+## 2026-11-11 — iPad speed: short sleeps, NEON, RSX cuts
+
+### Why
+
+- The user's M1 Max and even a plain M1 MacBook beat the M4 iPad Pro.
+
+### Found
+
+- **Fire and effects** were the GPU cost. The Metal engine ignored
+  `FEEDBACK_RUN` (D3D12 honours it). Fixed in 76ff9e4.
+- After that the iPad is **CPU-bound**, not GPU-bound.
+- **Short sleeps.** The guest main thread polls its job counters with
+  `sys_timer_usleep(5)` (lr 0x00116824, ~30k/s) and `usleep(1)`
+  (lr 0x000F2A74). On POSIX each was a `nanosleep`: kernel timer, two
+  context switches, late wake-up. On the iPad that was ~6.4 s of 20 s
+  main-thread CPU, inside the kernel.
+- Windows never sleeps for these: under 1 ms it waits on the clock
+  (QPC + `SwitchToThread` with `PS3_SHORT_SLEEP_SPIN=0`, the launch
+  default; PAUSE spin up to 50 µs otherwise).
+
+### Changed
+
+- `sys_timer.c` (Apple): same split as Windows. Under 1 ms:
+  `PS3_SHORT_SLEEP_SPIN=0` → `sched_yield` until the deadline;
+  unset or 1 → `isb` spin up to 50 µs. `PS3_SHORT_SLEEP_NANO=1` brings
+  back `nanosleep`. Logs one `[timer]` line at start.
+- One rule for macOS and iOS, as on Windows (commit 20db509).
+- Other commits this round:
+  - c5f49a2 inline guest loads/stores in lifted PPU code (Apple).
+  - 0f933df `PORT_PPU_MEMLEAN` = ALL on Apple.
+  - 2da9260 `PORT_PGO=GEN` / `USE` on Apple.
+  - bde4597 `spu_fi` on arm64 without libm `ldexpf`.
+  - 4c0e3a2, c206170 name the PPU, SPU, RSX and SPURS host threads.
+  - fc95af9 iOS CPU diagnostics (core split, clock probe, stress test).
+  - 2b4e98c `SPURS_KERN_QOS` test switch, 4e32db2 Metal opt-ins.
+  - 51adbeb iOS app marked as a game (Game Mode).
+  - 11a016d cellPad: touch-pad hook links in builds without SDL3.
+  - b260727 program memo, 9070eba partial vertex constants.
+  - 6f9c267 Apple QoS fix (see "Tried, no gain").
+  - 72e8460 SPU rc vector helpers on arm64 through sse2neon.
+  - 31ed304 SPU float core and v130 helpers in native NEON.
+  - 053e042 SPU `frest` / `frsqest` with NEON TBL.
+
+### NEON SPU helpers (the big one)
+
+- On arm64 the SPU job code used the scalar helpers: every float op
+  went lane by lane, with a clamp per operand. x86 has had SSE4.1 /
+  AVX2 forms for a long time.
+- Now arm64 gets the same vector helpers: integer ops through
+  sse2neon, and the float core (`fa`, `fm`, `fma`, compares,
+  conversions, `fi`, bit shifts, `frest`) in native NEON.
+- Bit-exact: `test_spu_helpers_vec` 24.44M checks and
+  `test_spu_helpers_v130_neon` 3.26G checks (every rounding mode, FZ
+  on/off, all 2^32 inputs for the clamp and `frest`), 0 differ.
+- x86 output unchanged (same preprocessed source).
+- Hot job d466: code 70% smaller.
+
+| | old | NEON |
+|---|---|---|
+| iPad, hot ABBA (flips/s) | 32.1 / 28.6 | **38.4 / 37.3** |
+| iPad total CPU | 646–661% | 597–599% |
+| iPad RSX thread busy | 71–75% | **99%** |
+| Mac (non-PGO, flips/s) | 60.6 | 65.0 |
+
+- iPad **+18–25%**. The RSX thread is now the limit on the iPad.
+- This iOS build had its SPU code un-PGO'd (profile from the old code).
+
+### Results
+
+iPad, gameplay, `ios_ab.sh` (flips/s 150–250 s), one build:
+
+| short sleeps | run 1 | run 2 | mean |
+|---|---|---|---|
+| clock + yield (launch default) | 27.9 | 26.3 | **27.1** |
+| spin ≤50 µs (`SPIN=1`) | 26.1 | 25.0 | 25.6 |
+| old `nanosleep` (`NANO=1`) | 23.8 | 24.2 | 24.0 |
+
+- Yield: **+13%** over the old sleep.
+- Mac gameplay (same script, headless): yield 55.7 / 54.5, nanosleep
+  52.1 / 55.2 flips/s. About +3%.
+- Mac static scene (`ab_mac.sh`): yield 49.1 / 53.5, nanosleep
+  51.5 / 56.2 flips/s. Yield is ~5% slower there (the RSX thread is the
+  limit on the Mac, and yield takes CPU from it: 725% vs 677%).
+
+Other gains this round:
+
+| change | iPad | Mac |
+|---|---|---|
+| inline loads/stores | +5% | −7% CPU per frame |
+| MEMLEAN = ALL | 0 | +8% |
+| PGO (first profile) | +6% | — |
+| PGO (retrained, MEMLEAN + inline) | +12% (30.8 / 29.9 vs 27.3 / 27.0) | — |
+| PGO v3 (retrained on memo + VCB, new sleeps) | — | +9% (62.9 / 57.2 vs 54.2 / 55.9, Mac load 15–22) |
+| program memo (b260727) | +6% (27.6 / 28.3 vs 26.5 / 26.4) | scans gone from profile |
+| partial vertex constants (9070eba) | +6.5% hot, ABBA (27.7 / 28.0 vs 25.8 / 26.5) | ~6.5% of RSX thread was the copy |
+
+Tried, no gain (opt-in only or dropped):
+
+- `ENC_THREAD=1` (Metal encoder thread): iPad RSX thread 85% → 59%
+  busy, same fps; Mac slower. With the PGO build it loses on the iPad:
+  29.3 (and 26.6 with `ENC_QOS=ut`) vs 31.7 flips/s. Stays opt-in.
+- `RT_PRIVATE=1` (private colour targets): GPU 22% → 20%, same fps.
+- `SPURS_KERN_QOS`: no change.
+- `METALFX=0` (no upscaling): GPU busy 43–52% → 22%, but no gain in
+  flips/s or CPU clock (hot: 28.1 / P 1.67 GHz vs 29.1 / P 1.74 GHz
+  with MetalFX). The GPU is not what heats the iPad. MetalFX stays on.
+- Frame workgroup (`os_workgroup` on the game threads): no change,
+  removed before commit.
+- RSX thread at real UI QoS. Bug found: the shim set the sched
+  priority first, which opts a thread out of QoS for good, so
+  `RSX_QOS` never worked (iPad thread showed "--"). Fixed in 6f9c267.
+  With the fix, iPad hot ABBA: 27.8 / 29.0 vs 28.6 / 27.6 flips/s
+  (no real change). Mac `RSX_QOS=1`: 60.7 / 61.1 vs 62.7 / 61.9, so
+  it stays off on macOS.
+
+iPad clocks (stress test): 3 busy threads run at 3.54 GHz; 9 busy
+threads drop to P 2.75 / E 2.81 GHz. More threads busy = slower cores.
+
+### The iPad slows down as it warms up
+
+- Cold (after 10 min idle) the iPad runs ~32 flips/s; after ~20 min of
+  play it settles at ~27. Thermal state stays 0 ("nominal") the whole
+  time. Each run is flat inside; the level drops between runs.
+- `ios_ab.sh` keeps the game running between sides, so the first side
+  of an ABAB set is cold and wins. Use ABBA, in the hot state.
+- Hot state (`IOS_CPU_LOG_SECS=10`): P cores at **1.5 GHz** (max 3.54),
+  E cores 2.16 GHz, ~675% CPU, ~5.5 threads waiting for a core. RSX
+  thread 84% busy.
+- The SPURS threads (~400% CPU) are real SPU job code, not spinning
+  (iPad profile: 2–3% in yield/kernel). So the iPad is power-capped by
+  real work. A Mac with a fan does not drop like this.
+- What helps: less work per frame on any thread (power is shared), not
+  only on the RSX thread.
+
+
+### RSX thread cuts (11-11)
+
+- After NEON the iPad RSX thread is 98–99% busy. It sets the pace.
+- 0de5ea3: plain textures skip the render-target scans (bloom
+  filter of target addresses); CONTROL0 enable bit checked first.
+- 77398a3: no ARC retain/release in `eng_encode_draw`.
+- c488cc3: GCM FIFO fast path in engine mode. Pure state words
+  (texture units, transform program, vertex format, CONTROL3) are
+  stored inline; the rest goes through `rsx_process_method` as
+  before. `GCM_ENG_FAST=0` off, `=1` no inline words. Exactness:
+  offline test of every inline word vs the handler, 0 differ.
+  Frames match the baseline (same black fades).
+
+| | old | new |
+|---|---|---|
+| Mac, RSX cuts (static scene) | 64.5 / 63.1 | **67.9 / 68.3** (+6.5%) |
+| Mac, FIFO cut alone | 71.0 / 69.3 | 71.0 / 71.5 (~0) |
+| iPad, all cuts, hot ABBA | 38.1 / 37.0 | **40.6 / 40.4** (+8%) |
+
+- iPad warm side: 43.5 flips/s.
+
+### PGO v4 (11-11)
+
+- Profile `$WORK_DIR/pgo/apple-v4.profdata`, trained on the NEON code.
+- iPad hot ABBA: 36.7 / 36.5 vs 37.5 / 35.8 (no-PGO NEON). No gain:
+  the RSX thread is the limit and SPU PGO does not help it.
+- Mac static scene: 78.0 / 76.2 vs 75.8 / 73.6 flips/s (+3%,
+  Mac load 11–33 from other work).
+
+### Next
+
+- iPad RSX thread (profile 11-11, leaf share): `eng_texture_slot`
+  15.5% (the sampled checksum loads), `sink_end` 12.7%, XXH3 geometry
+  hash 10.1%, FIFO walk 8.0%, `rsx_dispatch_method` 3.6%.
+- Fewer instructions in the hot SPU jobs (power, not just time).
 
 ## 2026-11-10 — iOS: "too old" screen for chips before A14
 
