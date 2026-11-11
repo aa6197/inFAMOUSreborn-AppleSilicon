@@ -324,6 +324,68 @@ static void* cpu_logger(void*)
     return NULL;
 }
 
+/* IOS_RUNSTATE=1 (default off): every 1 ms, read the run state of the main game thread and the RSX
+ * threads. Mach reports TH_STATE_RUNNING for running AND ready-to-run, so "ready" minus the CPU
+ * time the thread got is how long it was ready but waiting for a core. One line per thread every
+ * 10 s: on CPU / ready, waiting for a core / blocked. Shows which side limits when cores are full. */
+static void* runstate_sampler(void*)
+{
+    pthread_setname_np("ios-runstate");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    const char* e = getenv("IOS_RUNSTATE");
+    if (!e || *e != '1') return NULL;
+    static const char* const want[] = { "game-main", "rsx fifo", "rsx_encode" };
+    enum { NW = 3 };
+    for (;;) {
+        thread_act_t port[NW] = { MACH_PORT_NULL, MACH_PORT_NULL, MACH_PORT_NULL };
+        thread_act_array_t th; mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) { sleep(10); continue; }
+        for (mach_msg_type_number_t i = 0; i < n; i++) {
+            int keep = 0;
+            pthread_t pt = pthread_from_mach_thread_np(th[i]);
+            char nm[40] = "";
+            if (pt) pthread_getname_np(pt, nm, sizeof nm);
+            for (int k = 0; k < NW; k++)
+                if (port[k] == MACH_PORT_NULL && strcmp(nm, want[k]) == 0) { port[k] = th[i]; keep = 1; break; }
+            if (!keep) mach_port_deallocate(mach_task_self(), th[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof(thread_t));
+        uint32_t ready[NW] = { 0 }, samples = 0;
+        uint64_t us0[NW] = { 0 }, us1[NW] = { 0 };
+        auto cpu_us = [](thread_act_t t) -> uint64_t {
+            thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(t, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS) return 0;
+            return (uint64_t)bi.user_time.seconds * 1000000 + bi.user_time.microseconds +
+                   (uint64_t)bi.system_time.seconds * 1000000 + bi.system_time.microseconds;
+        };
+        for (int k = 0; k < NW; k++) if (port[k] != MACH_PORT_NULL) us0[k] = cpu_us(port[k]);
+        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 < 10000000000ull) {
+            for (int k = 0; k < NW; k++) {
+                if (port[k] == MACH_PORT_NULL) continue;
+                thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+                if (thread_info(port[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS &&
+                    bi.run_state == TH_STATE_RUNNING) ready[k]++;
+            }
+            samples++;
+            usleep(1000);
+        }
+        const double wall_us = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1000.0;
+        char line[512]; int o = snprintf(line, sizeof line, "[ios-runstate] %u samples:", samples);
+        for (int k = 0; k < NW; k++) {
+            if (port[k] == MACH_PORT_NULL) continue;
+            us1[k] = cpu_us(port[k]);
+            const double oncpu = 100.0 * (double)(us1[k] - us0[k]) / wall_us;
+            const double rdy = samples ? 100.0 * ready[k] / samples : 0.0;
+            o += snprintf(line + o, sizeof line - (size_t)o, " %s on CPU %.0f%%, ready %.0f%% (waiting for a core %.0f%%), blocked %.0f%% |",
+                          want[k], oncpu, rdy, rdy > oncpu ? rdy - oncpu : 0.0, 100.0 - rdy);
+            mach_port_deallocate(mach_task_self(), port[k]);
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+    return NULL;
+}
+
 /* IOS_FREQ_PROBE=<n> (default 0 = off): every n s, one user-interactive thread runs 10^9 dependent
  * adds (one cycle each) and logs the clock it got, by its own CPU time. Shows whether a busy thread
  * can still get a high clock while the game runs, or whether the cores are held low. */
@@ -619,6 +681,9 @@ int main(int argc, char* argv[])
         pthread_t ft;
         pthread_create(&ft, NULL, freq_probe, NULL);
         pthread_detach(ft);
+        pthread_t rt;
+        pthread_create(&rt, NULL, runstate_sampler, NULL);
+        pthread_detach(rt);
 
         s_game_argc = argc;
         s_game_argv = argv;
