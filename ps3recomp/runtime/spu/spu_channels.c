@@ -557,12 +557,22 @@ static mfc_engine* mfc_for(spu_context* ctx)
     /* Per-thread one-entry cache (2026-10-04): mfc_for runs on EVERY channel op
      * and was a linear scan of the slot table (10-18% of SPU threads). A hit is
      * validated against the slot's owner, so a released/reused slot just misses. */
+#if defined(__APPLE__)
+    /* Apple: each thread-local read is a call (_tlv_get_addr), so keep both in one struct (one call). */
+    static SPU_TLS struct { spu_context* ctx; int slot; } t_mc = { NULL, -1 };
+    if (ctx == t_mc.ctx && t_mc.slot >= 0 && s_mfc_slots[t_mc.slot].ctx == ctx)
+        return &s_mfc_slots[t_mc.slot].mfc;
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
+        if (s_mfc_slots[i].ctx == ctx) { t_mc.ctx = ctx; t_mc.slot = i;
+            return &s_mfc_slots[i].mfc; }
+#else
     static SPU_TLS spu_context* t_mctx; static SPU_TLS int t_mslot = -1;
     if (ctx == t_mctx && t_mslot >= 0 && s_mfc_slots[t_mslot].ctx == ctx)
         return &s_mfc_slots[t_mslot].mfc;
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
         if (s_mfc_slots[i].ctx == ctx) { t_mctx = ctx; t_mslot = i;
             return &s_mfc_slots[i].mfc; }
+#endif
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
