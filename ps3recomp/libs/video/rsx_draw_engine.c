@@ -1230,9 +1230,51 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
  * every frame was ~10% of the render thread.
  * PS3RECOMP_ENGINE_TEX_FULLHASH=1: the old word-at-a-time FNV over the whole
  * span (all levels, all faces), for chasing a stale texture. */
+/* Eight loads in flight (the D3D12 backend's TEX_CSUM_MLP, rsx_d3d12_backend.c
+ * v234, on in the shipped Windows launch env): the same sample offsets and the
+ * same FNV order, but eight independent words are loaded before any is hashed,
+ * so a large texture's ~1024 cache-line misses overlap instead of forming one
+ * load/hash chain. The scalar tail keeps the result bit-identical. iPad
+ * profile: the one-at-a-time sample load was ~10% of the RSX thread.
+ * Apple default on; PS3RECOMP_ENGINE_TEX_CSUM_MLP=0 off (=1 on elsewhere). */
+static int eng_csum_mlp_on(void)
+{
+    static int on = -1;
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENGINE_TEX_CSUM_MLP");
+#if defined(__APPLE__)
+        on = !(e && *e == '0');
+#else
+        on = (e && *e == '1');
+#endif
+    }
+    return on;
+}
 static u32 eng_csum_step(const u8* base, u32 nbytes, u32 step)
 {
     u32 h = 2166136261u, i = 0;
+    if (eng_csum_mlp_on()) {
+        const u64 span = (u64)step * 7u + 3u;
+        for (; (u64)i + span < nbytes; i += step * 8u) {
+            u32 w0, w1, w2, w3, w4, w5, w6, w7;
+            memcpy(&w0, base + i,            sizeof w0);
+            memcpy(&w1, base + i + step,     sizeof w1);
+            memcpy(&w2, base + i + step * 2, sizeof w2);
+            memcpy(&w3, base + i + step * 3, sizeof w3);
+            memcpy(&w4, base + i + step * 4, sizeof w4);
+            memcpy(&w5, base + i + step * 5, sizeof w5);
+            memcpy(&w6, base + i + step * 6, sizeof w6);
+            memcpy(&w7, base + i + step * 7, sizeof w7);
+            h ^= w0; h *= 16777619u;
+            h ^= w1; h *= 16777619u;
+            h ^= w2; h *= 16777619u;
+            h ^= w3; h *= 16777619u;
+            h ^= w4; h *= 16777619u;
+            h ^= w5; h *= 16777619u;
+            h ^= w6; h *= 16777619u;
+            h ^= w7; h *= 16777619u;
+        }
+    }
     for (; i + 3 < nbytes; i += step) {
         u32 w32; memcpy(&w32, base + i, sizeof w32);
         h ^= w32; h *= 16777619u;
