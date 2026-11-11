@@ -146,6 +146,26 @@ void spu_ls0_job_end(spu_context* ctx)
     spu_halt(ctx);
 }
 
+#if defined(__APPLE__)
+/* Apple: recompute the one-word hop gate (spu_context.h) after a write to any global it folds. The lock serialises
+ * the recomputes, so the last one sees every writer's value (each writer stores its global before calling this).
+ * Init-time only. */
+#include <stdatomic.h>
+extern int g_spu_ibf;   /* spu_ibf.h (defined via spu_channels.c) */
+void spu_hop_gate_sync(void)
+{
+    static atomic_flag s_lock = ATOMIC_FLAG_INIT;
+    while (atomic_flag_test_and_set_explicit(&s_lock, memory_order_acquire)) { }
+    int g = 0;
+    if (!(g_spu_dtail > 0 && g_spu_tlc_slow == 0 && g_yz_lockstep_on == 0 && g_spu_stack_reset_n == 0)) g |= 1;
+    if (!(g_spu_ibf > 0)) g |= 2;
+    __atomic_store_n(&g_spu_hop_gate, g, __ATOMIC_RELEASE);
+    atomic_flag_clear_explicit(&s_lock, memory_order_release);
+    static int s_logged;
+    if (g == 0 && !s_logged) { s_logged = 1; fprintf(stderr, "[spu] Apple one-word hop gate: open\n"); }
+}
+#endif
+
 /* v182: out-of-line part of the inline spu_tlc (spu_context.h). Called only when g_spu_tlc_slow != 0 (diagnostic
  * slow hook, or -1 = not initialised yet: spu_task_launch_check initialises it and does the whole hop's work) or
  * when stack-reset entries are registered (the old inline code's spu_check_stack_reset branch). */
@@ -172,6 +192,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
           if (on && spu_tailret_enabled()) on = 0;   /* SPU_TAILRET needs every hop in the drain */
           g_spu_dtail = on;
           fprintf(stderr, "[spu] v153 direct tail transfers: %s\n", on ? "ON" : "off"); }
+#if defined(__APPLE__)
+        spu_hop_gate_sync();
+#endif
     }
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));

@@ -2358,6 +2358,9 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
         g_spu_stack_reset_n = s_stack_reset_count;   /* v30: inline gate in spu_tlc */
+#if defined(__APPLE__)
+        spu_hop_gate_sync();
+#endif
     }
 }
 
@@ -3371,6 +3374,9 @@ static __attribute__((noinline)) int spu_ib_fast_init(void)   /* v183: keep its 
     { const char* f = getenv("SPU_IBF");   /* v177 in-module computed-branch dispatch (spu_ibf.h / tools/spu_ibfast.py) */
       g_spu_ibf = (on && !(f && *f == '0')) ? 1 : 0;
       fprintf(stderr, "[spu] v177 in-module computed-branch dispatch: %s (SPU_IBF=0 off)\n", g_spu_ibf ? "ON" : "off"); }
+#if defined(__APPLE__)
+    spu_hop_gate_sync();
+#endif
     return on;
 }
 

@@ -98,6 +98,9 @@ static void ls_arm_now(void)
         fflush(stderr);
     }
     g_yz_lockstep_on = on;
+#if defined(__APPLE__)
+    spu_hop_gate_sync();
+#endif
 }
 
 int yz_lockstep_enabled(void)

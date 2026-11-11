@@ -942,7 +942,44 @@ static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx,
 #  define SPU_PCH_NOTE(ctx) ((void)0)
 #endif
 SPU_GATE int g_spu_dtail = -1;   /* -1 = not initialised (spu_drain.c), 0 off, 1 on */
-#if defined(__clang__)
+/* Apple (FPS, iPad): one-word hop gate. SPU_XFER and SPU_IBF_COND tested four or five globals on EVERY SPU block
+ * hop (g_spu_dtail, g_spu_tlc_slow twice, the volatile g_yz_lockstep_on, g_spu_stack_reset_n, g_spu_ibf): ~4.7 % of
+ * the iPad's SPU samples were those loads. g_spu_hop_gate folds them into one word:
+ *   bit 0 set -> the old SPU_XFER test would fail or need the cold hook (dtail not on, slow hook or not initialised,
+ *                lockstep on or not decided, stack-reset entries registered): take the trampoline, and the drain loop
+ *                does the hop's work, as before v153;
+ *   bit 1 set -> SPU_IBF_COND's g_spu_ibf test would fail.
+ * Every writer of those globals calls spu_hop_gate_sync() (spu_drain.c) after its write. Starts at 3 (all slow).
+ * Windows: not compiled. -DSPU_NO_HOP_GATE (lifted SPU sources) = the old tests. */
+#if defined(__APPLE__)
+SPU_GATE int g_spu_hop_gate = 3;
+void spu_hop_gate_sync(void);
+#  if defined(__clang__) && !defined(SPU_NO_HOP_GATE) && !defined(SPU_TLC_OUTLINE)
+#    define SPU_HOP_GATE 1
+#  endif
+#endif
+#if defined(SPU_HOP_GATE)
+/* spu_tlc for a hop that passed the gate: g_spu_tlc_slow and g_spu_stack_reset_n are both 0, so spu_tlc's cold
+ * call cannot happen. Same remaining work. */
+static inline __attribute__((always_inline)) void spu_tlc_fast(spu_context* ctx)
+{
+#if defined(SPU_HOP_RECENT)
+    g_spu_recent[g_spu_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+#endif
+    if (__builtin_expect(ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0, 0) &&
+        !ctx->policy_mode && ctx->image_id > 0)
+        spu_ls0_job_end(ctx);
+}
+#  define SPU_XFER(ctx, F) do {                                             \
+        if (__builtin_expect(!(g_spu_hop_gate & 1), 1) &&                   \
+            !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) { \
+            spu_tlc_fast(ctx);                                              \
+            SPU_PCH_NOTE(ctx);                                              \
+            __attribute__((musttail)) return F(ctx);                        \
+        }                                                                   \
+        g_spu_trampoline_fn = (F); return;                                  \
+    } while (0)
+#elif defined(__clang__)
 #  define SPU_XFER(ctx, F) do {                                             \
         if (__builtin_expect(g_spu_dtail > 0, 1) && !g_spu_tlc_slow &&      \
             !g_yz_lockstep_on &&                                            \
