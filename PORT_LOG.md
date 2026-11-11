@@ -88,6 +88,8 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 18 | 11-11 | Round 5: SPU PGO profile retrained (v5) | 54.4 / 47.7 | 55.6 / 51.9 | +5.3% | RSX thread 95% busy again; Mac 81.6 / 87.9 vs 80.1 / 71.5 (busy Mac, not reliable) |
 | 19 | 11-11 | Round 6: Metal encoding on its own thread (not kept) | 54.2 / 55.6 | 54.1 / 55.0 | -0.6% | Drawing thread 93% -> 83% busy, but no faster. Something else also limits at ~55. |
 | 20 | 11-11 | Round 7: not a real test (new app did not install) | 55.1 / 55.7 | 54.3 / 55.6 | -0.8% | Both sides ran the round 6 app, so this only shows noise (same app: 54.3 to 55.7). Redo running. |
+| 21 | 11-11 | Round 8: where the frame waits (diagnostic) | 55.6 (encode off) | 54.5 (encode on) |  | One run each. Game thread spends 25-30% in a wait loop, mostly on SPU jobs. |
+| 22 | 11-11 | Round 9: SPU threads on slow cores (not kept) | 55.7 / 55.2 | 52.8 / 51.3 | -6.1% | Fast cores freed (272% -> 151%, 1.89 -> 2.34 GHz) but SPU work got slower. |
 
 ---
 
@@ -217,6 +219,46 @@ Round 7 (ABBA): geometry memo prefetch hints
   app is missing or the install fails, and prints the installed UUID.
 - Useful anyway: the same app 4 times gave 54.3–55.7 flips/s. That is the noise.
 - Redo running (rounds 8 and 7, with the right apps).
+
+Round 8 (diagnostic, one run each): why ~55 flips/s?
+New switch `IOS_RUNSTATE=1` (commit d417426): every 1 ms it checks if
+a thread is running, ready but waiting for a core, or blocked.
+
+| gameplay | encode thread off | on |
+|---|---|---|
+| flips/s | 55.6 | 54.5 |
+| game-main on CPU | 42% | 45% |
+| game-main ready but not running | 25% | 30% |
+| game-main blocked | 33% | 26% |
+| RSX thread on CPU (never waits) | 96% | 83% |
+| RSX: game PUT → drained | 17.2 of 17.7 ms | 15.0 of 18.2 ms |
+
+- Off: the RSX thread is behind for the whole frame.
+- On: RSX is done 3 ms early, but the game thread now limits.
+- **Correction (after round 9):** "ready but not running" is not
+  core contention. The game waits for SPU jobs in a `sched_yield`
+  loop (short sleeps, `sys_timer.c`), and a yielding thread counts as
+  ready. So most of that 25–30% is waiting on SPU jobs.
+
+Round 9 (screen, one run each): SPURS kernel threads to utility QoS.
+
+| run | flips/s | P cores | P clock |
+|---|---|---|---|
+| A1 default | 55.7 | 272% | 1.89 GHz |
+| B1 `SPURS_KERN_QOS=ut` | 52.8 | 151% | 2.34 GHz |
+| C1 + `SPURS_KERN1_QOS=ut` | 51.3 | | |
+| A2 default | 55.2 | 270% | 1.85 GHz |
+
+- Fast cores freed and clocked up, but the SPU work on slow cores
+  got slower, and the game waits on it. Not kept.
+- The game thread still showed ~31% "ready" with the P cores half
+  idle: that proved the metric is the yield loop, not contention.
+- The iPad's P cores run at only ~1.9 GHz under this load (power
+  limit). The M1 Max keeps ~3.2 GHz on 8 P cores. That gap, not the
+  core count alone, is the most likely reason the M1 Max is faster.
+- Next (round 10): free P-core time without slowing the main SPU
+  work: audio kernel only to E cores, shorter audio spin, and
+  parking job waits sooner.
 
 ### Notes
 
