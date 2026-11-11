@@ -3314,6 +3314,30 @@ static volatile long s_kick_woke = 0, s_kick_calls = 0;
 /* v221A: wids each registered kernel thread dispatched in its last pass that had any (written by that thread only,
  * and only when it changes); ps3_spurs_kick_wid wakes just the owners of one workload. */
 static volatile u32 s_kick_own[SPURS_KICK_MAX];
+#if defined(__APPLE__)
+/* Apple: the kick event (Windows: auto-reset event + waitable timer). Before this the kick was compiled out off
+ * Windows, so an idle kernel thread only saw new work when its SPURS_IDLE_WAIT_US nap ran out, and the task-wait
+ * kicks (ps3_spurs_kick / _wid) woke nobody. Mutex + condition variable: iOS 16 has no os_sync_wait_on_address. */
+#include <pthread.h>
+typedef struct { pthread_mutex_t m; pthread_cond_t c; int sig; } spurs_kev;
+static spurs_kev s_kick_kev[SPURS_KICK_MAX];
+static void spurs_kev_init(spurs_kev* e) { pthread_mutex_init(&e->m, NULL); pthread_cond_init(&e->c, NULL); e->sig = 0; }
+static void spurs_kev_set(spurs_kev* e)
+{
+    pthread_mutex_lock(&e->m); e->sig = 1; pthread_cond_signal(&e->c); pthread_mutex_unlock(&e->m);
+}
+/* Wait until set or us microseconds pass; auto-reset. 1 = set. A spurious wake-up just runs one pass early. */
+static int spurs_kev_wait(spurs_kev* e, long long us)
+{
+    struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
+    pthread_mutex_lock(&e->m);
+    if (!e->sig) pthread_cond_timedwait_relative_np(&e->c, &e->m, &ts);
+    const int r = e->sig; e->sig = 0;
+    pthread_mutex_unlock(&e->m);
+    return r;
+}
+static void spurs_kev_reset(spurs_kev* e) { pthread_mutex_lock(&e->m); e->sig = 0; pthread_mutex_unlock(&e->m); }
+#endif
 static volatile long s_kt_calls, s_kt_woke, s_kt_fallback, s_rcs_n[16], s_rcs_woke;
 static int spurs_kick_on(void)
 {
@@ -4038,6 +4062,8 @@ void ps3_spurs_kick(void)
         if (s_kick_waiting[i] && InterlockedExchange(&s_kick_waiting[i], 0)) {
 #ifdef _WIN32
             SetEvent(s_kick_ev[i]);
+#elif defined(__APPLE__)
+            spurs_kev_set(&s_kick_kev[i]);
 #endif
             woke++;
         }
@@ -4057,6 +4083,8 @@ static long ps3_spurs_kick_wid(int w)
         if (s_kick_waiting[i] && InterlockedExchange(&s_kick_waiting[i], 0)) {
 #ifdef _WIN32
             SetEvent(s_kick_ev[i]);
+#elif defined(__APPLE__)
+            spurs_kev_set(&s_kick_kev[i]);
 #endif
             woke++;
         }
@@ -4133,6 +4161,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             s_kick_ev[slot] = CreateEventA(NULL, FALSE, FALSE, NULL);
             if (s_kick_ev[slot]) kick_slot = (int)slot;
         }
+    }
+#elif defined(__APPLE__)
+    /* Opt-in (SPURS_KICK_APPLE=1): no gain on the iPad (11-11 A/B), so the default stays the timed nap. */
+    if (getenv("SPURS_KICK_APPLE") && *getenv("SPURS_KICK_APPLE") == '1') {
+        long slot = InterlockedIncrement(&s_kick_n) - 1;
+        if (slot < SPURS_KICK_MAX) { spurs_kev_init(&s_kick_kev[slot]); kick_slot = (int)slot; }
     }
 #endif
     u32 k_pass_no = 0;          /* per-thread pass counter (idle cadence) */
@@ -4311,6 +4345,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                         /* a kicker claimed the slot after the timer fired: drain its SetEvent */
                         WaitForSingleObject(s_kick_ev[kick_slot], 0);
                     }
+                }
+#elif defined(__APPLE__)
+                else if (kick_slot >= 0 && wait_us > 0) {
+                    /* same protocol as the Windows block above */
+                    InterlockedExchange(&s_kick_waiting[kick_slot], 1);
+                    InterlockedIncrement(&s_kick_parked);
+                    const int r = spurs_kev_wait(&s_kick_kev[kick_slot], wait_us);
+                    InterlockedDecrement(&s_kick_parked);
+                    if (!r && InterlockedExchange(&s_kick_waiting[kick_slot], 0) == 0)
+                        spurs_kev_reset(&s_kick_kev[kick_slot]);   /* a kicker claimed the slot after the timeout */
                 }
 #endif
                 else if (wait_us >= 1000) Sleep((DWORD)(wait_us / 1000));
