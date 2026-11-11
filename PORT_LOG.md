@@ -298,7 +298,8 @@ Round 10 (screen, one run each except A and M):
 | D `PS3_SHORT_SLEEP_PARK=50:20` | 52.3 | |
 
 - MetalFX costs ~1.5 ms of GPU per frame and ~3.5% speed. It is
-  already a switch; the default stays on until the user picks.
+  already a switch (`METALFX=0`). The user picked (11-11): **on** stays
+  the default on iPad/iPhone. Sharper picture over ~2 fps.
 - Audio and job-wait changes: no gain.
 - The RSX thread is still 93–97% busy. The GPU sum is near 100%,
   but buffers can overlap, so the real GPU load is not known yet.
