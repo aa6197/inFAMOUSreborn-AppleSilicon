@@ -629,7 +629,14 @@ if(SPU_SOURCES)
         if(APPLE)
             option(PORT_SPU_PGO "Apply PORT_PGO_PROFILE to the lifted SPU sources too" ON)
             set(PORT_SPU_EXTRA_OPTS "" CACHE STRING "Extra compile options for the lifted SPU sources (A/B tests)")
+            # SPU_U128_VECARGS (spu_helpers_vec.h): keep u128 values in vector registers on arm64.
+            # AAPCS64 passes the 16-byte u128 union in two GPRs, so every helper call bounced q -> x -> q.
+            # The header uses it only on arm64 + clang; elsewhere the define does nothing.
+            option(PORT_SPU_VECARGS "Lifted SPU sources: u128 helpers as vector-typed macros (arm64)" ON)
             set(_spu_extra ${PORT_SPU_EXTRA_OPTS})
+            if(PORT_SPU_VECARGS)
+                list(APPEND _spu_extra -DSPU_U128_VECARGS)
+            endif()
             if(PORT_PGO STREQUAL "USE" AND NOT PORT_SPU_PGO)
                 list(APPEND _spu_extra -fno-profile-instr-use)
             endif()
