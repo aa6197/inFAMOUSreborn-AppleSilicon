@@ -326,7 +326,62 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                                   "clock + isb spin (<=50us), sched_yield");
         }
         if (s_mode && usec > 0 && usec < 1000) {
-            const uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + usec * 1000ull;
+            const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            const uint64_t end = now + usec * 1000ull;
+            /* Wait episodes: the guest's poll loop calls this again and again until its counter moves.
+             * PS3_SHORT_SLEEP_STATS=1 logs how long those runs of back-to-back sleeps last (every 10 s).
+             * PS3_SHORT_SLEEP_PARK=<after_us>[:<sleep_us>] (default 200:50, 0 = off): once a run is older
+             * than after_us, each sleep is a real nanosleep(sleep_us) so a long wait stops burning a core;
+             * short waits keep the yield loop and its fast wake-up. 11-11 A/B: Mac +2.3% flips/s and -6% CPU,
+             * iPad same flips/s and -3..5% CPU (most main-thread waits last 0.5-10 ms). */
+            static __thread uint64_t t_last_end = 0, t_ep_start = 0;
+            static __thread uint32_t t_lr = 0;
+            static int s_ss_init = 0, s_ss_stats = 0;
+            static uint64_t s_park_ns = 200000, s_park_sleep_ns = 50000;
+            if (!s_ss_init) {
+                const char* p = getenv("PS3_SHORT_SLEEP_PARK");
+                const char* st = getenv("PS3_SHORT_SLEEP_STATS");
+                if (p && *p) {   /* unset: the default above */
+                    char* q; const unsigned long a = strtoul(p, &q, 10);
+                    s_park_ns = (uint64_t)a * 1000ull;
+                    if (*q == ':') { const unsigned long b = strtoul(q + 1, NULL, 10); if (b) s_park_sleep_ns = (uint64_t)b * 1000ull; }
+                }
+                if (s_park_ns) fprintf(stderr, "[timer] PS3_SHORT_SLEEP_PARK: waits past %llu us sleep %llu us at a time\n",
+                                       (unsigned long long)(s_park_ns / 1000), (unsigned long long)(s_park_sleep_ns / 1000));
+                else fprintf(stderr, "[timer] PS3_SHORT_SLEEP_PARK=0: waits never park\n");
+                s_ss_stats = (st && *st == '1');
+                s_ss_init = 1;
+            }
+            if (s_park_ns || s_ss_stats) {
+                if (now - t_last_end > 20000ull || (uint32_t)ctx->lr != t_lr) {   /* a new wait */
+                    if (s_ss_stats && t_ep_start) {
+                        static uint64_t s_n[6], s_ns[6], s_parks, s_t0;
+                        const uint64_t len = t_last_end - t_ep_start;
+                        const int k = len < 20000 ? 0 : len < 100000 ? 1 : len < 500000 ? 2 : len < 2000000 ? 3 : len < 10000000 ? 4 : 5;
+                        __atomic_fetch_add(&s_n[k], 1, __ATOMIC_RELAXED);
+                        __atomic_fetch_add(&s_ns[k], len, __ATOMIC_RELAXED);
+                        if (len >= s_park_ns && s_park_ns) __atomic_fetch_add(&s_parks, 1, __ATOMIC_RELAXED);
+                        uint64_t t0 = __atomic_load_n(&s_t0, __ATOMIC_RELAXED);
+                        if (!t0) __atomic_compare_exchange_n(&s_t0, &t0, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+                        else if (now - t0 >= 10000000000ull && __atomic_compare_exchange_n(&s_t0, &t0, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                            uint64_t n[6], ns[6];
+                            for (int i = 0; i < 6; i++) { n[i] = __atomic_exchange_n(&s_n[i], 0, __ATOMIC_RELAXED); ns[i] = __atomic_exchange_n(&s_ns[i], 0, __ATOMIC_RELAXED); }
+                            fprintf(stderr, "[timer] waits/10s (count, ms): <20us %llu %.0f | <100us %llu %.0f | <500us %llu %.0f | <2ms %llu %.0f | <10ms %llu %.0f | more %llu %.0f | parked %llu\n",
+                                    (unsigned long long)n[0], ns[0] / 1e6, (unsigned long long)n[1], ns[1] / 1e6,
+                                    (unsigned long long)n[2], ns[2] / 1e6, (unsigned long long)n[3], ns[3] / 1e6,
+                                    (unsigned long long)n[4], ns[4] / 1e6, (unsigned long long)n[5], ns[5] / 1e6,
+                                    (unsigned long long)__atomic_exchange_n(&s_parks, 0, __ATOMIC_RELAXED));
+                        }
+                    }
+                    t_ep_start = now; t_lr = (uint32_t)ctx->lr;
+                }
+                if (s_park_ns && now - t_ep_start >= s_park_ns) {
+                    const struct timespec ts = { 0, (long)s_park_sleep_ns };
+                    nanosleep(&ts, NULL);
+                    t_last_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                    return CELL_OK;
+                }
+            }
             if (s_mode == 2 && usec <= 50) {
                 do {
 #if defined(__aarch64__)
@@ -338,6 +393,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             } else {
                 do sched_yield(); while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < end);
             }
+            if (s_park_ns || s_ss_stats) t_last_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             return CELL_OK;
         }
     }
