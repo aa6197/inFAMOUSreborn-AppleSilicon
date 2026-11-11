@@ -96,6 +96,24 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 ---
 
+## 2026-11-11 — README: iPad/iPhone install and build steps
+
+- README: two ways to get the app (download, or build it yourself),
+  then add your game in the app. Speeds updated (iPad ~50–55 fps).
+- New "Build it yourself → iPad and iPhone" steps, with two scripts in
+  the repo (the old ones live in `$WORK_DIR/tools` with fixed paths):
+  - `infamous-recomp/tools/ios_deps.sh [iphoneos|iphonesimulator]`:
+    gets the dependency sources with git (pinned tags) and builds them.
+    `DEPS_DIR` (default `~/inFamous/deps`).
+  - `infamous-recomp/tools/ios_build.sh <team id> [device id]`:
+    configures (same flags as `ios_configure.sh`), builds with
+    xcodebuild, installs with devicectl when a device id is given.
+    `BUNDLE_ID` (default `local.<user>.infamous`), `BUILD_DIR`.
+- A self-built app has no `eboot_key.h`, so it only imports a game
+  folder that already has `PS3_GAME/USRDIR/EBOOT.elf`.
+
+---
+
 ## 2026-11-11 — iPad speed: hop gate, SPU vectors in registers
 
 All iPad numbers: `ios_ab.sh`-style 330 s gameplay runs, flips/s
