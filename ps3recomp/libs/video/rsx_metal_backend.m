@@ -4549,9 +4549,39 @@ static void eng_dump_frame(id<MTLTexture> src)
     free(rgba);
 }
 
+/* RFBOUND=1 (default off): the Metal side of the D3D12 [RFBOUND] report. Every 300 presents: frame time,
+ * the main guest thread's RSX fence-poll wait per frame split by what the FIFO thread was doing
+ * (cellGcmSys.c g_fifo_where: 0 other, 1 idle kick wait, 2 walking the FIFO, 3 present, 4 window pump),
+ * and the walker's own waits (NV406E ACQUIRE spins = waiting for SPU labels). */
+static void eng_rfbound_report(void)
+{
+    extern int v243c_rfbound_on(void);
+    extern volatile long long g_v243c_fence_qpc[8], g_v243c_st[16];
+    if (!v243c_rfbound_on()) return;
+    static u64 t0; static long long lf[8], ls[16]; static u32 n;
+    const u64 now = eng_now_ns();
+    if (!t0) {
+        t0 = now;
+        for (int k = 0; k < 8; k++) lf[k] = g_v243c_fence_qpc[k];
+        for (int k = 0; k < 16; k++) ls[k] = g_v243c_st[k];
+        return;
+    }
+    if (++n < 300) return;
+    double f[8], fence = 0; long long s[16];
+    for (int k = 0; k < 8; k++) { const long long v = g_v243c_fence_qpc[k]; f[k] = (double)(v - lf[k]) / 1e6 / n; lf[k] = v; fence += f[k]; }
+    for (int k = 0; k < 16; k++) { const long long v = g_v243c_st[k]; s[k] = v - ls[k]; ls[k] = v; }
+    fprintf(stderr, "[RFBOUND-mtl] %u frames: frame %.2f ms | main fence wait %.2f ms (walk %.2f idle %.2f present %.2f pump %.2f other %.2f)"
+                    " | ACQUIRE %.2f spins %.3f ms (%.3f while main waits) | put->drained %.2f ms, in walk %.2f ms\n",
+            n, (double)(now - t0) / 1e6 / n, fence, f[2], f[1], f[3], f[4], f[0] + f[5] + f[6] + f[7],
+            (double)s[6] / n, (double)s[4] / 1e6 / n, (double)s[5] / 1e6 / n,
+            s[10] ? (double)s[8] / 1e6 / (double)s[10] : 0.0, s[10] ? (double)s[9] / 1e6 / (double)s[10] : 0.0);
+    t0 = now; n = 0;
+}
+
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
+    eng_rfbound_report();
     id<MTLTexture> src = eng_obj(surface);
     eng_pool_tick();
     if (!src) { eng_encode_and_commit(nil); return; }
