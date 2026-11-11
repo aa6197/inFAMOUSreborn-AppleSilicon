@@ -14,14 +14,16 @@
 # A missing build is skipped with a note. Every bundle is checked for game
 # files before it is packed; one hit stops the script.
 #
-# DEPS_SRC: the dependency sources (licence files), default $WORK_DIR/deps/src.
+# out dir:  default ~/inFamous/dist/<ver>
+# DEPS_DIR: as for tools/ios_deps.sh, default ~/inFamous/deps.
+# DEPS_SRC: the dependency sources (licence files), default $DEPS_DIR/src.
 set -eu
 HERE=${0:A:h}
 ROOT=${HERE:h}                  # infamous-recomp/
 REPO=${ROOT:h}
 VER=${1:-0.1}
-OUT=${2:-$WORK_DIR/dist/$VER}
-DEPS_SRC=${DEPS_SRC:-$WORK_DIR/deps/src}
+OUT=${2:-$HOME/inFamous/dist/$VER}
+DEPS_SRC=${DEPS_SRC:-${DEPS_DIR:-$HOME/inFamous/deps}/src}
 STAGE=$OUT/.stage
 rm -rf $STAGE
 mkdir -p $OUT $STAGE

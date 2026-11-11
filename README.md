@@ -180,7 +180,7 @@ You also need a paid Apple Developer account, signed in to Xcode (Xcode → Sett
 Want an `.ipa` file instead, to install with SideStore or AltStore? After step 4, run:
 
 ```bash
-DEPS_SRC=~/inFamous/deps/src infamous-recomp/tools/release_apple.sh 0.1 ~/inFamous/dist
+infamous-recomp/tools/release_apple.sh
 ```
 
 The release apps are made with the same script. See [PORT_LOG.md](PORT_LOG.md) for the release build, the iPad build and every switch.

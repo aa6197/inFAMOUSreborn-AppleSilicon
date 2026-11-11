@@ -8,7 +8,8 @@ Read this first every session. Newest entry on top.
   files. The player picks their own disc image or game folder at first
   start; the app unpacks it, decrypts EBOOT.BIN and checks it. See entry
   "End-user release: in-app disc import". Make the files with
-  `infamous-recomp/tools/release_apple.sh` → `$WORK_DIR/dist/<ver>`.
+  `DEPS_DIR=$WORK_DIR/deps infamous-recomp/tools/release_apple.sh <ver> $WORK_DIR/dist/<ver>`
+  (no args: `~/inFamous/dist/<ver>`, deps in `~/inFamous/deps`).
 - **Legal points for the user's lawyer** (not decided by me): the
   prebuilt binary holds code translated from the game; it embeds the
   EBOOT metadata key (`import/eboot_key.h`, git-ignored, never commit);
