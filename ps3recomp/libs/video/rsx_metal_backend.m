@@ -2572,6 +2572,126 @@ static void eng_obj_wait_idle(u32 handle)
     }
 }
 
+/* Texture pool. Depth snapshots, depth colour copies and feedback copies are
+ * made and dropped many times a frame; each was a new Metal texture (AGX
+ * texture init ~3% of the RSX thread) and a dealloc. The GPU writes all of
+ * such a texture before anything reads it (a full-screen resolve with
+ * DontCare, or a whole-texture blit), so a dropped one can be handed out
+ * again once its slot is free and the last commit that read it has finished
+ * on the GPU. (Taking one that is still being read would be correct through
+ * Metal's hazard tracking, but makes the new frame's pass wait for the old
+ * frame on the GPU: Mac -2%.) No CPU write ever goes into a pooled texture.
+ * The pool mostly holds textures the in-flight commits retain anyway.
+ * Off with ENC_THREAD (slots are freed off the RSX thread there).
+ * PS3RECOMP_METAL_TEX_POOL=0 off, =2 logs hits. */
+#define ENG_POOL_MAX    64
+#define ENG_POOL_BYTES  (192u << 20)
+#define ENG_POOL_FRAMES 120u
+typedef struct { u32 fmt, w, h, use; } eng_pool_key;
+static id<MTLTexture> s_pool_tex[ENG_POOL_MAX];
+static eng_pool_key s_pool_key[ENG_POOL_MAX];
+static u32 s_pool_bytes_at[ENG_POOL_MAX], s_pool_frame_at[ENG_POOL_MAX];
+static u32 s_pool_use_at[ENG_POOL_MAX];                /* last commit that read it */
+static u32 s_pool_n, s_pool_bytes, s_pool_frame, s_pool_hit, s_pool_miss, s_pool_busy;
+static u8 s_eng_obj_pool[ENG_MAX_OBJECTS];             /* the slot's texture may be pooled */
+static eng_pool_key s_eng_obj_pkey[ENG_MAX_OBJECTS];
+static int s_pool_cfg = -1;
+static u32 eng_format_bytes(MTLPixelFormat f);
+
+static int eng_pool_on(void)
+{
+    if (s_pool_cfg < 0) {
+        const char* e = getenv("PS3RECOMP_METAL_TEX_POOL");
+        s_pool_cfg = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 2 : 1;
+        fprintf(stderr, "[rsx engine/metal] texture pool: %s (PS3RECOMP_METAL_TEX_POOL)\n",
+                s_pool_cfg ? "ON" : "off");
+    }
+    return s_pool_cfg && !s_enc_on;
+}
+
+static void eng_pool_drop_at(u32 k)
+{
+    s_pool_bytes -= s_pool_bytes_at[k];
+    s_pool_n--;
+    s_pool_tex[k] = s_pool_tex[s_pool_n];
+    s_pool_key[k] = s_pool_key[s_pool_n];
+    s_pool_bytes_at[k] = s_pool_bytes_at[s_pool_n];
+    s_pool_frame_at[k] = s_pool_frame_at[s_pool_n];
+    s_pool_use_at[k] = s_pool_use_at[s_pool_n];
+    s_pool_tex[s_pool_n] = nil;
+}
+
+static eng_pool_key eng_pool_key_of(MTLTextureDescriptor* td)
+{
+    eng_pool_key k = { (u32)td.pixelFormat, (u32)td.width, (u32)td.height,
+                       (u32)td.usage | (u32)td.storageMode << 16 };
+    return k;
+}
+
+/* A new texture for a resolve or copy target that the GPU writes whole. */
+static u32 eng_pool_new(MTLTextureDescriptor* td)
+{
+    const int on = eng_pool_on();
+    const eng_pool_key key = eng_pool_key_of(td);
+    id<MTLTexture> t = nil;
+    const u32 done = atomic_load_explicit(&s_eng_done_serial, memory_order_acquire);
+    int busy = 0;
+    for (u32 k = 0; on && k < s_pool_n; k++)
+        if (!memcmp(&s_pool_key[k], &key, sizeof key)) {
+            if (s_pool_use_at[k] > done) { busy = 1; continue; }
+            t = s_pool_tex[k];
+            eng_pool_drop_at(k);
+            break;
+        }
+    if (t) s_pool_hit++; else { s_pool_miss++; s_pool_busy += busy; }
+    if (!t) t = [s_dev newTextureWithDescriptor:td];
+    const u32 h = eng_obj_add(t);
+    if (h && on) { s_eng_obj_pool[h - 1] = 1; s_eng_obj_pkey[h - 1] = key; }
+    return h;
+}
+
+/* A slot is free: keep its texture for eng_pool_new if it came from there. */
+static void eng_obj_drop_tex(u32 i)
+{
+    if (s_eng_obj_pool[i] && s_eng_obj[i] && eng_pool_on()) {
+        const eng_pool_key key = s_eng_obj_pkey[i];
+        const u32 bytes = key.w * key.h * eng_format_bytes((MTLPixelFormat)key.fmt);
+        if (bytes && bytes <= ENG_POOL_BYTES / 4) {
+            while (s_pool_n && (s_pool_n >= ENG_POOL_MAX || s_pool_bytes + bytes > ENG_POOL_BYTES)) {
+                u32 old = 0;
+                for (u32 k = 1; k < s_pool_n; k++)
+                    if (s_pool_frame - s_pool_frame_at[k] > s_pool_frame - s_pool_frame_at[old]) old = k;
+                eng_pool_drop_at(old);
+            }
+            s_pool_tex[s_pool_n] = s_eng_obj[i];
+            s_pool_key[s_pool_n] = key;
+            s_pool_bytes_at[s_pool_n] = bytes;
+            s_pool_frame_at[s_pool_n] = s_pool_frame;
+            s_pool_use_at[s_pool_n] = s_eng_obj_use[i];
+            s_pool_n++;
+            s_pool_bytes += bytes;
+        }
+    }
+    s_eng_obj_pool[i] = 0;
+    s_eng_obj[i] = nil;
+}
+
+/* Once a frame: let go of what nobody took for ENG_POOL_FRAMES frames. */
+static void eng_pool_tick(void)
+{
+    s_pool_frame++;
+    for (u32 k = 0; k < s_pool_n;) {
+        if (s_pool_frame - s_pool_frame_at[k] > ENG_POOL_FRAMES) eng_pool_drop_at(k);
+        else k++;
+    }
+    if (s_pool_cfg == 2 && s_pool_frame % 600 == 0) {
+        fprintf(stderr, "[rsx engine/metal] texture pool: %u hits, %u new (%u with a match"
+                        " the GPU still reads) in 600 frames; holds %u (%u KB)\n",
+                s_pool_hit, s_pool_miss, s_pool_busy, s_pool_n, s_pool_bytes >> 10);
+        s_pool_hit = s_pool_miss = s_pool_busy = 0;
+    }
+}
+
 /* Recorded commands resolve numeric handles during encoding. Do not recycle
  * a released slot until those commands have acquired their Metal resources.
  * Submitted command buffers retain the objects for the GPU's remaining work. */
@@ -2585,7 +2705,7 @@ static void eng_collect_retired_objects(void)
         for (u32 i = 0; i < s_eng_obj_count; ++i) {
             if (!s_eng_obj_retired[i] || s_eng_obj_retire_sn[i] > enc) continue;
             s_eng_obj_retired[i] = 0;
-            s_eng_obj[i] = nil;
+            eng_obj_drop_tex(i);
             s_eng_obj_free[s_eng_obj_free_count++] = i;
             s_eng_obj_retired_n--;
         }
@@ -2595,7 +2715,7 @@ static void eng_collect_retired_objects(void)
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
         if (!s_eng_obj_retired[i]) continue;
         s_eng_obj_retired[i] = 0;
-        s_eng_obj[i] = nil;
+        eng_obj_drop_tex(i);
         s_eng_obj_free[s_eng_obj_free_count++] = i;
     }
 }
@@ -2787,6 +2907,8 @@ static void eng_shutdown(void* user)
         s_eng_obj_retired_n = 0;
     }
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
+    memset(s_eng_obj_pool, 0, sizeof s_eng_obj_pool);
+    while (s_pool_n) eng_pool_drop_at(s_pool_n - 1u);
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
         s_eng_pipe[i].ds = nil;
@@ -3066,7 +3188,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                                                            width:w height:h
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 dst = eng_pool_new(td);
     if (!dst) return 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -3104,7 +3226,7 @@ static u32 eng_depth_color_copy(void* user, u32 depth, u32 w, u32 h)
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 dst = eng_pool_new(td);
     if (!dst) return 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -3136,7 +3258,7 @@ static u32 eng_surface_copy(void* user, u32 surface, u32 dst)
         td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
         td.storageMode = MTLStorageModePrivate;
         if (dst) eng_obj_release(NULL, dst);
-        dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+        dst = eng_pool_new(td);
         if (!dst) return 0;
     }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -4431,6 +4553,7 @@ static void eng_present(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> src = eng_obj(surface);
+    eng_pool_tick();
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
     eng_dump_frame(src);
