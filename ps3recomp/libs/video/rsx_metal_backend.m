@@ -48,6 +48,7 @@
  */
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <os/lock.h>
 #if __has_include(<MetalFX/MetalFX.h>)
 #import <MetalFX/MetalFX.h>
 #define PS3RECOMP_HAVE_METALFX 1
@@ -2380,6 +2381,10 @@ static _Atomic u32 s_gpu_cbs;
  * resolves, draws, and the attachment pixels each pass loads from / stores to memory. On a tile GPU
  * (all Apple GPUs) every loaded or stored pixel is memory traffic. */
 static _Atomic u64 s_gs_pass, s_gs_copy, s_gs_resolve, s_gs_draw, s_gs_load_px, s_gs_store_px;
+static _Atomic u64 s_gs_zfb;   /* passes on the shared depth (no guest zeta) */
+static os_unfair_lock s_gpu_ulock = OS_UNFAIR_LOCK_INIT;
+static double s_gpu_last_end;  /* latest GPUEndTime seen (under s_gpu_ulock) */
+static u64    s_gpu_union_ns;  /* GPU time with overlap counted once (under s_gpu_ulock) */
 static void eng_gs_pass(MTLRenderPassDescriptor* rp, u32 ncolor)
 {
     if (s_gpu_stats != 1) return;
@@ -2410,8 +2415,17 @@ static void eng_gpu_commit(id<MTLCommandBuffer> cb)
     }
     if (s_gpu_stats) {
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-            const double d = c.GPUEndTime - c.GPUStartTime;
-            if (d > 0) atomic_fetch_add(&s_gpu_busy_ns, (u64)(d * 1e9));
+            const double s0 = c.GPUStartTime, e0 = c.GPUEndTime, d = e0 - s0;
+            if (d > 0) {
+                atomic_fetch_add(&s_gpu_busy_ns, (u64)(d * 1e9));
+                /* Union of the buffers' GPU intervals: time the GPU had any of
+                 * our work, overlap counted once. */
+                os_unfair_lock_lock(&s_gpu_ulock);
+                const double from = s0 > s_gpu_last_end ? s0 : s_gpu_last_end;
+                if (e0 > from) s_gpu_union_ns += (u64)((e0 - from) * 1e9);
+                if (e0 > s_gpu_last_end) s_gpu_last_end = e0;
+                os_unfair_lock_unlock(&s_gpu_ulock);
+            }
             atomic_fetch_add(&s_gpu_cbs, 1u);
             const u64 now = eng_now_ns();
             u64 due = atomic_load(&s_gpu_next_ns);
@@ -2419,12 +2433,18 @@ static void eng_gpu_commit(id<MTLCommandBuffer> cb)
                 const u64 b = atomic_exchange(&s_gpu_busy_ns, 0);
                 const u32 n = atomic_exchange(&s_gpu_cbs, 0u);
                 const double win = 10e9 + (double)(now - due);
-                fprintf(stderr, "[rsx metal] GPU busy %.0f%% over %.1f s, %u command buffers, %.2f ms each\n",
-                        100.0 * (double)b / win, win / 1e9, n, n ? (double)b / 1e6 / n : 0.0);
+                os_unfair_lock_lock(&s_gpu_ulock);
+                const u64 un = s_gpu_union_ns; s_gpu_union_ns = 0;
+                os_unfair_lock_unlock(&s_gpu_ulock);
+                fprintf(stderr, "[rsx metal] GPU busy %.0f%% (%.0f%% with overlap counted once) over %.1f s, "
+                                "%u command buffers, %.2f ms each\n",
+                        100.0 * (double)b / win, 100.0 * (double)un / win, win / 1e9, n,
+                        n ? (double)b / 1e6 / n : 0.0);
                 const double sec = win / 1e9;
-                fprintf(stderr, "[rsx metal] per second: %.0f passes, %.0f copies, %.0f depth resolves, %.0f draws, "
-                                "%.0f Mpx loaded, %.0f Mpx stored\n",
-                        atomic_exchange(&s_gs_pass, 0) / sec, atomic_exchange(&s_gs_copy, 0) / sec,
+                fprintf(stderr, "[rsx metal] per second: %.0f passes (%.0f on the shared depth), %.0f copies, "
+                                "%.0f depth resolves, %.0f draws, %.0f Mpx loaded, %.0f Mpx stored\n",
+                        atomic_exchange(&s_gs_pass, 0) / sec, atomic_exchange(&s_gs_zfb, 0) / sec,
+                        atomic_exchange(&s_gs_copy, 0) / sec,
                         atomic_exchange(&s_gs_resolve, 0) / sec, atomic_exchange(&s_gs_draw, 0) / sec,
                         atomic_exchange(&s_gs_load_px, 0) / sec / 1e6, atomic_exchange(&s_gs_store_px, 0) / sec / 1e6);
             }
@@ -4048,6 +4068,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
         }
         if (zbuf) {
             const int clear_here = have_clear_ds && depth == cd;
+            if (zbuf == zfb && s_gpu_stats == 1) atomic_fetch_add(&s_gs_zfb, 1);
             rp.depthAttachment.texture       = zbuf;
             rp.depthAttachment.storeAction   = MTLStoreActionStore;
             rp.depthAttachment.loadAction    =
