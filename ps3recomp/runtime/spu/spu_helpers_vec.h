@@ -22,7 +22,7 @@
 /* arm64 (Apple port): the same SSE4.1 forms through sse2neon. Without them the rc sources fell back to the
  * scalar references, with the u128-local problem described above. Each op here maps to one or two NEON
  * instructions (pshufb -> tbl, pmulld -> mul, pcmpgtd -> cmgt, shift by count -> ushl/sshl), so the locals
- * stay in q registers. The AVX2 / FMA parts below stay x86-only. */
+ * stay in q registers. The AVX2 parts below stay x86-only; v130 has its own NEON block. */
 #include "../../include/ps3emu/host_simd.h"
 #endif
 #if defined(__AVX2__)
@@ -250,7 +250,7 @@ static inline void spu__v_ls_wr(uint8_t* ls, uint32_t lsa, u128 val) {
  * them against the references on edge-case sweeps and random inputs. Where a lane would need a corner case that
  * is awkward to vectorise exactly (NaN into a conversion, fi with a tiny exponent), the reference is called for
  * that register instead (same result by definition). Requires AVX2 + FMA (the lifted SPU TUs are built with
- * -mavx2 -mfma); otherwise the references stay in use. */
+ * -mavx2 -mfma); arm64 has the NEON block after this one; elsewhere the references stay in use. */
 #if defined(__AVX2__) && defined(__FMA__) && defined(SPU__FSIMD) && SPU__FSIMD && !defined(SPU_HELPERS_V130_DISABLE)
 #include <immintrin.h>
 static inline u128 spu__v_fcgt(u128 a, u128 b)  { return spu__fst(_mm_cmpgt_ps(spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
@@ -334,7 +334,70 @@ static inline u128 spu__v_shlqbi(u128 a, u128 b)   { return spu__v_qshl_bits(a, 
 static inline u128 spu__v_rotqbi(u128 a, u128 b)   { return spu__v_qshl_bits(a, (int)(b._u32[0] & 7), 1); }
 static inline u128 spu__v_rotqmbii(u128 a, int i7) { return spu__v_qshr_bits(a, (0 - i7) & 7); }
 static inline u128 spu__v_rotqmbi(u128 a, u128 b)  { return spu__v_qshr_bits(a, (0 - (int)b._u32[0]) & 7); }
-#ifndef SPU_HELPERS_V130_NO_REDIRECT
+#define SPU__V130 1
+#elif defined(__aarch64__) && defined(__ARM_NEON) && defined(SPU__FSIMD) && SPU__FSIMD && !defined(SPU_HELPERS_V130_DISABLE)
+/* arm64 (Apple port): the same v130 set in native NEON, bit-identical to the arm64 references in the FPCR modes
+ * SPU code runs in (round to nearest / toward zero, FZ on or off): tests/test_spu_helpers_v130_neon.c.
+ * - Conversions run as two float64x2 halves (no 256-bit vectors). cflts truncates to s64 and narrows with
+ *   saturation (FCVTZS + SQXTN), which is the reference's clamp-then-truncate for every non-NaN value. Operands
+ *   come out of spu__xfq, which turns exponent-255 (Inf/NaN) into +-FLT_MAX, so no NaN reaches it.
+ * - fi: FMLS == the reference's contracted `base - step * y` (clang default -ffp-contract=on, as the SPU TUs build).
+ * - Bit shifts: USHL by a per-call count; a negative count shifts right and +-32 gives 0 (sh == 0 case). */
+static inline uint32x4_t spu__nv(u128 a)     { uint32x4_t x; memcpy(&x, &a, 16); return x; }
+static inline u128 spu__nvo(uint32x4_t x)    { u128 a; memcpy(&a, &x, 16); return a; }
+static inline u128 spu__v_fcgt(u128 a, u128 b)  { return spu__nvo(vcgtq_f32(spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
+static inline u128 spu__v_fceq(u128 a, u128 b)  { return spu__nvo(vceqq_f32(spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
+static inline u128 spu__v_fcmgt(u128 a, u128 b) { return spu__nvo(vcagtq_f32(spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
+static inline u128 spu__v_fcmeq(u128 a, u128 b) { return spu__nvo(vceqq_f32(vabsq_f32(spu__xfq(spu__fld(a))), vabsq_f32(spu__xfq(spu__fld(b))))); }
+static inline u128 spu__v_cflts(u128 a, int i8) {
+    const float32x4_t A = spu__xfq(spu__fld(a));
+    const float64x2_t f = vdupq_n_f64(spu__p2(173 - i8));
+    const int32x2_t lo = vqmovn_s64(vcvtq_s64_f64(vmulq_f64(vcvt_f64_f32(vget_low_f32(A)), f)));
+    return spu__nvo(vreinterpretq_u32_s32(vqmovn_high_s64(lo, vcvtq_s64_f64(vmulq_f64(vcvt_high_f64_f32(A), f)))));
+}
+static inline u128 spu__v_csflt(u128 a, int i8) {
+    const int32x4_t I = vreinterpretq_s32_u32(spu__nv(a));
+    const float64x2_t f = vdupq_n_f64(spu__p2(i8 - 155));
+    const float32x2_t lo = vcvt_f32_f64(vmulq_f64(vcvtq_f64_s64(vmovl_s32(vget_low_s32(I))), f));
+    return spu__fst(vcvt_high_f32_f64(lo, vmulq_f64(vcvtq_f64_s64(vmovl_high_s32(I)), f)));
+}
+static inline u128 spu__v_cuflt(u128 a, int i8) {
+    const uint32x4_t U = spu__nv(a);
+    const float64x2_t f = vdupq_n_f64(spu__p2(i8 - 155));
+    const float32x2_t lo = vcvt_f32_f64(vmulq_f64(vcvtq_f64_u64(vmovl_u32(vget_low_u32(U))), f));
+    return spu__fst(vcvt_high_f32_f64(lo, vmulq_f64(vcvtq_f64_u64(vmovl_high_u32(U)), f)));
+}
+static inline __attribute__((always_inline)) u128 spu__v_fi(u128 a, u128 b) {
+    const uint32x4_t A = spu__nv(a), B = spu__nv(b);
+    const uint32x4_t e = vandq_u32(vshrq_n_u32(B, 23), vdupq_n_u32(0xFF));
+    if (__builtin_expect(vminvq_u32(e) < 14u, 0)) return spu_fi(a, b);
+    const float32x4_t base = vreinterpretq_f32_u32(vandq_u32(B, vdupq_n_u32(0xFFFFFC00u)));
+    const float32x4_t p2 = vreinterpretq_f32_u32(vshlq_n_u32(vsubq_u32(e, vdupq_n_u32(13)), 23));
+    const uint32x4_t neg = vandq_u32(vcltzq_f32(base), vdupq_n_u32(0x80000000u));
+    const float32x4_t step = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(
+        vmulq_f32(vcvtq_f32_u32(vandq_u32(B, vdupq_n_u32(0x3FF))), p2)), neg));
+    const float32x4_t y = vmulq_f32(vcvtq_f32_u32(vandq_u32(A, vdupq_n_u32(0x7FFFF))), vdupq_n_f32(1.0f / 524288.0f));
+    return spu__fst(vfmsq_f32(base, step, y));
+}
+static inline u128 spu__v_qshl_bits(u128 a, int sh, int rot) {
+    const uint32x4_t A = spu__nv(a);
+    const uint32x4_t N = rot ? vextq_u32(A, A, 1) : vextq_u32(A, vdupq_n_u32(0), 1);   /* lane i <- lane i+1 */
+    return spu__nvo(vorrq_u32(vshlq_u32(A, vdupq_n_s32(sh)), vshlq_u32(N, vdupq_n_s32(sh - 32))));
+}
+static inline u128 spu__v_qshr_bits(u128 a, int sh) {
+    const uint32x4_t A = spu__nv(a);
+    const uint32x4_t P = vextq_u32(vdupq_n_u32(0), A, 3);                               /* lane i <- lane i-1 */
+    return spu__nvo(vorrq_u32(vshlq_u32(A, vdupq_n_s32(-sh)), vshlq_u32(P, vdupq_n_s32(32 - sh))));
+}
+static inline u128 spu__v_shlqbii(u128 a, int sh)  { return spu__v_qshl_bits(a, sh & 7, 0); }
+static inline u128 spu__v_rotqbii(u128 a, int sh)  { return spu__v_qshl_bits(a, sh & 7, 1); }
+static inline u128 spu__v_shlqbi(u128 a, u128 b)   { return spu__v_qshl_bits(a, (int)(b._u32[0] & 7), 0); }
+static inline u128 spu__v_rotqbi(u128 a, u128 b)   { return spu__v_qshl_bits(a, (int)(b._u32[0] & 7), 1); }
+static inline u128 spu__v_rotqmbii(u128 a, int i7) { return spu__v_qshr_bits(a, (0 - i7) & 7); }
+static inline u128 spu__v_rotqmbi(u128 a, u128 b)  { return spu__v_qshr_bits(a, (0 - (int)b._u32[0]) & 7); }
+#define SPU__V130 1
+#endif /* v130 */
+#if defined(SPU__V130) && !defined(SPU_HELPERS_V130_NO_REDIRECT)
 #define spu_fcgt    spu__v_fcgt
 #define spu_fceq    spu__v_fceq
 #define spu_fcmgt   spu__v_fcmgt
@@ -351,8 +414,7 @@ static inline u128 spu__v_rotqmbi(u128 a, u128 b)  { return spu__v_qshr_bits(a, 
 #define spu_rotqbi  spu__v_rotqbi
 #define spu_rotqmbii spu__v_rotqmbii
 #define spu_rotqmbi spu__v_rotqmbi
-#endif
-#endif /* v130 */
+#endif /* v130 redirects */
 
 #endif /* __SSE4_1__ or arm64 NEON */
 #endif /* SPU_HELPERS_VEC_H */

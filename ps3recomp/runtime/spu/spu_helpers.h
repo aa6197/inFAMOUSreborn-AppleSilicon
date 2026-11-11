@@ -540,8 +540,8 @@ static inline u128 spu_xfv(u128 a) { if (g_spu_xfloat) for (int i = 0; i < 4; i+
  * rounding, exactly fmaf) when the TU has FMA (lifted SPU sources: -mfma), else fmaf. */
 #if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__)
 #if defined(__aarch64__) && !defined(__SSE2__)
-/* arm64: the same SSE2 ops through sse2neon (IEEE-exact add/sub/mul/compare). No __FMA__ / __SSE4_1__ here, so
- * fma/fms/fnms take the fmaf path and spu__xfq the SSE2 mask/blend form below -- both bit-identical by design. */
+/* arm64: the same SSE2 ops through sse2neon (IEEE-exact add/sub/mul/compare). No __FMA__ / __SSE4_1__ here:
+ * spu__xfq takes the SSE4.1 two-min form and fma/fms/fnms native NEON FMLA/FMLS (both below, bit-identical). */
 #include "../../include/ps3emu/host_simd.h"
 #else
 #include <emmintrin.h>
@@ -555,7 +555,9 @@ static inline u128 spu_xfv(u128 a) { if (g_spu_xfloat) for (int i = 0; i < 4; i+
 #define SPU__FSIMD 1
 static inline __m128 spu__fld(u128 a) { __m128 v; memcpy(&v, &a, 16); return v; }
 static inline u128 spu__fst(__m128 v) { u128 r; memcpy(&r, &v, 16); return r; }
-#if defined(__SSE4_1__)
+/* arm64 (Apple port) takes the same two-min clamp: sse2neon maps _mm_min_epu32 / _mm_min_epi32 to one UMIN / SMIN
+ * each, and it drops the per-operand g_spu_xfloat load + branch of the SSE2 form below (as v131/v171 did on x86). */
+#if defined(__SSE4_1__) || (defined(__aarch64__) && !defined(__SSE2__))
 /* v131 (FPS): the same clamp as two unsigned/signed integer mins against per-run limits instead of a
  * mask/blend behind an `if (g_spu_xfloat)` branch. Every float op in a lifted kernel used to carry that
  * branch (clang does not unswitch the big SPU loops), which also cost spills around each op.
@@ -604,6 +606,13 @@ static inline u128 spu_fm(u128 a, u128 b) { return spu__fst(_mm_mul_ps(spu__xfq(
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__fst(_mm_fmadd_ps (spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)), spu__xfq(spu__fld(c)))); }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__fst(_mm_fmsub_ps (spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)), spu__xfq(spu__fld(c)))); }
 static inline u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__fst(_mm_fnmadd_ps(spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)), spu__xfq(spu__fld(c)))); }
+#elif defined(__aarch64__) && !defined(__SSE2__)
+/* arm64: one fused NEON op per register instead of four fmaf lanes. FMLA/FMLS and the scalar FMADD/FMSUB that
+ * fmaf compiles to share one rounding and the same FPCR handling (rounding mode, FZ); fms = a*b + (-c),
+ * fnms = c + (-a)*b == c + a*(-b), signed zeros included. The clamped operands are never NaN. */
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__fst(vfmaq_f32(spu__xfq(spu__fld(c)), spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__fst(vfmaq_f32(vnegq_f32(spu__xfq(spu__fld(c))), spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__fst(vfmsq_f32(spu__xfq(spu__fld(c)), spu__xfq(spu__fld(a)), spu__xfq(spu__fld(b)))); }
 #else
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; a=spu__fst(spu__xfq(spu__fld(a))); b=spu__fst(spu__xfq(spu__fld(b))); c=spu__fst(spu__xfq(spu__fld(c))); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; a=spu__fst(spu__xfq(spu__fld(a))); b=spu__fst(spu__xfq(spu__fld(b))); c=spu__fst(spu__xfq(spu__fld(c))); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
