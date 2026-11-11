@@ -1,6 +1,7 @@
 /* test_spu_helpers_v130_neon.c -- arm64 only: the NEON v130 block of spu_helpers_vec.h (float compares,
  * conversions, fi, quadword bit shifts) against the scalar references in spu_helpers.h, plus the arm64
- * float core of spu_helpers.h (spu__xfq two-min clamp, NEON fma/fms/fnms) against scalar forms.
+ * float core of spu_helpers.h (spu__xfq two-min clamp, NEON fma/fms/fnms) against scalar forms, and the
+ * TBL frest / frsqest against the LUT references over all 2^32 inputs.
  * Every FPCR rounding mode, FZ on and off. g_spu_xfloat = 1 (the vector clamp is compile-time, as on x86).
  * Exit status 0 = all equal. Prints "N checks, M differ"; M must be 0.
  *
@@ -61,6 +62,12 @@ int main(int argc, char** argv){
     /* spu__xfq (two-min clamp) vs the scalar spu_xf over every bit pattern, default FPCR */
     { long d = 0; for (uint64_t w = 0; w < (1ull << 32); w += 4) { u128 a; for (int i = 0; i < 4; i++) a._u32[i] = (uint32_t)(w + i);
         u128 v = spu__fst(spu__xfq(spu__fld(a))), r = spu_xfv(a); tot++; if (memcmp(&v, &r, 16)) { if (d++ < 5) printf("DIFF xfq %08X\n", a._u32[0]); bad++; } } }
+#if defined(SPU__V130_FREST)
+    /* frest / frsqest (TBL byte planes) vs the scalar LUT references over every bit pattern (no FP math in them) */
+    { long d = 0; for (uint64_t w = 0; w < (1ull << 32); w += 4) { u128 a; for (int i = 0; i < 4; i++) a._u32[i] = (uint32_t)(w + i);
+        u128 v = spu__v_frest(a), r = spu_frest(a); tot++; if (memcmp(&v, &r, 16)) { if (d++ < 5) printf("DIFF frest %08X\n", a._u32[0]); bad++; }
+        v = spu__v_frsqest(a); r = spu_frsqest(a); tot++; if (memcmp(&v, &r, 16)) { if (d++ < 5) printf("DIFF frsqest %08X\n", a._u32[0]); bad++; } } }
+#endif
     for (unsigned rm = 0; rm < 4; rm++) for (unsigned fz = 0; fz < 2; fz++) {
         const uint64_t fpcr = base | ((uint64_t)rm << 22) | ((uint64_t)fz << 24);
         set_fpcr(fpcr);
