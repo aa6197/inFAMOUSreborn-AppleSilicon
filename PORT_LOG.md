@@ -92,6 +92,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 22 | 11-11 | Round 9: SPU threads on slow cores (not kept) | 55.7 / 55.2 | 52.8 / 51.3 | -6.1% | Fast cores freed (272% -> 151%, 1.89 -> 2.34 GHz) but SPU work got slower. |
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
+| 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
 
@@ -300,6 +301,27 @@ Round 11 (ABBA, `PS3RECOMP_METAL_GPU_STATS=1`, MetalFX on):
 - Kept (default on): same as D3D12, same picture, not slower.
 - All four runs are 2-3 flips/s under round 10. The GPU stats
   add some cost; the iPad may also have been warmer.
+
+Round 12 (ABBA, `METALFX=0`, GPU stats + `RFBOUND=1` + `IOS_RUNSTATE=1`):
+
+| run | flips/s | RSX thread | GPU busy (overlap once) |
+|---|---|---|---|
+| M1 encode on RSX thread | 52.8 | 96% | 68–72% |
+| E1 `PS3RECOMP_METAL_ENC_THREAD=1` | 51.6 | 79% | 68–70% |
+| E2 `PS3RECOMP_METAL_ENC_THREAD=1` | 52.3 | 81% | |
+| M2 encode on RSX thread | 52.9 | 96% | |
+
+- Encode thread: -1.7%. No gain again, even with GPU room.
+- With MetalFX off the real GPU load is ~70%. The GPU is not
+  the limit.
+- With the encode thread on, the RSX FIFO walk gets slower
+  (~10-11 -> ~13.6 ms per frame). The 3 fast cores are full
+  (P 268-275% at 1.80 GHz, power-limited). Adding a thread
+  only moves work around.
+- So the iPad is CPU-bound on its 3 fast cores. The M1 Max
+  has 8 fast cores at ~3.2 GHz, which is why it is faster.
+- `RFBOUND-mtl` "main fence wait" reads 0 on Apple: that part
+  of the report is not wired up there. The walk numbers work.
 
 ### Notes
 
