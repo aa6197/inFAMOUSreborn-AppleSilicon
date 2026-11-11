@@ -1653,6 +1653,74 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+#if defined(__APPLE__)
+/* GCM_ENG_FAST: one subchannel-0 word whose rsx_process_method handler is a pure
+ * assignment into the state (texture units, texture CONTROL3, vertex array
+ * format/offset, transform program words), done inline. These are the handler
+ * bodies verbatim; nothing ahead of them in rsx_process_method acts on these
+ * methods except the diagnostic traces, which turn this off. 0 = not one of them. */
+static inline int gcm_state_word(rsx_state* st, u32 m, u32 d)
+{
+    if (m - NV4097_SET_TEXTURE_OFFSET < RSX_MAX_TEXTURES * 0x20u) {
+        rsx_texture_state* const t = &st->textures[(m - NV4097_SET_TEXTURE_OFFSET) >> 5];
+        switch ((m - NV4097_SET_TEXTURE_OFFSET) & 0x1Fu) {
+        case 0x00: t->offset = d; break;
+        case 0x04: t->format = d; break;
+        case 0x08: t->address = d; break;
+        case 0x0C: t->control0 = d; break;
+        case 0x10: t->control1 = d; break;
+        case 0x14: t->filter = d; break;
+        case 0x18: t->image_rect = d; break;
+        case 0x1C: t->border_color = d; break;
+        default: return 0;
+        }
+        t->dirty = 1;
+        st->texture_dirty = 1;
+        return 1;
+    }
+    if (m - NV4097_SET_TRANSFORM_PROGRAM < 32u * 4u) {
+        extern volatile u32 g_rsx_vp_gen;
+        const u32 w = st->vp_ucode_write;
+        if (w + 4 <= sizeof(st->vp_ucode)) {
+            { u32 old; memcpy(&old, &st->vp_ucode[w], 4);
+              if (old != d || w + 4 > st->vp_ucode_bytes) g_rsx_vp_gen++; }
+            st->vp_ucode[w+0] = (u8)(d);
+            st->vp_ucode[w+1] = (u8)(d >> 8);
+            st->vp_ucode[w+2] = (u8)(d >> 16);
+            st->vp_ucode[w+3] = (u8)(d >> 24);
+            st->vp_ucode_write = w + 4;
+            if (w + 4 > st->vp_ucode_bytes) st->vp_ucode_bytes = w + 4;
+            st->vp_dirty = 1;
+        }
+        return 1;
+    }
+    if (m - NV4097_SET_VERTEX_DATA_ARRAY_FORMAT < RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        rsx_vertex_attrib* const a = &st->vertex_attribs[(m - NV4097_SET_VERTEX_DATA_ARRAY_FORMAT) >> 2];
+        a->type      = d & 0xF;
+        a->size      = (d >> 4) & 0xF;
+        a->stride    = (d >> 8) & 0xFF;
+        a->frequency = (d >> 16) & 0xFFFF;
+        a->enabled   = (a->size != 0);
+        a->format    = d;
+        st->vertex_dirty = 1;
+        return 1;
+    }
+    if (m - NV4097_SET_VERTEX_DATA_ARRAY_OFFSET < RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        st->vertex_attribs[(m - NV4097_SET_VERTEX_DATA_ARRAY_OFFSET) >> 2].offset = d;
+        st->vertex_dirty = 1;
+        return 1;
+    }
+    if (m - NV4097_SET_TEXTURE_CONTROL3 < RSX_MAX_TEXTURES * 4u) {
+        rsx_texture_state* const t = &st->textures[(m - NV4097_SET_TEXTURE_CONTROL3) >> 2];
+        t->control3 = d;
+        t->dirty = 1;
+        st->texture_dirty = 1;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1993,6 +2061,41 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           }
                         } }
 #endif
+#if defined(__APPLE__)
+                      /* Apple: the same block store as TC_VEC above in plain C (the compiler vectorises the
+                       * copy), on by default; GCM_TC_BLOCK=0 = the per-word loop below. The per-word loop was
+                       * ~2% of the iPad RSX thread. Same stores, same dirty range, same fallback when the load
+                       * slot is out of range. */
+                      { static int tb = -1;
+                        if (__builtin_expect(tb < 0, 0)) { const char* e = getenv("GCM_TC_BLOCK"); tb = !(e && *e == '0'); }
+                        u32 i0 = 0, ld = s_state.transform_constant_load;
+                        if (method == 0x1EFCu) { ld = gcm_read_be32_direct(p); i0 = 1; }
+                        if (tb && ld < RSX_MAX_VERTEX_CONSTANTS) {
+                            s_state.transform_constant_load = ld;
+                            const u32 base = ld * 4u + ((method + 4u * i0 - 0x1F00u) >> 2);   /* float index */
+                            u32 n = count - i0;
+                            if (base >= RSX_MAX_VERTEX_CONSTANTS * 4u) n = 0;
+                            else if (base + n > RSX_MAX_VERTEX_CONSTANTS * 4u) n = RSX_MAX_VERTEX_CONSTANTS * 4u - base;
+                            if (n) {
+                                float* const dst = &s_state.vertex_constants[0][0] + base;
+                                const u8* const sp = p + 4u * i0;
+                                for (u32 k = 0; k < n; k++) {
+                                    const u32 d = gcm_read_be32_direct(sp + 4u * k);
+                                    memcpy(&dst[k], &d, 4);
+                                }
+                                const u32 s0 = base >> 2, s1 = (base + n - 1u) >> 2;
+                                if (!s_state.vertex_constants_dirty) {
+                                    s_state.vertex_constants_lo = s0; s_state.vertex_constants_hi = s1;
+                                    s_state.vertex_constants_dirty = 1;
+                                } else {
+                                    if (s0 < s_state.vertex_constants_lo) s_state.vertex_constants_lo = s0;
+                                    if (s1 > s_state.vertex_constants_hi) s_state.vertex_constants_hi = s1;
+                                }
+                            }
+                            s_fifo_getoff += 4u + count * 4u;
+                            continue;
+                        } }
+#endif
                       for (u32 i = 0; i < count; i++) {
                           u32 raw; memcpy(&raw, p + 4u * i, 4);
                           const u32 d = ps3_bswap32(raw);
@@ -2109,6 +2212,53 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+#if defined(__APPLE__)
+            /* Apple GCM_ENG_FAST (default on; 0 = off): GCM_GEN_FAST below is off whenever the draw
+             * engine (the Metal back end) is on, so every subchannel-0 word took the per-word path at the
+             * bottom: ~10 debug-switch checks and an IO lookup per word, ~8% of the iPad RSX thread.
+             * This block does per word exactly what that path does for subchannel 0 with those switches
+             * off -- the engine feed, rsx_process_method, the SET_REFERENCE fence push, the GET_REPORT
+             * answer, in that order -- with one IO lookup per block (whole block in one 1 MB IO page, as
+             * GCM_GEN_FAST requires) and direct reads. Off with any switch that watches single words. */
+            { static int ef = -1, lean = 0;
+              if (__builtin_expect(ef < 0, 0)) {
+                  const char* e = getenv("GCM_ENG_FAST");
+                  ef = rsx_draw_engine_enabled() && !rsx_live_draw_enabled() && !(e && *e == '0') &&
+                       !getenv("GCM_SUBCH7") && !getenv("GCM_OBJDBG") && !getenv("GCM_SUBCH_GATE") &&
+                       !getenv("GCM_VAL_WATCH") && !getenv("RSX_LIVE_FEED_DBG");
+                  /* gcm_state_word for the pure-assignment methods; GCM_ENG_FAST=1 = always rsx_process_method */
+                  lean = ef && !(e && *e == '1') && !getenv("RSX_MHIST") && !getenv("RSX_TRACE") &&
+                         !getenv("IMM_MTRACE") && !getenv("TCONST_DBG") && !getenv("SEQ_DBG");
+                  fprintf(stderr, "[GCM] engine method fast path %s%s (GCM_ENG_FAST=0 off, 1 = no inline state words)%c",
+                          ef ? "ON" : "off", lean ? " + inline state words" : "", 10);
+              }
+              if (ef && subch == 0 && count) {
+                  const u32 io0 = s_fifo_getoff + 4u, io1 = s_fifo_getoff + 4u * count;
+                  const u32 ea0 = gcm_io2ea(io0);
+                  if (ea0 && (io0 >> 20) == (io1 >> 20)) {
+                      extern uint8_t* vm_base;
+                      const u8* const args = vm_base + ea0;
+                      for (u32 i = 0; i < count; i++) {
+                          const u32 m = (type == 0) ? method + 4u * i : method;
+                          const u32 d = gcm_read_be32_direct(args + 4u * i);
+                          rsx_draw_engine_method(m, d);
+                          if (lean && gcm_state_word(&s_state, m, d)) continue;
+                          rsx_process_method(&s_state, m, d);
+                          if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                          else if (m == 0x1800) {
+                              const u32 idx = (d & 0xFFFFFFu) / 16u;
+                              { static int rn = 0; if ((rn < 6 && rn++ < 6)) printf("[GET_REPORT] type=%u idx=%u%c", d >> 24, idx, 10); }
+                              if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                                  s_report_data[idx].timestamp = get_timestamp_ns();
+                                  s_report_data[idx].value = (d >> 24) == 1u ? 0xFFFFu : 0u;
+                              }
+                          }
+                      }
+                      s_fifo_getoff += 4u + count * 4u;
+                      continue;
+                  }
+              } }
+#endif
             /* v180 GCM_GEN_FAST (default 1; 0 = off): ordinary subchannel-0 method blocks (~150k words/frame in
              * the city after the v65 constant fast path) skip the per-word debug switches below (GCM_SUBCH7,
              * GCM_OBJDBG, GCM_SUBCH_GATE, GCM_VAL_WATCH, live/dispatch engines, RSX_LIVE_FEED_DBG -- any of them
