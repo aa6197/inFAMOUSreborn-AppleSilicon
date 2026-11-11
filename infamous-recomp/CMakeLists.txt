@@ -480,6 +480,12 @@ if(MSVC AND PORT_NO_GS AND TARGET ps3recomp_runtime)
     target_compile_options(ps3recomp_runtime PRIVATE /GS-)
     message(STATUS "Runtime + lifted SPU: /GS- (PORT_NO_GS=ON, v183)")
 endif()
+# Apple: the same for the runtime. Apple clang adds a stack guard to functions with local arrays by default; on the
+# iPad sink_end, spu_wrch_impl and XXH3 (hot, called per draw / per channel write) carried it.
+if(APPLE AND PORT_NO_GS AND TARGET ps3recomp_runtime)
+    target_compile_options(ps3recomp_runtime PRIVATE -fno-stack-protector)
+    message(STATUS "Runtime: -fno-stack-protector (PORT_NO_GS=ON, Apple)")
+endif()
 
 set(SPU_SOURCES "")
 if(PORT_ENABLE_SPU)
