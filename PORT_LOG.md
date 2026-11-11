@@ -19,8 +19,8 @@ Read this first every session. Newest entry on top.
   Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
-- iPad speed now (11-11, round 4): **48.3 / 49.1 flips/s** with the hop gate
-  and SPU vectors in registers. Full list: "### iPad speed history" below.
+- iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
+  SPU vectors in registers and PGO profile v5 everywhere. Full list: "### iPad speed history" below.
   Older note: ~40 flips/s hot, ~43 warm in gameplay (hot ABBA,
   11-11). Was 27–28 hot on 11-10 and 20–21 on 11-09. Gains: short
   sleeps, NEON SPU helpers, RSX thread cuts. The iPad slows as it warms
@@ -85,6 +85,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 15 | 11-11 | Round 2: stack guard off + mfc, lpgate, lane QoS 0 |  | 51.1 / 45.9 | 0.0% | all neutral; serial mode 35.3 / 33.4 (bad) |
 | 16 | 11-11 | Round 3: hop gate | 43.6 / 43.5 | 46.3 / 46.6 | +6.7% | SPU PGO worth ~5.5% on top |
 | 17 | 11-11 | Round 4: SPU vectors in registers | 47.4 / 46.9 | 48.3 / 49.1 | +3.3% | Mac same: 79.3 / 79.6 |
+| 18 | 11-11 | Round 5: SPU PGO profile retrained (v5) | 54.4 / 47.7 | 55.6 / 51.9 | +5.3% | RSX thread 95% busy again; Mac 81.6 / 87.9 vs 80.1 / 71.5 (busy Mac, not reliable) |
 
 ---
 
@@ -172,6 +173,19 @@ Round 4 (ABBA, SPU without PGO on both):
 - ef0540f header + test, f5055f0 `PORT_SPU_VECARGS` (CMake, Apple,
   default ON). x86 / Windows preprocessed output unchanged.
 - The RSX thread is close to the limit again on the iPad.
+
+Round 5 (ABBA): PGO profile v5 everywhere, retrained with vectors in
+registers (`$WORK_DIR/pgo/apple-v5.profdata`, not in git).
+
+| | vecargs, SPU without PGO | + PGO v5 on SPU too |
+|---|---|---|
+| iPad flips/s | 54.4 / 47.7 | **55.6 / 51.9** (+5.3%) |
+| iPad RSX thread busy | 90–96% | 95% |
+| Mac flips/s (load 11 → 22) | 80.1 / 71.5 | 81.6 / 87.9 |
+
+- PGO v5 is now the setup in `build-ios-pgo` and `build-mac-pgo`
+  (`PORT_SPU_PGO=ON`, `PORT_PGO_PROFILE=.../apple-v5.profdata`).
+- Mac numbers are not reliable (Photos and storage scans running).
 
 ### Notes
 
