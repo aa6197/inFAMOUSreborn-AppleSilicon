@@ -24,13 +24,16 @@ Read this first every session. Newest entry on top.
   sleeps, NEON SPU helpers, RSX thread cuts. The iPad slows as it warms
   up (P cores ~1.8 GHz hot); only trust ABBA runs in the hot state. See
   entry "iPad speed: short sleeps, NEON, RSX cuts".
-- The RSX thread is now the limit on the iPad (98–99% busy).
+- Later on 11-11: texture and geometry hashes moved to 3 worker
+  threads (TEXCS, GEOCS) and a texture pool. iPad hot 41–42 flips/s
+  (39–40 on a hotter day), Mac static scene ~77–83.
+- The RSX thread is still the iPad limit, but now 87–92% busy
+  (was 98–99%). Power is shared, so less work on any thread helps.
 - PGO on Apple: profile `$WORK_DIR/pgo/apple-v4.profdata` (not in git).
   Mac +3%, iPad no gain. Build dirs `build-mac-pgo`, `build-ios-pgo`
   (installed on the iPad).
-- Next speed work (iPad RSX thread, profile 11-11): texture checksum
-  (15.5%), `sink_end` (12.7%, spread out), XXH3 geometry hash (10.1%),
-  FIFO walk (8%).
+- Next speed work: see "### Next" in the 11-11 entry (main-thread
+  spin wait, SPU job code, `sink_end`, Metal encode).
 - **Mac keyboard + mouse (new):** same keys as Windows (WASD, mouse look,
   Space, Esc pause). See entry "Mac keyboard + mouse controls".
 - Still needs the user: real taps on the touch pad, a real controller,
@@ -215,12 +218,99 @@ threads drop to P 2.75 / E 2.81 GHz. More threads busy = slower cores.
 - Mac static scene: 78.0 / 76.2 vs 75.8 / 73.6 flips/s (+3%,
   Mac load 11–33 from other work).
 
+### Parallel hashes: TEXCS + GEOCS (11-11)
+
+- Idea: the RSX thread is the limit on the iPad. Move its hashing to
+  3 worker threads (utility QoS). The RSX thread only checks results.
+- 6927e13 `TEX_CSUM_MLP`: texture checksum with 8 loads in flight.
+  iPad +1% (40.8 / 40.6 vs 40.1 / 40.5), Mac same.
+- 7ac3303 **TEXCS**: workers checksum the textures the last frame used.
+  - A worker value counts only if it was made after the last change to
+    guest memory the RSX thread can see (put read, NV406E acquire, RSX
+    2D write), in the same frame, for the same inputs.
+  - Textures that changed in the last 16 frames get no job.
+  - `PS3RECOMP_ENGINE_TEXCS=0` off, `_THREADS=<n>` (default 3),
+    `_VERIFY=1`, `_STATS=1`.
+- c94c571 **GEOCS**: same workers, same rule, for the geometry
+  memo's vertex hash.
+  - Jobs = last frame's probe range lists, one job per distinct list.
+  - A probe takes a value only if pointer, start, length and location of
+    every range match exactly.
+  - A probe that finds its job not started does it inline and leaves the
+    value for later probes of the same ranges.
+  - `PS3RECOMP_ENGINE_GEOCS=0` off, `_VERIFY=1`, `_STATS=1`.
+  - Verify (Mac): 33 windows, ~24M values taken, 0 differ. Inline
+    hashing 15.5 → ~3.5 MB per frame (title), 5.9 MB at 8700 draws.
+
+| | off | on |
+|---|---|---|
+| TEXCS, Mac static scene | 75.1 / 72.1 | **82.5 / 80.6** (+11%) |
+| TEXCS, iPad hot BAAB | 40.6 / 40.2 | **42.1 / 42.1** (+4%) |
+| GEOCS, Mac static scene | 82.9 / 82.7 | 82.4 / 84.5 (same) |
+| GEOCS, iPad cool pair | 48.6 | 49.0 |
+| GEOCS, iPad hot pair | 41.4 | 42.3 |
+| GEOCS, iPad hot BAAB | 40.3 / 39.6 | **41.2 / 40.2** (+2%) |
+
+- GEOCS: iPad RSX thread 86–93% busy vs 95–96%.
+- The Mac at ~83 flips/s is no longer RSX-bound: GEOCS gives it nothing.
+
+### Texture pool (11-11)
+
+- Depth snapshots, depth colour copies and feedback copies were new
+  Metal textures every time (~14 a frame). AGX texture init + dealloc
+  was ~3.7% of the Mac RSX thread.
+- 835e6a5: they now come from a small pool (64 textures, 192 MB,
+  dropped after 120 frames unused). Only textures the GPU writes
+  whole (full-screen resolve, full blit). Never colour targets or
+  CPU-filled textures.
+- A pooled texture is handed out again only after the last commit that
+  used it is done on the GPU. (Taking one the GPU still reads is
+  correct, but makes the new pass wait for the old frame: Mac -2%.)
+- Mac check: ~7800 hits, 0–3 new per 600 frames; holds 5–7 textures
+  (19–27 MB). Frames look right.
+- `PS3RECOMP_METAL_TEX_POOL=0` off, `=2` logs hits. Off with ENC_THREAD.
+
+| | off | on |
+|---|---|---|
+| Mac static scene | 77.1 / 75.3 | 76.7 / 76.7 (same) |
+| iPad hot BAAB | 39.6 / 38.6 | **39.7 / 39.3** (+1%) |
+
+- iPad total CPU 668 / 671% → 647 / 653%.
+- This iPad was hotter than in the GEOCS test (39 vs 41 hot).
+
+### Tried, no gain
+
+- Faster clock in the Win32 shim (`QueryPerformanceCounter`,
+  `GetTickCount64`). macOS `clock_gettime(CLOCK_MONOTONIC)` is 17 ns
+  vs 7 ns raw, and 11% of a Mac SPURS kernel thread. But on the iPad
+  it is ~0.2%, and the raw clock is 10.5 s off the monotonic one, so
+  mixing them would break timers. Dropped.
+
+### Mac profile recipe
+
+- `$WORK_DIR/tools/prof_mac_xc.sh <tag> <at> <dur>` → `prof.trace`.
+- Export: `xcrun xctrace export --input prof.trace --xpath
+  '/trace-toc/run/data/table[@schema="time-profile"]' > tp.xml`.
+- Scripts in `$WORK_DIR/tools` (python3.12): `tsym.py tp.xml <thread>
+  <binary>` (leaf + inclusive), `tcallee.py` (callees of a function),
+  `tcaller2.py` (caller chains), `tline2.py` (by source line; needs
+  DWARF from a `-g` build), `tleafbin.py` (leaf share by library;
+  works on iPad traces too).
+- iPad traces: keep a copy of the app binary from the profiled build.
+  App frames are offsets; `atos` needs that exact binary.
+
 ### Next
 
-- iPad RSX thread (profile 11-11, leaf share): `eng_texture_slot`
-  15.5% (the sampled checksum loads), `sink_end` 12.7%, XXH3 geometry
-  hash 10.1%, FIFO walk 8.0%, `rsx_dispatch_method` 3.6%.
-- Fewer instructions in the hot SPU jobs (power, not just time).
+- Mac RSX thread now (profile 11-11, after pool, inclusive):
+  `sink_end` 69% (leaf 11%), Metal encode 18% (`drawIndexedPrimitives`
+  6.5%, new render encoders 2.8%), FIFO walk leaf 9%,
+  `rsx_dispatch_method` 5%, vertex fetch plan 5%.
+- iPad: the guest main thread polls its job counters with
+  `sys_timer_usleep(5)`. With the yield loop that is ~20% of a core
+  inside `sched_yield`, all burned power. Test other waits.
+- SPU jobs: 3 lanes + kernel 0/11 ≈ 1.8 cores of real job work
+  (`jobmod_d466…`, `jobmod_153e…`). Lifted code stores and reloads
+  many registers around every call. Fewer instructions = less power.
 
 ## 2026-11-10 — iOS: "too old" screen for chips before A14
 
