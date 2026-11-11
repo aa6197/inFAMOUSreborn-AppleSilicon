@@ -150,6 +150,10 @@ static struct {
     u32 n_surfaces;
     eng_zdepth zdepths[ENG_MAX_ZDEPTHS];
     u32 n_zdepths;
+    /* One bit per hash of the (location, offset) of every colour and depth
+     * target (eng_rt_note). Bits are only added: a slot keeps its key for
+     * life, so a set bit can be stale but a clear bit is exact. */
+    u64 rt_filter[16];
     /* This draw's shadow-compare units, as the D3D12 backend keys them: bits
      * 0-3 the units, bits 4-15 a 3-bit zfunc per unit. */
     u32 shkey;
@@ -187,6 +191,25 @@ static struct {
 
     rsx_fp_constant_block fp_constants;
 } g;
+
+/* The target filter. A texture unit whose address has no bit set reads no
+ * colour or depth target, so sink_bind_textures skips both table scans for
+ * it: an exact shortcut, the scans would find nothing. iPad profile: the two
+ * scans, per bound unit per draw, were ~5% of the RSX thread. */
+static inline u32 eng_rt_bit(u32 location, u32 offset)
+{
+    return ((offset ^ (location << 31)) * 2654435761u) >> 22;   /* 0..1023 */
+}
+static inline void eng_rt_note(u32 location, u32 offset)
+{
+    const u32 b = eng_rt_bit(location, offset);
+    g.rt_filter[b >> 6] |= 1ull << (b & 63u);
+}
+static inline int eng_rt_maybe(u32 location, u32 offset)
+{
+    const u32 b = eng_rt_bit(location, offset);
+    return (int)((g.rt_filter[b >> 6] >> (b & 63u)) & 1u);
+}
 
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
 static char s_vs_hlsl[256 * 1024];
@@ -601,6 +624,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     if (s->feedback && g.be->texture_release) g.be->texture_release(g.be->user, s->feedback);
     s->location = location; s->offset = offset;
+    eng_rt_note(location, offset);
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
     s->cwritten = 0;
@@ -700,6 +724,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     if (z->ccopy && g.be->texture_release) g.be->texture_release(g.be->user, z->ccopy);
     z->location = location; z->offset = offset;
+    eng_rt_note(location, offset);
     z->w = want_w; z->h = want_h;
     z->handle = handle;
     z->snapshot = 0;
@@ -3281,6 +3306,11 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     g.texk = 0;
     s_bind_serial++;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        /* The enable bit alone first: SET_TEXTURE_CONTROL0 bit 31, the bit
+         * rsx_dsp_get_texture reports as t.enabled. Most of the 16 units are
+         * off, and decoding all of a unit's registers was ~3% of the RSX
+         * thread on the iPad. */
+        if (!(rsx_dsp_reg(&g.rsx, 0x1A0Cu + u * 0x20u) >> 31)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -3300,15 +3330,16 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         /* The depth target at this address (zc), and the same if this draw
          * is not testing against it (zi). */
         u32 zi = ENG_INVALID, zc = ENG_INVALID;
-        for (u32 i = 0; i < g.n_zdepths; i++)
+        int sampled = -1, feedback = 0;
+        const int maybe_rt = eng_rt_maybe(t.location, t.offset);
+        for (u32 i = 0; maybe_rt && i < g.n_zdepths; i++)
             if (g.zdepths[i].handle && g.zdepths[i].location == t.location &&
                 g.zdepths[i].offset == t.offset) {
                 if (zc == ENG_INVALID) zc = i;
                 if (current_zslot != i) { zi = i; break; }
             }
 
-        int sampled = -1, feedback = 0;
-        for (u32 i = 0; i < g.n_surfaces; i++) {
+        for (u32 i = 0; maybe_rt && i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
