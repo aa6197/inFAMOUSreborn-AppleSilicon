@@ -87,6 +87,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 17 | 11-11 | Round 4: SPU vectors in registers | 47.4 / 46.9 | 48.3 / 49.1 | +3.3% | Mac same: 79.3 / 79.6 |
 | 18 | 11-11 | Round 5: SPU PGO profile retrained (v5) | 54.4 / 47.7 | 55.6 / 51.9 | +5.3% | RSX thread 95% busy again; Mac 81.6 / 87.9 vs 80.1 / 71.5 (busy Mac, not reliable) |
 | 19 | 11-11 | Round 6: Metal encoding on its own thread (not kept) | 54.2 / 55.6 | 54.1 / 55.0 | -0.6% | Drawing thread 93% -> 83% busy, but no faster. Something else also limits at ~55. |
+| 20 | 11-11 | Round 7: geometry prefetch hints (not kept yet) | 55.1 / 55.7 | 54.3 / 55.6 | -0.8% | Mac drawing thread spends less time on geometry, but iPad no faster. Same ~55 limit. |
 
 ---
 
@@ -200,6 +201,18 @@ Round 6 (ABBA): Metal encoding on its own thread
 - The RSX thread gets ~10% free time, but speed stays the same.
   So something else also limits at ~55 flips/s (GPU, or the
   PPU/SPU side). Keep it off.
+
+Round 7 (ABBA): geometry memo prefetch hints
+(`PS3RECOMP_ENGINE_GEO_PF`, Apple only). Not kept yet.
+
+| | off | on |
+|---|---|---|
+| iPad flips/s | 55.1 / 55.7 | 54.3 / 55.6 (−0.8%) |
+| iPad RSX thread busy | 83–96% | 95–96% |
+
+- On the Mac it cut `sink_end` from 22.9% to 17.4% of the RSX thread.
+- On the iPad: no change. Same ~55 limit as round 6.
+- Code stays uncommitted. Retest once the ~55 limit is found.
 
 ### Notes
 
