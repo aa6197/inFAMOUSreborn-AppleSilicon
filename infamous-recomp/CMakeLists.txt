@@ -623,6 +623,23 @@ if(SPU_SOURCES)
                 set_source_files_properties("${_f}" PROPERTIES COMPILE_OPTIONS "${_o};-w")
             endif()
         endforeach()
+        # Apple port: A/B knobs for the lifted SPU sources only. PORT_SPU_PGO=OFF builds them without the PGO
+        # profile (the profile goes stale for every SPU function when a runtime macro they all expand changes).
+        # PORT_SPU_EXTRA_OPTS = extra compile options for them, e.g. -DSPU_NO_HOP_GATE.
+        if(APPLE)
+            option(PORT_SPU_PGO "Apply PORT_PGO_PROFILE to the lifted SPU sources too" ON)
+            set(PORT_SPU_EXTRA_OPTS "" CACHE STRING "Extra compile options for the lifted SPU sources (A/B tests)")
+            set(_spu_extra ${PORT_SPU_EXTRA_OPTS})
+            if(PORT_PGO STREQUAL "USE" AND NOT PORT_SPU_PGO)
+                list(APPEND _spu_extra -fno-profile-instr-use)
+            endif()
+            if(_spu_extra)
+                foreach(_f IN LISTS SPU_SOURCES)
+                    get_source_file_property(_o "${_f}" COMPILE_OPTIONS)
+                    set_source_files_properties("${_f}" PROPERTIES COMPILE_OPTIONS "${_o};${_spu_extra}")
+                endforeach()
+            endif()
+        endif()
     endif()
 endif()
 
