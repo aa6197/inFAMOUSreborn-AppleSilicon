@@ -27,6 +27,10 @@ Read this first every session. Newest entry on top.
 - Later on 11-11: texture and geometry hashes moved to 3 worker
   threads (TEXCS, GEOCS) and a texture pool. iPad hot 41–42 flips/s
   (39–40 on a hotter day), Mac static scene ~77–83.
+- Later still on 11-11: one TLS block (4336c81, Mac +2.7%, iPad
+  same), long main-thread waits park (05e2575, Mac +2.3% and −6% CPU,
+  iPad same fps, −3..5% CPU), SPURS kick ported but off (7edc84e,
+  `SPURS_KICK_APPLE=1`). A cooler iPad runs ~50–51 flips/s.
 - The RSX thread is still the iPad limit, but now 87–92% busy
   (was 98–99%). Power is shared, so less work on any thread helps.
 - PGO on Apple: profile `$WORK_DIR/pgo/apple-v4.profdata` (not in git).
@@ -278,6 +282,77 @@ threads drop to P 2.75 / E 2.81 GHz. More threads busy = slower cores.
 - iPad total CPU 668 / 671% → 647 / 653%.
 - This iPad was hotter than in the GEOCS test (39 vs 41 hot).
 
+### Thread-local cuts (11-11)
+
+- On Apple every `__thread` read is a call (`_tlv_get_addr`).
+  It was 2.3% of iPad CPU (shown as libdyld in profiles).
+- 4336c81: the SPU call fast path read 6 thread-locals per call.
+  Now one block (`g_spu_hot_tls`: trampoline + IRQ count) = 2 reads.
+  `spu_img_restore` is inline on Apple.
+- Windows: unchanged (same names, same code).
+
+| | old | new |
+|---|---|---|
+| Mac static scene, BAAB | 87.0 / 85.8 | **89.3 / 88.4** (+2.7%) |
+| iPad, ABBA | 50.9 / 51.2 | 51.3 / 50.9 (same) |
+
+### Short sleeps on Apple: modes tried (11-11)
+
+- iPad hot ABCCBA (flips/s):
+  - yield loop (default): 38.8 / 42.9
+  - isb spin (`PS3_SHORT_SLEEP_SPIN=1`): 39.6 / 38.8
+  - nanosleep (`PS3_SHORT_SLEEP_NANO=1`): 36.1 / 36.0 (−7%)
+- WFE wait (tried, dropped): the thread never blocks, so the OS keeps
+  a P core for it. game-main 51 → 96% busy, RSX thread 88 → 71%,
+  46.3 / 48.7 vs 50.9 flips/s. Diff kept in
+  `$WORK_DIR/runs/wfe-sleep-tried.diff`.
+- Default stays the yield loop.
+
+### SPURS kick on Apple (11-11)
+
+- Windows wakes a parked SPURS kernel thread when new work comes
+  (`ps3_spurs_kick`, a per-thread event). On Apple this was compiled
+  out: an idle kernel only saw new work when its 250 µs nap ran out.
+- Now: mutex + condition variable per kernel thread (iOS 16 has no
+  `os_sync_wait_on_address`). Same protocol as Windows.
+- Off by default on Apple: no gain on the iPad. `SPURS_KICK_APPLE=1` = on.
+- iPad without the ReadyCountStore kick (`V221A_RCS=0`): 51.2 / 51.3.
+- Mac: 12 threads registered, no hang.
+
+| | off | on |
+|---|---|---|
+| Mac static scene, ABBA | 90.2 / 80.7 | 87.4 / 88.3 (noisy, load 15–20) |
+| iPad, ABBA | 51.8 / 50.8 | 49.5 / 50.7 |
+
+### Other findings
+
+- memmove (2.2% of iPad CPU) is real SPU DMA (`mfc_do_transfer`).
+- PGO builds have ~200k outlined code stubs (no-PGO: 577). On the
+  iPad they are only 0.67% of CPU. Not worth chasing.
+
+### Park long waits (11-11)
+
+- The main thread polls job counters with `sys_timer_usleep(5)`
+  (lr 0x00116824). `PS3_SHORT_SLEEP_STATS=1` logs how long those
+  waits last (every 10 s). Most last 0.5–10 ms; ~70–80% of the
+  main thread's time is waiting.
+- Before: every sleep was a yield loop, so a long wait kept a core busy.
+- Now (Apple default): a wait older than 200 µs sleeps for real in
+  50 µs steps (`nanosleep`). Short waits keep the yield loop.
+- `PS3_SHORT_SLEEP_PARK=<after_us>[:<sleep_us>]`, `=0` = off.
+- Windows: unchanged (Apple-only block).
+
+| | off | 200:50 | 100:20 |
+|---|---|---|---|
+| Mac static scene, ABBA | 82.9 / 81.4 | **83.0 / 84.5** | 78.2 / 80.9 (vs 200:50: 74.0 / 81.3, load 22–31) |
+| Mac CPU | 747% / 729% | **701% / 694%** | |
+| iPad, ABCCBA | 49.3 / 51.5 | 51.0 / 50.3 | 49.4 / 50.1 |
+| iPad CPU | 657% / 671% | **642% / 636%** | 627% / 634% |
+
+- Mac +2.3% flips/s, −6% CPU. iPad same flips/s, −3..5% CPU.
+- Without park the iPad main thread had ~310 waits/10 s over 10 ms
+  (3.4 s of every 10 s). With park those are gone.
+
 ### Tried, no gain
 
 - Faster clock in the Win32 shim (`QueryPerformanceCounter`,
@@ -305,9 +380,8 @@ threads drop to P 2.75 / E 2.81 GHz. More threads busy = slower cores.
   `sink_end` 69% (leaf 11%), Metal encode 18% (`drawIndexedPrimitives`
   6.5%, new render encoders 2.8%), FIFO walk leaf 9%,
   `rsx_dispatch_method` 5%, vertex fetch plan 5%.
-- iPad: the guest main thread polls its job counters with
-  `sys_timer_usleep(5)`. With the yield loop that is ~20% of a core
-  inside `sched_yield`, all burned power. Test other waits.
+- Main-thread wait: done (park, 05e2575). Spin, WFE, nanosleep and
+  the SPURS kick were tried, see above.
 - SPU jobs: 3 lanes + kernel 0/11 ≈ 1.8 cores of real job work
   (`jobmod_d466…`, `jobmod_153e…`). Lifted code stores and reloads
   many registers around every call. Fewer instructions = less power.
