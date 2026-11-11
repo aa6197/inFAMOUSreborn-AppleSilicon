@@ -16,8 +16,10 @@ Read this first every session. Newest entry on top.
   at3_standalone (LGPL 2.1) is linked statically; the repo has no
   top-level licence.
 - Milestone: **M9 done on the real iPad** (iPad Pro 11 M4, iPadOS 27.2):
-  gameplay + pause menu, 330 s, no crash. M10 (iPhone) is done in the
-  Simulator only (iPhone 17, iPhone 18 Pro). **Never use the physical iPhone.**
+  gameplay + pause menu, 330 s, no crash. M10 (iPhone): Simulator
+  (iPhone 17, iPhone 18 Pro), plus one test on the real iPhone 16 Pro
+  (11-11, user's OK): runs, 12.6–15.8 flips/s. See entry "iPhone 16 Pro:
+  first real-device test". **Otherwise never use the physical iPhone.**
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -94,6 +96,31 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-11 — iPhone 16 Pro: first real-device test
+
+One install and test on the user's iPhone 16 Pro (iOS 27.2), with
+their OK. Same app as the iPad (`build-ios-pgo`, PGO v5, MetalFX on).
+Game folder copied in with devicectl (8.2 GB in 4 min). Same 330 s
+script as `ios_ab.sh`. `ios_device.sh` now takes `IOS_DEV=<udid>`.
+
+| run | flips/s (150–250 s) | min free memory | thermal |
+|---|---|---|---|
+| 1 (cool start) | 15.8 | 4267 MB of 6135 | 0 → 2 within ~1 min |
+| 2 (hot) | 12.6 | 4320 MB | 2 the whole run |
+
+- Works: boot, title, gameplay, pause menu, touch pad. No crash, no
+  jetsam. MetalFX 1280x720 → 2144x1206 (Metal view 2622x1206).
+- 6 cores (2 P + 4 E), so lean mode is on.
+- CPU-bound and hot: thermal state 2 ("serious") within a minute.
+  P cores only 1.3–1.4 GHz, E cores 2.1 GHz. ~6.6 threads waiting
+  for a core. The iPad keeps 3 P cores at ~1.8 GHz.
+- Memory is fine: over 4 GB still free.
+- Runs: `runs/20261111-192231-iphone-perf1`, `runs/20261111-192853-iphone-perf2`.
+- Ideas if the iPhone matters later: fewer SPU threads, or a 30 fps
+  cap so the phone stays cooler.
 
 ---
 

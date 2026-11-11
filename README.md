@@ -26,7 +26,7 @@ This is a Mac and iPad port of [inFAMOUSreborn](https://github.com/whompay/inFAM
 - **Works now:** inFamous (Europe, `BCES00220`)
 - **Not yet:** other regions
 - **Tested on:** a Mac with an M5 Pro (60+ fps) and an iPad Pro 11-inch (M4, about 50–55 fps)
-- **iPhone:** runs in the Simulator only so far
+- **iPhone:** runs on an iPhone 16 Pro, but slowly (about 13–16 fps)
 - **Game files are not included.** You choose your own copy of the game when the app first starts. The app copies what it needs from it
 
 ## Install
@@ -55,7 +55,7 @@ You only do this once.
 You need iPadOS or iOS 16 or newer, and:
 
 - **iPad:** an A14 or M1 chip or newer. That's iPad Air (4th generation), iPad (10th generation), iPad mini (6th generation), iPad Pro with M1, or newer. Tested on an iPad Pro with M4
-- **iPhone:** iPhone 12 or newer. Not tested on a real iPhone yet, and it will likely run slower than on an iPad
+- **iPhone:** iPhone 12 or newer. Tested on an iPhone 16 Pro. It runs much slower than on an iPad, because the phone gets hot fast
 
 On an older device the app shows a "too old" message instead of starting.
 
@@ -105,15 +105,16 @@ Controllers, touch and keyboard controls have only been lightly tested. If yours
 
 ## Status
 
-| | Mac (M5 Pro) | iPad Pro 11 (M4) | iPhone |
+| | Mac (M5 Pro) | iPad Pro 11 (M4) | iPhone 16 Pro |
 |---|---|---|---|
-| Runs | Yes | Yes | Simulator only |
-| Speed | 60+ fps | about 50–55 fps | not tested |
+| Runs | Yes | Yes | Yes |
+| Speed | 60+ fps | about 50–55 fps | about 13–16 fps |
 
 Known issues:
 
 - 3D surfaces close to the camera look too bright
 - The iPad gets a little slower when it's hot
+- The iPhone gets hot within a minute and then slows down a lot
 - Only tested on one Mac so far. Older chips (M1, M2) will be slower
 
 Please report bugs here, not on inFAMOUSreborn. This port isn't part of the original project.
