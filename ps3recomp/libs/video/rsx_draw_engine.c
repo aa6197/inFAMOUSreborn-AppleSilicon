@@ -1398,6 +1398,10 @@ static u16 s_tcs_used[2][ENG_MAX_TEXTURES];        /* slots validated, by frame 
 static u32 s_tcs_used_n[2], s_tcs_used_frame[2] = { ~0u, ~0u };
 static struct { u64 kicks, jobs, take, self, busy, stale, miss, skip_in, checked, differ; } s_tcs_st;
 static _Atomic u64 s_tcs_byw;
+/* GEOCS (with the geometry memo below) shares these workers */
+static u32 s_gcs_wake;          /* under s_tcs_mx */
+static _Atomic int s_gcs_in[2];
+static void eng_gcs_run(u32 gen);
 
 static void eng_tcs_run(u32 gen)
 {
@@ -1422,44 +1426,59 @@ static void* eng_tcs_worker(void* p)
 {
     (void)p;
     pthread_setname_np("eng texcs");
-    u32 seen = 0;
+    u32 seen = 0, gseen = 0;
     for (;;) {
         pthread_mutex_lock(&s_tcs_mx);
-        while (s_tcs_wake == seen) pthread_cond_wait(&s_tcs_cv, &s_tcs_mx);
-        const u32 gen = s_tcs_wake;
+        while (s_tcs_wake == seen && s_gcs_wake == gseen) pthread_cond_wait(&s_tcs_cv, &s_tcs_mx);
+        const u32 gen = s_tcs_wake, ggen = s_gcs_wake;
         pthread_mutex_unlock(&s_tcs_mx);
-        seen = gen;
-        atomic_fetch_add(&s_tcs_in[gen & 1u], 1);
-        eng_tcs_run(gen);
-        atomic_fetch_sub(&s_tcs_in[gen & 1u], 1);
+        if (gen != seen) {
+            seen = gen;
+            atomic_fetch_add(&s_tcs_in[gen & 1u], 1);
+            eng_tcs_run(gen);
+            atomic_fetch_sub(&s_tcs_in[gen & 1u], 1);
+        }
+        if (ggen != gseen) {
+            gseen = ggen;
+            atomic_fetch_add(&s_gcs_in[ggen & 1u], 1);
+            eng_gcs_run(ggen);
+            atomic_fetch_sub(&s_gcs_in[ggen & 1u], 1);
+        }
     }
     return NULL;
+}
+
+/* the worker threads, once, for TEXCS and/or GEOCS (RSX thread) */
+static void eng_cs_pool_start(void)
+{
+    static int started;
+    if (started) return;
+    started = 1;
+    const char* t = getenv("PS3RECOMP_ENGINE_TEXCS_THREADS");
+    if (t && *t) { s_tcs_nthr = atoi(t); if (s_tcs_nthr < 0) s_tcs_nthr = 0; if (s_tcs_nthr > 8) s_tcs_nthr = 8; }
+    (void)eng_csum_mlp_on();   /* its lazy init runs here, before any worker */
+    for (int i = 0; i < s_tcs_nthr; i++) {
+        pthread_attr_t at; pthread_t th;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 256u << 10);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_attr_set_qos_class_np(&at, QOS_CLASS_UTILITY, 0);
+        const int rc = pthread_create(&th, &at, eng_tcs_worker, NULL);
+        pthread_attr_destroy(&at);
+        if (rc) { s_tcs_nthr = i; break; }
+    }
 }
 
 static int eng_tcs_on(void)
 {
     if (__builtin_expect(s_tcs_cfg < 0, 0)) {
         const char* e = getenv("PS3RECOMP_ENGINE_TEXCS");
-        const char* t = getenv("PS3RECOMP_ENGINE_TEXCS_THREADS");
         const char* v = getenv("PS3RECOMP_ENGINE_TEXCS_VERIFY");
         const char* s = getenv("PS3RECOMP_ENGINE_TEXCS_STATS");
         s_tcs_cfg = !(e && *e == '0') && !eng_tex_fullhash_on();
-        if (t && *t) { s_tcs_nthr = atoi(t); if (s_tcs_nthr < 0) s_tcs_nthr = 0; if (s_tcs_nthr > 8) s_tcs_nthr = 8; }
         s_tcs_verify = v && *v == '1';
         s_tcs_stats = s && *s == '1';
-        (void)eng_csum_mlp_on();   /* its lazy init runs here, before any worker */
-        if (s_tcs_cfg) {
-            for (int i = 0; i < s_tcs_nthr; i++) {
-                pthread_attr_t at; pthread_t th;
-                pthread_attr_init(&at);
-                pthread_attr_setstacksize(&at, 256u << 10);
-                pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-                pthread_attr_set_qos_class_np(&at, QOS_CLASS_UTILITY, 0);
-                const int rc = pthread_create(&th, &at, eng_tcs_worker, NULL);
-                pthread_attr_destroy(&at);
-                if (rc) { s_tcs_nthr = i; break; }
-            }
-        }
+        if (s_tcs_cfg) eng_cs_pool_start();
         fprintf(stderr, "[TEXCS] parallel texture checksums: %s, %d workers "
                 "(PS3RECOMP_ENGINE_TEXCS, _THREADS)%s\n", s_tcs_cfg ? "ON" : "off",
                 s_tcs_cfg ? s_tcs_nthr : 0, s_tcs_verify ? ", VERIFY" : "");
@@ -3124,10 +3143,236 @@ typedef struct {
     int have_key;
 } eng_geo_probe;
 
+/* ---- GEOCS: the memo's vertex hashes on the TEXCS workers (Apple) ---------
+ * The vertex hash of each memo probe (eng_geo_vtx_hash) was ~15% of the RSX
+ * thread on the Mac after TEXCS (static scene: ~5900 probes and 15.5 MB per
+ * frame). Same scheme as TEXCS: the range lists probed in the previous frame
+ * become jobs at the first probe of each data epoch (and frame); a probe
+ * takes a worker's value only if the job is of the current epoch and frame
+ * and hashes exactly the same bytes (host pointer, length, location and start
+ * of every range). Shapes whose vertices changed in the last 16 frames get no
+ * job. A probe that finds its job not started computes it inline and leaves
+ * the value for later probes of the same ranges in the epoch.
+ * PS3RECOMP_ENGINE_GEOCS=0 off (Apple default on, with the memo),
+ * PS3RECOMP_ENGINE_GEOCS_VERIFY=1 recomputes every taken value and counts
+ * differences, PS3RECOMP_ENGINE_GEOCS_STATS=1 logs [GEOCS] every 600 frames. */
+#if defined(__APPLE__)
+#define GCS_JOBS 16384u
+#define GCS_RNGS 32768u
+#define GCS_TAB  32768u     /* power of two, > GCS_JOBS */
+typedef struct { const u8* p; u32 a, len, loc; } gcs_rng;
+typedef struct { u32 r0, nr, l1; } gcs_rec;
+typedef struct {
+    u32 r0, nr;                 /* ranges in s_gcs_jr[gen & 1] */
+    _Atomic u32 state;          /* 0 pending, 1 claimed, 2 done (res valid) */
+    u64 res;
+} gcs_job;
+typedef struct { u32 gen, key, idx; } gcs_tab;
+static gcs_job s_gcs_j[2][GCS_JOBS];     /* by generation parity */
+static gcs_rng s_gcs_jr[2][GCS_RNGS];
+static _Atomic u64 s_gcs_ctr;            /* gen (bits 32..63) | n (16..31) | next (0..15) */
+static int s_gcs_cfg = -1, s_gcs_verify, s_gcs_stats;
+static _Atomic u64 s_gcs_byw;
+/* RSX thread only from here */
+static gcs_rec s_gcs_rec[2][GCS_JOBS];   /* probes, by frame parity */
+static gcs_rng s_gcs_rp[2][GCS_RNGS];
+static u32 s_gcs_rec_n[2], s_gcs_rp_n[2], s_gcs_rec_frame[2] = { ~0u, ~0u };
+static gcs_tab s_gcs_tab[GCS_TAB];
+static u32 s_gcs_kick_epoch, s_gcs_kick_frame, s_gcs_gen;
+static u32* s_gcs_chg;                   /* per l1 entry: frame + 1 of its last vertex change */
+static struct { u64 kicks, jobs, take, self, busy, stale, miss, skip_in, checked, differ; } s_gcs_st;
+
+static u64 eng_gcs_hash(const gcs_rng* r, u32 n)
+{
+    u64 h = 0x9E3779B97F4A7C15ull;
+    for (u32 i = 0; i < n; i++)
+        h = XXH3_64bits_withSeed(r[i].p, r[i].len, h ^ ((u64)r[i].loc << 40) ^ r[i].a);
+    return h;
+}
+static u32 eng_gcs_key(const gcs_rng* r, u32 n)
+{
+    u64 x = n;
+    for (u32 i = 0; i < n; i++)
+        x = (x ^ ((u64)r[i].loc << 60) ^ ((u64)r[i].a << 28) ^ r[i].len) * 0x9E3779B97F4A7C15ull;
+    return (u32)(x >> 32);
+}
+static int eng_gcs_same(const gcs_rng* x, const gcs_rng* y, u32 n)
+{
+    for (u32 i = 0; i < n; i++)
+        if (x[i].p != y[i].p || x[i].a != y[i].a || x[i].len != y[i].len || x[i].loc != y[i].loc)
+            return 0;
+    return 1;
+}
+
+static void eng_gcs_run(u32 gen)
+{
+    gcs_job* const a = s_gcs_j[gen & 1u];
+    const gcs_rng* const jr = s_gcs_jr[gen & 1u];
+    for (;;) {
+        u64 v = atomic_load(&s_gcs_ctr);
+        if ((u32)(v >> 32) != gen) return;
+        const u32 nx = (u32)v & 0xFFFFu, n = (u32)(v >> 16) & 0xFFFFu;
+        if (nx >= n) return;
+        if (!atomic_compare_exchange_weak(&s_gcs_ctr, &v, v + 1)) continue;
+        gcs_job* const j = &a[nx];
+        u32 exp = 0;
+        if (!atomic_compare_exchange_strong(&j->state, &exp, 1u)) continue;
+        j->res = eng_gcs_hash(&jr[j->r0], j->nr);
+        atomic_store_explicit(&j->state, 2u, memory_order_release);
+        atomic_fetch_add_explicit(&s_gcs_byw, 1, memory_order_relaxed);
+    }
+}
+
+static int eng_gcs_on(void)
+{
+    if (__builtin_expect(s_gcs_cfg < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENGINE_GEOCS");
+        const char* v = getenv("PS3RECOMP_ENGINE_GEOCS_VERIFY");
+        const char* s = getenv("PS3RECOMP_ENGINE_GEOCS_STATS");
+        s_gcs_cfg = !(e && *e == '0');
+        s_gcs_verify = v && *v == '1';
+        s_gcs_stats = s && *s == '1';
+        if (s_gcs_cfg) {
+            s_gcs_chg = (u32*)calloc((size_t)2 << GEO_SET_BITS, sizeof(u32));
+            if (!s_gcs_chg) s_gcs_cfg = 0;
+        }
+        if (s_gcs_cfg) eng_cs_pool_start();
+        fprintf(stderr, "[GEOCS] parallel geometry hashes: %s, %d workers "
+                "(PS3RECOMP_ENGINE_GEOCS, TEXCS_THREADS)%s\n", s_gcs_cfg ? "ON" : "off",
+                s_gcs_cfg ? s_tcs_nthr : 0, s_gcs_verify ? ", VERIFY" : "");
+    }
+    return s_gcs_cfg;
+}
+
+/* l1 entry `i` saw new vertices (or a new shape) */
+static void eng_gcs_changed(const geo_l1* l1)
+{
+    if (s_gcs_chg) s_gcs_chg[l1 - s_geo_l1] = g.frames + 1u;
+}
+
+/* a probe's ranges: next frame's job list */
+static void eng_gcs_record(const gcs_rng* r, u32 n, u32 l1)
+{
+    const u32 p = g.frames & 1u;
+    if (s_gcs_rec_frame[p] != g.frames) { s_gcs_rec_frame[p] = g.frames; s_gcs_rec_n[p] = 0; s_gcs_rp_n[p] = 0; }
+    if (s_gcs_rec_n[p] >= GCS_JOBS || s_gcs_rp_n[p] + n > GCS_RNGS) return;
+    gcs_rec* const rc = &s_gcs_rec[p][s_gcs_rec_n[p]++];
+    rc->r0 = s_gcs_rp_n[p]; rc->nr = n; rc->l1 = l1;
+    memcpy(&s_gcs_rp[p][rc->r0], r, n * sizeof *r);
+    s_gcs_rp_n[p] += n;
+}
+
+/* table slot of the job with exactly these ranges, or of the first free slot */
+static u32 eng_gcs_slot(u32 gen, const gcs_rng* r, u32 n, u32 key, int* found)
+{
+    const gcs_job* const a = s_gcs_j[gen & 1u];
+    const gcs_rng* const jr = s_gcs_jr[gen & 1u];
+    for (u32 t = key & (GCS_TAB - 1u);; t = (t + 1u) & (GCS_TAB - 1u)) {
+        const gcs_tab* e = &s_gcs_tab[t];
+        if (e->gen != gen) { *found = 0; return t; }
+        if (e->key == key && a[e->idx].nr == n && eng_gcs_same(&jr[a[e->idx].r0], r, n)) {
+            *found = 1; return t;
+        }
+    }
+}
+
+/* publish this epoch's jobs: last frame's probes, from about where this
+ * frame has got to, once each */
+static void eng_gcs_kick(void)
+{
+    const u32 gen = (s_gcs_gen + 1u) ? s_gcs_gen + 1u : 1u;
+    const u32 par = gen & 1u;
+    if (atomic_load(&s_gcs_in[par])) {   /* a worker from two kicks ago is still inside */
+        atomic_store(&s_gcs_ctr, (u64)s_gcs_gen << 32);   /* close the stale generation */
+        s_gcs_st.skip_in++;
+        return;
+    }
+    s_gcs_gen = gen;
+    s_gcs_kick_epoch = atomic_load_explicit(&s_tcs_epoch, memory_order_relaxed);
+    s_gcs_kick_frame = g.frames;
+    gcs_job* const a = s_gcs_j[par];
+    gcs_rng* const jr = s_gcs_jr[par];
+    u32 n = 0, nr = 0;
+    const u32 pf = g.frames - 1u, pp = pf & 1u, cp = g.frames & 1u;
+    if (s_gcs_rec_frame[pp] == pf) {
+        const u32 done = s_gcs_rec_frame[cp] == g.frames ? s_gcs_rec_n[cp] : 0u;
+        for (u32 k = done; k < s_gcs_rec_n[pp] && n < GCS_JOBS; k++) {
+            const gcs_rec* const rc = &s_gcs_rec[pp][k];
+            const u32 c = s_gcs_chg[rc->l1];
+            if (c && g.frames + 1u - c < 16u) continue;
+            const gcs_rng* const r = &s_gcs_rp[pp][rc->r0];
+            const u32 key = eng_gcs_key(r, rc->nr);
+            int found;
+            const u32 t = eng_gcs_slot(gen, r, rc->nr, key, &found);
+            if (found) continue;
+            if (nr + rc->nr > GCS_RNGS) break;
+            memcpy(&jr[nr], r, rc->nr * sizeof *r);
+            gcs_job* const j = &a[n];
+            j->r0 = nr; j->nr = rc->nr;
+            atomic_store_explicit(&j->state, 0u, memory_order_relaxed);
+            s_gcs_tab[t].gen = gen; s_gcs_tab[t].key = key; s_gcs_tab[t].idx = n;
+            nr += rc->nr; n++;
+        }
+    }
+    atomic_store(&s_gcs_ctr, ((u64)gen << 32) | ((u64)n << 16));
+    s_gcs_st.kicks++; s_gcs_st.jobs += n;
+    if (n && s_tcs_nthr) {
+        pthread_mutex_lock(&s_tcs_mx);
+        s_gcs_wake = gen;
+        pthread_cond_broadcast(&s_tcs_cv);
+        pthread_mutex_unlock(&s_tcs_mx);
+    }
+}
+
+/* 1 = *out is a value computed for exactly these ranges in this epoch.
+ * 0 = compute inline; *mine is then the job to complete, if any. */
+static int eng_gcs_take(const gcs_rng* r, u32 n, u64* out, gcs_job** mine)
+{
+    *mine = NULL;
+    if (atomic_load_explicit(&s_tcs_epoch, memory_order_relaxed) != s_gcs_kick_epoch ||
+        g.frames != s_gcs_kick_frame) {   /* new data or a new frame: new jobs */
+        eng_gcs_kick(); s_gcs_st.stale++;
+        if (atomic_load_explicit(&s_tcs_epoch, memory_order_relaxed) != s_gcs_kick_epoch ||
+            g.frames != s_gcs_kick_frame) return 0;   /* stragglers: no jobs now */
+    }
+    int found;
+    const u32 t = eng_gcs_slot(s_gcs_gen, r, n, eng_gcs_key(r, n), &found);
+    if (!found) { s_gcs_st.miss++; return 0; }
+    gcs_job* const j = &s_gcs_j[s_gcs_gen & 1u][s_gcs_tab[t].idx];
+    u32 st = atomic_load_explicit(&j->state, memory_order_acquire);
+    if (st == 2u) { *out = j->res; s_gcs_st.take++; return 1; }
+    if (st == 0u && atomic_compare_exchange_strong(&j->state, &st, 1u)) {
+        *mine = j; s_gcs_st.self++;          /* not started: computed inline */
+        return 0;
+    }
+    s_gcs_st.busy++;                         /* a worker is on it: no waiting */
+    return 0;
+}
+
+static void eng_gcs_frame(void)
+{
+    if (!s_gcs_stats || s_gcs_cfg <= 0 || (g.frames % 600u) != 599u) return;
+    fprintf(stderr, "[GEOCS] 600 frames: %llu kicks, %llu jobs (%llu by workers), "
+            "%llu taken, %llu inline (%llu not started, %llu busy, %llu first of "
+            "epoch/frame, %llu no job), %llu straggler skips, verify %llu/%llu differ\n",
+            (unsigned long long)s_gcs_st.kicks, (unsigned long long)s_gcs_st.jobs,
+            (unsigned long long)atomic_exchange(&s_gcs_byw, 0),
+            (unsigned long long)s_gcs_st.take,
+            (unsigned long long)(s_gcs_st.self + s_gcs_st.busy + s_gcs_st.miss),
+            (unsigned long long)s_gcs_st.self, (unsigned long long)s_gcs_st.busy,
+            (unsigned long long)s_gcs_st.stale, (unsigned long long)s_gcs_st.miss,
+            (unsigned long long)s_gcs_st.skip_in,
+            (unsigned long long)s_gcs_st.differ, (unsigned long long)s_gcs_st.checked);
+    memset(&s_gcs_st, 0, sizeof s_gcs_st);
+}
+#endif /* __APPLE__ */
+
 /* Hash the guest bytes every laid-out attribute reads for elements
  * [elo, ehi]: one range per attribute, overlapping ranges of one location
- * merged so an interleaved buffer is read once. 0 = a range is unreadable. */
-static int eng_geo_vtx_hash(const rsx_vertex_fetch_plan* plan, u32 elo, u32 ehi, u64* out)
+ * merged so an interleaved buffer is read once. 0 = a range is unreadable.
+ * l1: the probe's shape entry (GEOCS), NULL = always inline. */
+static int eng_geo_vtx_hash(const rsx_vertex_fetch_plan* plan, u32 elo, u32 ehi,
+                            const geo_l1* l1, u64* out)
 {
     u32 loc[RSX_DSP_NUM_VERTEX_ATTR];
     u64 lo[RSX_DSP_NUM_VERTEX_ATTR], hi[RSX_DSP_NUM_VERTEX_ATTR];
@@ -3147,6 +3392,44 @@ static int eng_geo_vtx_hash(const rsx_vertex_fetch_plan* plan, u32 elo, u32 ehi,
         }
         loc[k] = f->desc.location; lo[k] = a; hi[k] = b;
     }
+#if defined(__APPLE__)
+    if (l1 && eng_gcs_on()) {
+        gcs_rng rg[RSX_DSP_NUM_VERTEX_ATTR];
+        u32 nrg = 0;
+        for (u32 i = 0; i < n;) {
+            u64 a = lo[i], b = hi[i];
+            u32 j = i + 1;
+            while (j < n && loc[j] == loc[i] && lo[j] <= b) { if (hi[j] > b) b = hi[j]; j++; }
+            const u8* src = eng_guest_ptr(NULL, loc[i], (u32)a, (u32)(b - a));
+            if (!src) return 0;
+            rg[nrg].p = src; rg[nrg].a = (u32)a; rg[nrg].len = (u32)(b - a); rg[nrg].loc = loc[i];
+            nrg++;
+            i = j;
+        }
+        u64 h;
+        gcs_job* mine = NULL;
+        if (nrg && eng_gcs_take(rg, nrg, &h, &mine)) {
+            if (s_gcs_verify) {
+                s_gcs_st.checked++;
+                if (h != eng_gcs_hash(rg, nrg)) {
+                    if (s_gcs_st.differ < 4 && (g.frames % 600u) < 300u)
+                        fprintf(stderr, "[GEOCS] differ: frame %u ranges %u loc %u a 0x%08X len %u\n",
+                                g.frames, nrg, rg[0].loc, rg[0].a, rg[0].len);
+                    s_gcs_st.differ++;
+                }
+            }
+        } else {
+            h = eng_gcs_hash(rg, nrg);
+            for (u32 i = 0; i < nrg; i++) s_geo_st.hashb += rg[i].len;
+            if (mine) { mine->res = h; atomic_store_explicit(&mine->state, 2u, memory_order_release); }
+        }
+        if (nrg) eng_gcs_record(rg, nrg, (u32)(l1 - s_geo_l1));
+        *out = h;
+        return 1;
+    }
+#else
+    (void)l1;
+#endif
     u64 h = 0x9E3779B97F4A7C15ull;
     for (u32 i = 0; i < n;) {
         u64 a = lo[i], b = hi[i];
@@ -3246,7 +3529,7 @@ static const geo_l2* eng_geo_lookup(u32 prim, eng_geo_probe* pr)
     /* Vertices that changed the last three times: probe 1 frame in 16. */
     if (l1->vol >= 3 && (g.frames & 15u)) { s_geo_st.volskip++; pr->ok = 0; return NULL; }
     u64 hv;
-    if (!eng_geo_vtx_hash(plan, l1->elo, l1->ehi, &hv)) { pr->ok = 0; return NULL; }
+    if (!eng_geo_vtx_hash(plan, l1->elo, l1->ehi, l1, &hv)) { pr->ok = 0; return NULL; }
     u64 key = XXH3_64bits_withSeed(&pr->plan, sizeof pr->plan, h ^ hv);
     if (!key) key = 1;
     pr->key = key;
@@ -3256,6 +3539,9 @@ static const geo_l2* eng_geo_lookup(u32 prim, eng_geo_probe* pr)
     if (!l2->used || l2->key != key || l2->stride != plan->layout.stride ||
         s_geo_head > l2->pos + s_geo_size) {
         if (l1->vol < 255) l1->vol++;
+#if defined(__APPLE__)
+        eng_gcs_changed(l1);
+#endif
         s_geo_st.miss2++;
         return NULL;
     }
@@ -3302,11 +3588,14 @@ static void eng_geo_store(eng_geo_probe* pr, int indexed, u32 n_draw, const u32*
     if (!l1->used || l1->key != pr->shape || l1->elo != elo || l1->ehi != ehi) {
         l1->key = pr->shape; l1->elo = elo; l1->ehi = ehi; l1->vol = 0; l1->used = 1;
         pr->have_key = 0;
+#if defined(__APPLE__)
+        eng_gcs_changed(l1);
+#endif
     }
     l1->last = g.frames;
     if (!pr->have_key) {
         u64 hv;
-        if (!eng_geo_vtx_hash(plan, elo, ehi, &hv)) return;
+        if (!eng_geo_vtx_hash(plan, elo, ehi, NULL, &hv)) return;
         pr->key = XXH3_64bits_withSeed(&pr->plan, sizeof pr->plan, pr->shape ^ hv);
         if (!pr->key) pr->key = 1;
     }
@@ -4139,6 +4428,7 @@ static void eng_present(u32 buffer_id)
     eng_geo_frame();
 #if defined(__APPLE__)
     eng_tcs_frame();
+    eng_gcs_frame();
 #endif
     g.frames++;
     g.last_guest_draws = g.guest_draws;
