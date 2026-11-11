@@ -33,6 +33,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 static int g_pass, g_fail;
 #define CHECK(cond) do { if (cond) g_pass++; else { g_fail++; \
@@ -163,7 +167,21 @@ static void test_thread_lifecycle(void)
 
     CHECK(SuspendThread(GetCurrentThread()) == (DWORD)-1);
     CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL));
+#if defined(__APPLE__)
+    {   /* the calling thread must really get the QoS class (no sched-param opt-out) */
+        qos_class_t q = QOS_CLASS_UNSPECIFIED; int rel = 0;
+        CHECK(pthread_get_qos_class_np(pthread_self(), &q, &rel) == 0);
+        CHECK(q == QOS_CLASS_USER_INTERACTIVE);
+    }
+#endif
     CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL));
+#if defined(__APPLE__)
+    {
+        qos_class_t q = QOS_CLASS_UNSPECIFIED; int rel = 0;
+        CHECK(pthread_get_qos_class_np(pthread_self(), &q, &rel) == 0);
+        CHECK(q == QOS_CLASS_USER_INITIATED);
+    }
+#endif
     CHECK(SetThreadDescription(GetCurrentThread(), L"compat-test") == 0);
     (void)SetThreadAffinityMask(GetCurrentThread(), 1);
     CHECK(GetCurrentThreadId() != 0);

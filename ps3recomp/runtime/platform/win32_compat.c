@@ -408,6 +408,25 @@ BOOL CancelWaitableTimer(HANDLE h)
 static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
 {
 #if defined(__APPLE__)
+    /* QoS is what actually decides P-core vs E-core on Apple Silicon. Only the
+     * calling thread can set its own; a thread created suspended gets it from
+     * the trampoline, which runs on the new thread.
+     * Set QoS ONLY for the calling thread: pthread_setschedparam() opts a thread
+     * out of QoS for good (pthread/qos.h), so calling it first made the QoS call
+     * fail with EPERM and left the thread at a fixed priority with no QoS (the
+     * iPad RSX thread showed "--" in IOS_CPU_LOG_SECS). PS3_PRIO_SCHED=1 brings
+     * back the old order (sched priority, then the failing QoS call). */
+    static int s_sched = -1;
+    if (s_sched < 0) { const char* e = getenv("PS3_PRIO_SCHED"); s_sched = (e && *e == '1') ? 1 : 0; }
+    if (is_self && !s_sched) {
+        qos_class_t q = QOS_CLASS_DEFAULT;
+        if      (level >= THREAD_PRIORITY_ABOVE_NORMAL) q = QOS_CLASS_USER_INTERACTIVE;
+        else if (level == THREAD_PRIORITY_NORMAL)       q = QOS_CLASS_USER_INITIATED;
+        else if (level >= THREAD_PRIORITY_LOWEST)       q = QOS_CLASS_UTILITY;
+        else                                            q = QOS_CLASS_BACKGROUND;
+        if (pthread_set_qos_class_self_np(q, 0) == 0) { (void)tid; return; }
+        /* already opted out (EPERM): fall through to the sched priority */
+    }
     struct sched_param sp; int policy = SCHED_OTHER;
     if (pthread_getschedparam(pt, &policy, &sp) == 0) {
         int lo = sched_get_priority_min(policy), hi = sched_get_priority_max(policy);
@@ -421,10 +440,7 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
         sp.sched_priority = p;
         pthread_setschedparam(pt, policy, &sp);
     }
-    /* QoS is what actually decides P-core vs E-core on Apple Silicon. Only the
-     * calling thread can set its own; a thread created suspended gets it from
-     * the trampoline, which runs on the new thread. */
-    if (is_self) {
+    if (is_self && s_sched) {
         qos_class_t q = QOS_CLASS_DEFAULT;
         if      (level >= THREAD_PRIORITY_ABOVE_NORMAL) q = QOS_CLASS_USER_INTERACTIVE;
         else if (level == THREAD_PRIORITY_NORMAL)       q = QOS_CLASS_USER_INITIATED;
