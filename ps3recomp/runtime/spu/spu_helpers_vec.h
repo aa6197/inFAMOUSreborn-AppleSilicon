@@ -15,8 +15,16 @@
  * reference on random and edge-case inputs. */
 #ifndef SPU_HELPERS_VEC_H
 #define SPU_HELPERS_VEC_H
-#if defined(__SSE4_1__) && !defined(SPU_HELPERS_VEC_DISABLE)
+#if (defined(__SSE4_1__) || (defined(__aarch64__) && defined(__ARM_NEON))) && !defined(SPU_HELPERS_VEC_DISABLE)
+#if defined(__SSE4_1__)
 #include <smmintrin.h>
+#else
+/* arm64 (Apple port): the same SSE4.1 forms through sse2neon. Without them the rc sources fell back to the
+ * scalar references, with the u128-local problem described above. Each op here maps to one or two NEON
+ * instructions (pshufb -> tbl, pmulld -> mul, pcmpgtd -> cmgt, shift by count -> ushl/sshl), so the locals
+ * stay in q registers. The AVX2 / FMA parts below stay x86-only. */
+#include "../../include/ps3emu/host_simd.h"
+#endif
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -346,5 +354,5 @@ static inline u128 spu__v_rotqmbi(u128 a, u128 b)  { return spu__v_qshr_bits(a, 
 #endif
 #endif /* v130 */
 
-#endif /* __SSE4_1__ */
+#endif /* __SSE4_1__ or arm64 NEON */
 #endif /* SPU_HELPERS_VEC_H */
