@@ -86,6 +86,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 16 | 11-11 | Round 3: hop gate | 43.6 / 43.5 | 46.3 / 46.6 | +6.7% | SPU PGO worth ~5.5% on top |
 | 17 | 11-11 | Round 4: SPU vectors in registers | 47.4 / 46.9 | 48.3 / 49.1 | +3.3% | Mac same: 79.3 / 79.6 |
 | 18 | 11-11 | Round 5: SPU PGO profile retrained (v5) | 54.4 / 47.7 | 55.6 / 51.9 | +5.3% | RSX thread 95% busy again; Mac 81.6 / 87.9 vs 80.1 / 71.5 (busy Mac, not reliable) |
+| 19 | 11-11 | Round 6: Metal encoding on its own thread (not kept) | 54.2 / 55.6 | 54.1 / 55.0 | -0.6% | Drawing thread 93% -> 83% busy, but no faster. Something else also limits at ~55. |
 
 ---
 
@@ -186,6 +187,19 @@ registers (`$WORK_DIR/pgo/apple-v5.profdata`, not in git).
 - PGO v5 is now the setup in `build-ios-pgo` and `build-mac-pgo`
   (`PORT_SPU_PGO=ON`, `PORT_PGO_PROFILE=.../apple-v5.profdata`).
 - Mac numbers are not reliable (Photos and storage scans running).
+
+Round 6 (ABBA): Metal encoding on its own thread
+(`PS3RECOMP_METAL_ENC_THREAD=1`). Not kept.
+
+| | off | on |
+|---|---|---|
+| iPad flips/s | 54.2 / 55.6 | 54.1 / 55.0 (−0.6%) |
+| iPad RSX thread busy | 93–94% | 82–85% |
+| iPad CPU total | 632–638% | 673–680% |
+
+- The RSX thread gets ~10% free time, but speed stays the same.
+  So something else also limits at ~55 flips/s (GPU, or the
+  PPU/SPU side). Keep it off.
 
 ### Notes
 
