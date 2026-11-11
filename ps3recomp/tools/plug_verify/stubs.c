@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(SPU_HOT_TLS)
+SPU_HOT_TLS_DEFINE;
+#else
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+#endif
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 SPU_THREAD_LOCAL uint32_t g_spu_recent[32];
@@ -23,7 +27,7 @@ void spu_ls_watch_slow(uint32_t a, int w, const uint8_t* p, uint32_t pc, uint32_
 void spu_tlc_slow(spu_context* c, void* f) { (void)c; (void)f; }
 void spu_depth_guard(spu_context* c) { (void)c; }
 int spu_tailret_enabled(void) { g_spu_tailret = 0; return 0; }
-void spu_img_restore(spu_context* c, int32_t s) { (void)c; (void)s; }
+void (spu_img_restore)(spu_context* c, int32_t s) { (void)c; (void)s; }
 void spu_check_stack_reset_slow(spu_context* c) { (void)c; }
 
 /* harness control */

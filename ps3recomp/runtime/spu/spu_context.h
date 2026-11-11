@@ -784,7 +784,23 @@ void spu_indirect_branch(spu_context* ctx);
 
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */
+#if defined(__APPLE__)
+/* Apple: every __thread access is a call through the TLV descriptor (_tlv_get_addr), redone
+ * in each basic block. The inline call-return fast path (spu_drain_call_inl) reads this and
+ * g_irq_live_n at every lifted call site; in one block, the address the first read computed
+ * serves the second (iPad: _tlv_get_addr was 2.3 % of all game CPU). Same values, same
+ * thread, only the storage moved. Define the block with SPU_HOT_TLS_DEFINE. */
+typedef struct spu_hot_tls {
+    void (*tramp)(spu_context*);
+    int    irq_live_n;
+} spu_hot_tls;
+extern __thread spu_hot_tls g_spu_hot_tls;
+#  define SPU_HOT_TLS 1
+#  define SPU_HOT_TLS_DEFINE __thread spu_hot_tls g_spu_hot_tls
+#  define g_spu_trampoline_fn (g_spu_hot_tls.tramp)
+#else
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+#endif
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
@@ -799,6 +815,15 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
  * persistent LS-0xA00 workload module if one is set. */
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
+#if defined(__APPLE__) && !defined(SPU_DRAIN_IMPL)
+/* Apple: inline at every lifted call site (was an out-of-line call per call bracket). Same body
+ * as spu_drain.c. */
+static inline __attribute__((always_inline)) void spu_img_restore_inl(spu_context* ctx, int32_t saved_img)
+{
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
+}
+#  define spu_img_restore(c, s) spu_img_restore_inl((c), (s))
+#endif
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
@@ -945,7 +970,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
  * call was 3.9 % of the serial w2 lane). Anything else, and the first calls before SPU_DRAIN_FASTRET is read, go to
  * the real function. -DSPU_DRAIN_CALL_OUTLINE restores a plain call everywhere. */
 SPU_GATE int g_spu_drain_fastret_pub = -1;          /* mirror of spu_drain.c s_drain_fastret */
+#if defined(SPU_HOT_TLS)
+#  define g_irq_live_n (g_spu_hot_tls.irq_live_n)  /* Apple: next to g_spu_trampoline_fn (see above) */
+#else
 extern SPU_THREAD_LOCAL int g_irq_live_n;            /* spu_drain.c: irq frames registered on this thread */
+#endif
 #if !defined(SPU_DRAIN_IMPL) && !defined(SPU_DRAIN_CALL_OUTLINE)
 static inline __attribute__((always_inline)) void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
 {

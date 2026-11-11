@@ -54,7 +54,11 @@ typedef struct spu_irq_frame {
  * unwinds to a frame that is still registered. */
 enum { SPU_IRQ_LIVE_MAX = 64 };
 static SPU_THREAD_LOCAL spu_irq_frame* g_irq_live[SPU_IRQ_LIVE_MAX];
+#if defined(SPU_HOT_TLS)
+SPU_HOT_TLS_DEFINE;                  /* Apple: g_irq_live_n + g_spu_trampoline_fn in one block (spu_context.h) */
+#else
 SPU_THREAD_LOCAL int g_irq_live_n;   /* v176: read by the inline drain fast path (spu_context.h) */
+#endif
 static int spu_irq_live_find(const spu_irq_frame* f)
 {
     for (int i = g_irq_live_n - 1; i >= 0; i--) if (g_irq_live[i] == f) return i;
@@ -88,7 +92,9 @@ static spu_irq_frame* spu_irq_frame_live_head(spu_context* ctx)
 }
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
+#if !defined(SPU_HOT_TLS)
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+#endif
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 

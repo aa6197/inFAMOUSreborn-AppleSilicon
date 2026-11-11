@@ -98,14 +98,18 @@ void spu_halt(spu_context* c){ (void)c; }
 /* The lifter grew references to these runtime hooks, and the standalone driver
  * did not follow -- the validation has not linked since. Stub them so the test
  * runs again; none affect the arithmetic being checked. */
+#if defined(SPU_HOT_TLS)
+SPU_HOT_TLS_DEFINE;
+#else
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+#endif
 int g_wws_read_probe = 0;
 int g_wws_code_probe = 0;
 void yz_lockstep_tick(spu_context* c){ (void)c; }
 void spu_task_launch_check(spu_context* c, void* f){ (void)c; (void)f; }
 void (*spu_take_interrupt(spu_context* c, void (*tf)(spu_context*)))(spu_context*)
 { (void)c; return tf; }
-void spu_img_restore(spu_context* c, int32_t s){ (void)c; (void)s; }
+void (spu_img_restore)(spu_context* c, int32_t s){ (void)c; (void)s; }
 /* Calls return through the trampoline: run it until the callee's `bi $lr`
  * lands back on the return address (the runtime's drain, minus interrupts). */
 void spu_drain_call(spu_context* c, uint32_t ret){
