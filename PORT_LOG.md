@@ -87,7 +87,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 17 | 11-11 | Round 4: SPU vectors in registers | 47.4 / 46.9 | 48.3 / 49.1 | +3.3% | Mac same: 79.3 / 79.6 |
 | 18 | 11-11 | Round 5: SPU PGO profile retrained (v5) | 54.4 / 47.7 | 55.6 / 51.9 | +5.3% | RSX thread 95% busy again; Mac 81.6 / 87.9 vs 80.1 / 71.5 (busy Mac, not reliable) |
 | 19 | 11-11 | Round 6: Metal encoding on its own thread (not kept) | 54.2 / 55.6 | 54.1 / 55.0 | -0.6% | Drawing thread 93% -> 83% busy, but no faster. Something else also limits at ~55. |
-| 20 | 11-11 | Round 7: not a real test (new app did not install) | 55.1 / 55.7 | 54.3 / 55.6 | -0.8% | Both sides ran the round 6 app, so this only shows noise (same app: 54.3 to 55.7). Redo running. |
+| 20 | 11-11 | Round 7: geometry prefetch hints (not kept) | 54.9 / 53.0 | 53.1 / 53.1 | -1.6% | RSX thread 96% -> 94% busy, no gain. iPad warmer this round (P 1.86 -> 1.81 GHz). |
 | 21 | 11-11 | Round 8: where the frame waits (diagnostic) | 55.6 (encode off) | 54.5 (encode on) |  | One run each. Game thread spends 25-30% in a wait loop, mostly on SPU jobs. |
 | 22 | 11-11 | Round 9: SPU threads on slow cores (not kept) | 55.7 / 55.2 | 52.8 / 51.3 | -6.1% | Fast cores freed (272% -> 151%, 1.89 -> 2.34 GHz) but SPU work got slower. |
 
@@ -205,12 +205,12 @@ Round 6 (ABBA): Metal encoding on its own thread
   PPU/SPU side). Keep it off.
 
 Round 7 (ABBA): geometry memo prefetch hints
-(`PS3RECOMP_ENGINE_GEO_PF`, Apple only). Not kept yet.
+(`PS3RECOMP_ENGINE_GEO_PF`, Apple only). Not kept.
 
 | | off | on |
 |---|---|---|
-| iPad flips/s | 55.1 / 55.7 | 54.3 / 55.6 (−0.8%) |
-| iPad RSX thread busy | 83–96% | 95–96% |
+| iPad flips/s (redo) | 54.9 / 53.0 | 53.1 / 53.1 (−1.6%) |
+| iPad RSX thread busy | 96% | 94% |
 
 - On the Mac it cut `sink_end` from 22.9% to 17.4% of the RSX thread.
 - **Not a real test.** The A/B script wants `<dir>/Release-iphoneos/inFamousRecomp.app`.
@@ -218,7 +218,7 @@ Round 7 (ABBA): geometry memo prefetch hints
   and both sides ran the round 6 app. Fixed: the script now stops when the
   app is missing or the install fails, and prints the installed UUID.
 - Useful anyway: the same app 4 times gave 54.3–55.7 flips/s. That is the noise.
-- Redo running (rounds 8 and 7, with the right apps).
+- Redo with the right app: no gain. Dropped (patch kept outside the repo).
 
 Round 8 (diagnostic, one run each): why ~55 flips/s?
 New switch `IOS_RUNSTATE=1` (commit d417426): every 1 ms it checks if
@@ -256,7 +256,12 @@ Round 9 (screen, one run each): SPURS kernel threads to utility QoS.
 - The iPad's P cores run at only ~1.9 GHz under this load (power
   limit). The M1 Max keeps ~3.2 GHz on 8 P cores. That gap, not the
   core count alone, is the most likely reason the M1 Max is faster.
-- Next (round 10): free P-core time without slowing the main SPU
+- Mac reference, same pad script (this Mac, M5 Pro, PGO build,
+  headless): 115 flips/s in gameplay (150–250 s).
+- In gameplay the iPad GPU shows ~100% busy (`PS3RECOMP_METAL_GPU_STATS=1`,
+  round 8 run: ~2 command buffers per frame, ~9 ms each). Earlier
+  `METALFX=0` halved GPU busy at 28 fps; now at 55 fps it may be the limit.
+- Next (round 10): MetalFX off, plus free P-core time without slowing the main SPU
   work: audio kernel only to E cores, shorter audio spin, and
   parking job waits sooner.
 
