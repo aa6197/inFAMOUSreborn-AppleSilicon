@@ -1291,30 +1291,21 @@ static u32 eng_csum_dense(const u8* base, u32 nbytes)
     if (!step) step = 4u;
     return eng_csum_step(base, nbytes, step);
 }
-static u64 eng_texture_content_hash(u32 location, u32 offset, u32 fmt, u32 w,
-                                    u32 h, u32 levels, u32 pitch, int cube,
-                                    u32 span, int* readable)
+static int eng_tex_fullhash_on(void)
 {
-    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
-    if (!src) { *readable = 0; return 0; }
-    *readable = 1;
     static int full = -1;
     if (full < 0) {
         const char* e = getenv("PS3RECOMP_ENGINE_TEX_FULLHASH");
         full = (e && *e && *e != '0') ? 1 : 0;
     }
-    if (full) {
-        u64 hash = 1469598103934665603ull;
-        u32 i = 0;
-        for (; i + 8 <= span; i += 8) {
-            u64 word;
-            memcpy(&word, src + i, sizeof(word));
-            hash ^= word;
-            hash *= 1099511628211ull;
-        }
-        for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
-        return hash;
-    }
+    return full;
+}
+/* The sampled checksum of a resolved source. Pure: it reads src[0..span) and
+ * nothing else, so a worker thread computes exactly what the RSX thread would
+ * (TEXCS below). */
+static u32 eng_texture_csum_src(const u8* src, u32 fmt, u32 w, u32 h,
+                                u32 levels, u32 pitch, int cube, u32 span)
+{
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 n = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     u32 nb = n ? lv[0].tl.face_bytes : span;
@@ -1328,6 +1319,299 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 fmt, u32 w,
                 hash = (hash ^ eng_csum(src + (size_t)f * fs, nb)) * 16777619u;
     }
     return hash;
+}
+static u64 eng_texture_content_hash(u32 location, u32 offset, u32 fmt, u32 w,
+                                    u32 h, u32 levels, u32 pitch, int cube,
+                                    u32 span, int* readable)
+{
+    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    if (!src) { *readable = 0; return 0; }
+    *readable = 1;
+    if (eng_tex_fullhash_on()) {
+        u64 hash = 1469598103934665603ull;
+        u32 i = 0;
+        for (; i + 8 <= span; i += 8) {
+            u64 word;
+            memcpy(&word, src + i, sizeof(word));
+            hash ^= word;
+            hash *= 1099511628211ull;
+        }
+        for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
+        return hash;
+    }
+    return eng_texture_csum_src(src, fmt, w, h, levels, pitch, cube, span);
+}
+
+/* ---- TEXCS: the frame's texture checksums on worker threads (Apple) --------
+ * The D3D12 backend's v228 TEXCS (rsx_d3d12_backend.c, tcs_*). Every cached
+ * texture bound in a frame is re-validated once per frame by the sampled
+ * checksum above: ~1000 textures x ~1024 scattered loads, issued one texture
+ * after another by the RSX thread, which sets the pace on the iPad (profile:
+ * ~15% of it). D3D12 runs the same checksum functions on workers at its
+ * prepass, once the whole frame is recorded. This engine has no prepass (it
+ * validates at the first bind), so the job list is the textures validated in
+ * the previous frame, and a worker's value is used only when it was computed
+ * from data at least as new as what the bind may rely on:
+ *  - rsx_draw_engine_data_epoch() is called by the FIFO walker when it reads a
+ *    new put (it then executes only commands up to that put) and at every
+ *    NV406E semaphore acquire (SPU-released data; the same two points as the
+ *    D3D12 VC_WW epoch). The RSX's own 2D writes (NV308A, NV3089) count too.
+ *  - Textures whose content changed in the last 16 frames get no job: the
+ *    game rewrites a few every frame between two puts (eng_tcs_volatile).
+ *  - The first validation of an epoch (and of each frame) publishes the jobs
+ *    (seq_cst, after the walker's acquire of put / the label), so every
+ *    worker load happens after the data published by that put or label.
+ *  - A bind takes a value only if its job is of the current epoch and has
+ *    exactly the bind's inputs (pointer, format, size, levels, pitch, cube,
+ *    span); otherwise it computes inline, as before.
+ * Values are bit-identical to the inline path (same function, same bytes);
+ * the read only moves earlier within the same epoch, as in D3D12. The RSX
+ * thread never waits for a worker.
+ * PS3RECOMP_ENGINE_TEXCS=0 off (Apple default on; not built elsewhere),
+ * PS3RECOMP_ENGINE_TEXCS_THREADS=<n> (default 3, utility QoS = E cores),
+ * PS3RECOMP_ENGINE_TEXCS_VERIFY=1 recomputes every taken value and counts
+ * differences, PS3RECOMP_ENGINE_TEXCS_STATS=1 logs [TEXCS] every 600 frames. */
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#include <stdatomic.h>
+typedef struct {
+    const u8* src;
+    u32 fmt, w, h, levels, pitch, span, cube;
+    _Atomic u32 state;          /* 0 pending, 1 claimed, 2 done (res valid) */
+    u32 res;
+} eng_tcs_job;
+static eng_tcs_job s_tcs_j[2][ENG_MAX_TEXTURES];   /* by generation parity */
+static _Atomic u64 s_tcs_ctr;   /* gen (bits 32..63) | n (16..31) | next (0..15) */
+static _Atomic int s_tcs_in[2]; /* workers inside the array of that parity */
+static pthread_mutex_t s_tcs_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_tcs_cv = PTHREAD_COND_INITIALIZER;
+static u32 s_tcs_wake;          /* under s_tcs_mx */
+static int s_tcs_cfg = -1, s_tcs_nthr = 3, s_tcs_verify, s_tcs_stats;
+static _Atomic u32 s_tcs_epoch = 1;
+/* RSX thread only from here */
+static u32 s_tcs_kick_epoch, s_tcs_kick_frame, s_tcs_gen;
+static u32 s_tcs_slot_gen[ENG_MAX_TEXTURES];
+static u16 s_tcs_slot_idx[ENG_MAX_TEXTURES];
+static u32 s_tcs_chg[ENG_MAX_TEXTURES];         /* frame + 1 of the slot's last content change */
+static u16 s_tcs_used[2][ENG_MAX_TEXTURES];        /* slots validated, by frame parity */
+static u32 s_tcs_used_n[2], s_tcs_used_frame[2] = { ~0u, ~0u };
+static struct { u64 kicks, jobs, take, self, busy, stale, miss, skip_in, checked, differ; } s_tcs_st;
+static _Atomic u64 s_tcs_byw;
+
+static void eng_tcs_run(u32 gen)
+{
+    eng_tcs_job* const a = s_tcs_j[gen & 1u];
+    for (;;) {
+        u64 v = atomic_load(&s_tcs_ctr);
+        if ((u32)(v >> 32) != gen) return;
+        const u32 nx = (u32)v & 0xFFFFu, n = (u32)(v >> 16) & 0xFFFFu;
+        if (nx >= n) return;
+        if (!atomic_compare_exchange_weak(&s_tcs_ctr, &v, v + 1)) continue;
+        eng_tcs_job* const j = &a[nx];
+        u32 exp = 0;
+        if (!atomic_compare_exchange_strong(&j->state, &exp, 1u)) continue;
+        j->res = eng_texture_csum_src(j->src, j->fmt, j->w, j->h, j->levels,
+                                      j->pitch, (int)j->cube, j->span);
+        atomic_store_explicit(&j->state, 2u, memory_order_release);
+        atomic_fetch_add_explicit(&s_tcs_byw, 1, memory_order_relaxed);
+    }
+}
+
+static void* eng_tcs_worker(void* p)
+{
+    (void)p;
+    pthread_setname_np("eng texcs");
+    u32 seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&s_tcs_mx);
+        while (s_tcs_wake == seen) pthread_cond_wait(&s_tcs_cv, &s_tcs_mx);
+        const u32 gen = s_tcs_wake;
+        pthread_mutex_unlock(&s_tcs_mx);
+        seen = gen;
+        atomic_fetch_add(&s_tcs_in[gen & 1u], 1);
+        eng_tcs_run(gen);
+        atomic_fetch_sub(&s_tcs_in[gen & 1u], 1);
+    }
+    return NULL;
+}
+
+static int eng_tcs_on(void)
+{
+    if (__builtin_expect(s_tcs_cfg < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENGINE_TEXCS");
+        const char* t = getenv("PS3RECOMP_ENGINE_TEXCS_THREADS");
+        const char* v = getenv("PS3RECOMP_ENGINE_TEXCS_VERIFY");
+        const char* s = getenv("PS3RECOMP_ENGINE_TEXCS_STATS");
+        s_tcs_cfg = !(e && *e == '0') && !eng_tex_fullhash_on();
+        if (t && *t) { s_tcs_nthr = atoi(t); if (s_tcs_nthr < 0) s_tcs_nthr = 0; if (s_tcs_nthr > 8) s_tcs_nthr = 8; }
+        s_tcs_verify = v && *v == '1';
+        s_tcs_stats = s && *s == '1';
+        (void)eng_csum_mlp_on();   /* its lazy init runs here, before any worker */
+        if (s_tcs_cfg) {
+            for (int i = 0; i < s_tcs_nthr; i++) {
+                pthread_attr_t at; pthread_t th;
+                pthread_attr_init(&at);
+                pthread_attr_setstacksize(&at, 256u << 10);
+                pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+                pthread_attr_set_qos_class_np(&at, QOS_CLASS_UTILITY, 0);
+                const int rc = pthread_create(&th, &at, eng_tcs_worker, NULL);
+                pthread_attr_destroy(&at);
+                if (rc) { s_tcs_nthr = i; break; }
+            }
+        }
+        fprintf(stderr, "[TEXCS] parallel texture checksums: %s, %d workers "
+                "(PS3RECOMP_ENGINE_TEXCS, _THREADS)%s\n", s_tcs_cfg ? "ON" : "off",
+                s_tcs_cfg ? s_tcs_nthr : 0, s_tcs_verify ? ", VERIFY" : "");
+    }
+    return s_tcs_cfg;
+}
+
+/* a slot validated this frame: next frame's job list */
+static void eng_tcs_note(u32 slot)
+{
+    const u32 p = g.frames & 1u;
+    if (s_tcs_used_frame[p] != g.frames) { s_tcs_used_frame[p] = g.frames; s_tcs_used_n[p] = 0; }
+    if (s_tcs_used_n[p] < ENG_MAX_TEXTURES) s_tcs_used[p][s_tcs_used_n[p]++] = (u16)slot;
+}
+
+/* Textures whose content changed in the last 16 frames are validated inline
+ * only: a texture the game rewrites every frame (verify run: a 64x64 Y16_X16
+ * normal map and a 64x36 map, rewritten mid-frame with no put or semaphore
+ * between) would otherwise be checked against a snapshot older than the bind. */
+static int eng_tcs_volatile(u32 slot)
+{
+    return s_tcs_chg[slot] && g.frames + 1u - s_tcs_chg[slot] < 16u;
+}
+
+/* publish this epoch's jobs: last frame's validated slots not yet validated
+ * in this frame (except the one the caller computes now) */
+static void eng_tcs_kick(u32 except)
+{
+    const u32 gen = (s_tcs_gen + 1u) ? s_tcs_gen + 1u : 1u;
+    const u32 par = gen & 1u;
+    if (atomic_load(&s_tcs_in[par])) {   /* a worker from two kicks ago is still inside */
+        atomic_store(&s_tcs_ctr, (u64)s_tcs_gen << 32);   /* close the stale generation */
+        s_tcs_st.skip_in++;
+        return;
+    }
+    s_tcs_gen = gen;
+    s_tcs_kick_epoch = atomic_load_explicit(&s_tcs_epoch, memory_order_relaxed);
+    s_tcs_kick_frame = g.frames;
+    eng_tcs_job* const a = s_tcs_j[par];
+    u32 n = 0;
+    const u32 pf = g.frames - 1u, pp = pf & 1u;
+    if (s_tcs_used_frame[pp] == pf) {
+        for (u32 k = 0; k < s_tcs_used_n[pp]; k++) {
+            const u32 i = s_tcs_used[pp][k];
+            if (i == except || i >= g.n_textures || s_tcs_slot_gen[i] == gen) continue;
+            const eng_texture* e = &g.textures[i];
+            if (!e->handle || !e->span || e->last_hash_frame == g.frames || eng_tcs_volatile(i)) continue;
+            const u8* src = eng_guest_ptr(NULL, e->location, e->offset, e->span);
+            if (!src) continue;
+            eng_tcs_job* const j = &a[n];
+            j->src = src; j->fmt = e->format; j->w = e->width; j->h = e->height;
+            j->levels = e->span_levels; j->pitch = e->pitch; j->span = e->span;
+            j->cube = e->cubemap;
+            atomic_store_explicit(&j->state, 0u, memory_order_relaxed);
+            s_tcs_slot_gen[i] = gen; s_tcs_slot_idx[i] = (u16)n;
+            n++;
+        }
+    }
+    atomic_store(&s_tcs_ctr, ((u64)gen << 32) | ((u64)n << 16));
+    s_tcs_st.kicks++; s_tcs_st.jobs += n;
+    if (n && s_tcs_nthr) {
+        pthread_mutex_lock(&s_tcs_mx);
+        s_tcs_wake = gen;
+        pthread_cond_broadcast(&s_tcs_cv);
+        pthread_mutex_unlock(&s_tcs_mx);
+    }
+}
+
+/* slot i's checksum if a worker computed it for exactly these inputs in this
+ * epoch; 0 = compute it inline */
+static int eng_tcs_take(u32 i, const u8* src, u32 fmt, u32 w, u32 h, u32 levels,
+                        u32 pitch, int cube, u32 span, u32* cs)
+{
+    if (atomic_load_explicit(&s_tcs_epoch, memory_order_relaxed) != s_tcs_kick_epoch ||
+        g.frames != s_tcs_kick_frame) {   /* new data or a new frame: new jobs */
+        eng_tcs_kick(i); s_tcs_st.stale++;
+        return 0;
+    }
+    if (s_tcs_slot_gen[i] != s_tcs_gen) { s_tcs_st.miss++; return 0; }
+    s_tcs_slot_gen[i] = 0;
+    eng_tcs_job* const j = &s_tcs_j[s_tcs_gen & 1u][s_tcs_slot_idx[i]];
+    if (j->src != src || j->fmt != fmt || j->w != w || j->h != h ||
+        j->levels != levels || j->pitch != pitch || j->span != span ||
+        j->cube != (u32)(cube != 0)) { s_tcs_st.miss++; return 0; }
+    u32 st = atomic_load_explicit(&j->state, memory_order_acquire);
+    if (st == 0u && atomic_compare_exchange_strong(&j->state, &st, 1u)) {
+        s_tcs_st.self++;                     /* not started: computed inline */
+        return 0;
+    }
+    if (st == 2u) { *cs = j->res; s_tcs_st.take++; return 1; }
+    s_tcs_st.busy++;                         /* a worker is on it: no waiting */
+    return 0;
+}
+
+static void eng_tcs_frame(void)
+{
+    if (!s_tcs_stats || s_tcs_cfg <= 0 || (g.frames % 600u) != 599u) return;
+    fprintf(stderr, "[TEXCS] 600 frames: %llu kicks, %llu jobs (%llu by workers), "
+            "%llu taken, %llu inline (%llu not started, %llu busy, %llu first of "
+            "epoch/frame, %llu no job), %llu straggler skips, verify %llu/%llu differ\n",
+            (unsigned long long)s_tcs_st.kicks, (unsigned long long)s_tcs_st.jobs,
+            (unsigned long long)atomic_exchange(&s_tcs_byw, 0),
+            (unsigned long long)s_tcs_st.take,
+            (unsigned long long)(s_tcs_st.self + s_tcs_st.busy + s_tcs_st.stale + s_tcs_st.miss),
+            (unsigned long long)s_tcs_st.self, (unsigned long long)s_tcs_st.busy,
+            (unsigned long long)s_tcs_st.stale, (unsigned long long)s_tcs_st.miss,
+            (unsigned long long)s_tcs_st.skip_in,
+            (unsigned long long)s_tcs_st.differ, (unsigned long long)s_tcs_st.checked);
+    memset(&s_tcs_st, 0, sizeof s_tcs_st);
+}
+#endif /* __APPLE__ */
+
+void rsx_draw_engine_data_epoch(void)
+{
+#if defined(__APPLE__)
+    atomic_fetch_add_explicit(&s_tcs_epoch, 1u, memory_order_relaxed);
+#endif
+}
+
+/* The once-per-frame validation checksum of cached slot `slot`; same contract
+ * as eng_texture_content_hash. */
+static u64 eng_texture_validate_hash(u32 slot, u32 location, u32 offset, u32 fmt,
+                                     u32 w, u32 h, u32 levels, u32 pitch,
+                                     int cube, u32 span, int* readable)
+{
+#if defined(__APPLE__)
+    if (eng_tcs_on()) {
+        eng_tcs_note(slot);
+        const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+        if (!src) { *readable = 0; return 0; }
+        *readable = 1;
+        u32 cs;
+        if (eng_tcs_take(slot, src, fmt, w, h, levels, pitch, cube, span, &cs)) {
+            if (s_tcs_verify) {
+                s_tcs_st.checked++;
+                if (cs != eng_texture_csum_src(src, fmt, w, h, levels, pitch, cube, span)) {
+                    if (s_tcs_st.differ < 4 && (g.frames % 600u) < 300u)
+                        fprintf(stderr, "[TEXCS] differ: frame %u slot %u loc %u off 0x%08X "
+                                "fmt 0x%02X %ux%u lv %u cube %d span %u\n", g.frames, slot,
+                                location, offset, fmt, w, h, levels, cube, span);
+                    s_tcs_st.differ++;
+                }
+            }
+            return cs;
+        }
+        return eng_texture_csum_src(src, fmt, w, h, levels, pitch, cube, span);
+    }
+#else
+    (void)slot;
+#endif
+    return eng_texture_content_hash(location, offset, fmt, w, h, levels, pitch,
+                                    cube, span, readable);
 }
 
 static int eng_staging_reserve(u32 bytes)
@@ -1458,11 +1742,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         eng_tex_assoc_note(hb, found);
         if (e->handle && e->last_hash_frame != g.frames) {
             int readable = 0;
-            const u64 hash = eng_texture_content_hash(location, offset, fmt,
-                                                      w, h, levels, pitch,
-                                                      cube, span, &readable);
+            const u64 hash = eng_texture_validate_hash((u32)found, location,
+                                                       offset, fmt, w, h, levels,
+                                                       pitch, cube, span, &readable);
             e->last_hash_frame = g.frames;
             if (readable && hash != e->content_hash) {
+#if defined(__APPLE__)
+                s_tcs_chg[found] = g.frames + 1u;   /* TEXCS: inline for a while */
+#endif
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap);
                 if (fresh) {
@@ -1504,6 +1791,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                   cube, remap);
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) { g.textures[index] = e; eng_tex_assoc_note(hb, (int)index); }
+#if defined(__APPLE__)
+    if (e.handle && s_tcs_cfg > 0) { s_tcs_chg[index] = 0; eng_tcs_note(index); }   /* TEXCS: validated next frame */
+#endif
     return e.handle;
 }
 
@@ -3847,6 +4137,9 @@ static void eng_present(u32 buffer_id)
     if (ENG_TRACING()) { eng_trace_pass_boundary(1); eng_dump_surfaces(); }
     eng_trace_tick(g.frames);
     eng_geo_frame();
+#if defined(__APPLE__)
+    eng_tcs_frame();
+#endif
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;

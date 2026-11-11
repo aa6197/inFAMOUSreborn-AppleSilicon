@@ -276,6 +276,11 @@ void rsx_draw_engine_shutdown(void);
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
 
+/* The FIFO walker read a new put, or reached an NV406E semaphore acquire:
+ * guest or SPU data behind it may be newer than before. Texture checksums a
+ * worker computed before this point are not used after it (TEXCS, Apple). */
+void rsx_draw_engine_data_epoch(void);
+
 /* A whole incrementing transform-constant block on subchannel 0 (methods
  * 0x1EFC..0x1F7C), words in guest byte order: same result as calling
  * rsx_draw_engine_method on each word. */

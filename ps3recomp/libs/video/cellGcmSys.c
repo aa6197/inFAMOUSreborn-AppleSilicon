@@ -1153,6 +1153,9 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
             vm_write32(base + py * dst_pitch + px * 4, data);
+#if defined(__APPLE__)
+            rsx_draw_engine_data_epoch();   /* draw engine TEXCS: the RSX wrote guest memory */
+#endif
             return;
         }
         return;
@@ -1182,7 +1185,11 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0400: s_nv3089.in_sz     = data; return;
         case 0x0404: s_nv3089.in_fmt    = data; return;
         case 0x0408: s_nv3089.in_off    = data; return;
-        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit();
+#if defined(__APPLE__)
+                     rsx_draw_engine_data_epoch();   /* draw engine TEXCS: the RSX wrote guest memory */
+#endif
+                     return;
         }
         return;
     }
@@ -1757,6 +1764,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     { extern void rsx_ww_bump(void); rsx_ww_bump(); }   /* v219 VC_WW: data behind a new put may be newer than the last poll */
+#if defined(__APPLE__)
+    { static u32 s_eng_epoch_put = 0xFFFFFFFFu;   /* draw engine TEXCS: same, for its worker checksums */
+      if (put != s_eng_epoch_put) { s_eng_epoch_put = put; rsx_draw_engine_data_epoch(); } }
+#endif
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
      * in order; on arm64 it does not, so without an acquire here the ring
@@ -2163,6 +2174,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x68u) { static unsigned long s_acq = 0; if (((++s_acq) & 0x3FFFu) == 1)   /* v173 diag */
                         fprintf(stderr, "[SEMA] NV406E acquire #%lu: label 0x%X = 0x%08X, want 0x%08X%c", s_acq, la, vm_read32(la), v, 10); }
                     if (m == 0x68u) { extern void rsx_ww_bump(void); rsx_ww_bump(); }   /* v219 VC_WW: SPU-released data */
+#if defined(__APPLE__)
+                    if (m == 0x68u) rsx_draw_engine_data_epoch();   /* draw engine TEXCS: same */
+#endif
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) { extern void (*g_rsx_vtx_sync)(void); if (g_rsx_vtx_sync) g_rsx_vtx_sync(); vm_write32(la, v); }
                     else if (m == 0x68u && vm_read32(la) != v) {
