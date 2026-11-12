@@ -19,7 +19,12 @@ Read this first every session. Newest entry on top.
   gameplay + pause menu, 330 s, no crash. M10 (iPhone): Simulator
   (iPhone 17, iPhone 18 Pro), plus one test on the real iPhone 16 Pro
   (11-11, user's OK): runs, 12.6–15.8 flips/s. See entry "iPhone 16 Pro:
-  first real-device test". **Otherwise never use the physical iPhone.**
+  first real-device test". Since 11-12 the user allows speed tests on
+  the iPhone (A/B, profiling): `IOS_DEV=<iphone>` with
+  the iOS tools. Nothing else on the iPhone.
+- **iPhone speed now (11-12):** the long freezes (2–55 s) are fixed
+  (d09eb0b, lock-line wait yields and sleeps). Steady speed is still
+  ~18–20 flips/s, hot (thermal 2). See entry "iPhone speed: freezes fixed".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -96,6 +101,78 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-12 — iPhone speed: freezes fixed
+
+Goal from the user: iPhone 16 Pro in the high 30s (iPad is ~50–55).
+Same 330 s script as the iPad (`ios_ab.sh`, `IOS_DEV=<iPhone udid>`).
+Build: `build-ios-pgo`. The phone is at thermal 2 ("serious") in every run.
+
+### What was wrong
+
+- Most runs froze for 2–55 s: no new frames, audio silent.
+- Profile of a freeze: game-main and 7–9 SPURS kernel threads sat 100%
+  in `spu_lockline_lock_ea`. The thread that held the lock-line stripe
+  (a SPURS lane thread, utility QoS on iOS) got no CPU.
+- Cause: the POSIX `ll_acq` in `spu_coherency.c` spun with no pause and
+  no yield. 6 cores, all busy spinning, so the holder never ran. The iPad
+  (10 cores) has spare cores, so it never froze.
+- Windows already had a fix (v100: yield, then Sleep(1)).
+
+### Fix (d09eb0b)
+
+- Apple branch of `ll_acq`: pause, `sched_yield` after 4096 spins, and
+  after `SPU_LL_SLEEP_MS` (default 4) a 1 ms sleep every 4th round.
+  A sleep lets any thread run; a yield only same or higher priority.
+- Waits >= 50 ms print `[LL-WAIT]` with waiter and holder names.
+- Windows code unchanged (`_MSC_VER` branch).
+
+### Results (flips/s 150–250 s; frozen = seconds with no frame)
+
+| round | setup | flips/s | frozen s |
+|---|---|---|---|
+| 1 | base | 17.8 / 17.5 | 53 / 9 |
+| 1 | MetalFX off | 19.3 / 15.2 | 12 / 34 |
+| 1 | lower screen res (`IOS_VIEW_SCALE=2`) | 15.1 / 18.1 | 22 / 0 |
+| 2 | base | 19.9 / (bg) | 0 / – |
+| 2 | `V242A_LLSPIN` | 16.8 / 18.2 | 26 / (bg) |
+| 2 | `V242A_NAP` | 18.6 / 18.0 | 0 / 0 |
+| 2 | audio kernel utility QoS | 18.9 / 19.4 | 88 / 98 |
+| 3 | **lock fix** | 20.0 | 0 |
+| 3 | fix + `SPU_LL_SLEEP_MS=1` | 18.2 | 0 |
+| 3 | fix + `SPURS_KERN0_QOS=ui` | 17.9 | 0 |
+| 3 | fix + `SPURS_WKL_THREADS=3` | 17.5 / 19.2 | 0 / 0 |
+
+- Before the fix 10 of 14 runs froze (32 s per run on average).
+  After: 0 of 5. Freezes are gone; `[LL-WAIT]` waits now end by ~51 ms.
+- Steady speed did not move: ~18–20 flips/s. No switch won.
+- Round 3 has one run per side: the phone locked at ~08:30, so the
+  mirrored half failed (launch refused while locked).
+- Not kept (patches in `$WORK_DIR/patches/`): `IOS_VIEW_SCALE`
+  (GPU is only ~25% busy, so fewer pixels gain nothing) and
+  `SPURS_KERN0_QOS`. Never use `SPURS_KERN1_QOS=ut`: it causes long
+  freezes (88–98 s per run before the fix).
+- "(bg)": the app went to the background mid-run; not counted.
+
+### Why the iPhone is slow
+
+- CPU and power bound, not GPU: GPU ~20–35% busy.
+- Hot all the time: P cores 1.4–2.1 GHz, E cores ~2.1 GHz. Only 2 P cores
+  (iPad: 3–4 at ~1.8 GHz hot).
+- ~5–7 threads wait for a core at any time.
+
+### Next
+
+- Lock holders are SPURS lane threads at utility QoS. Test
+  `SPURS_LANE_QOS=in` on the iPhone.
+- Finish round 3 (the mirrored half) with the phone kept unlocked.
+- A 30 fps cap might keep the phone cooler and steadier.
+- PGO: `spu_coherency.c` changed, so its profile is stale. Regenerate later.
+
+Runs: `runs/20261112-06*-iphone-r1*`, `-r2*`, `-r3*`, `-stall1`, `-prof1`.
+Speed chart page: "inFamous iPhone Speed".
 
 ---
 
