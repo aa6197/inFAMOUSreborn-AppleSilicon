@@ -2889,9 +2889,88 @@ static void eng_ivf_check(int stage)
 /* The fetch plan's register part: descriptors, defaults, sources. Nothing
  * in it depends on the references, so it is set up before dc_fetch (the
  * geometry memo keys on it) and dc_fetch only adds the element ranges. */
+#if defined(__APPLE__)
+/* PLAN_MEMO (Apple): the register part is a pure function of the vertex
+ * registers -- VTXFMT[16] (0x1740), the 4F defaults (0x1C00, 64 words), the
+ * frequency divider (0x1FC0), VTXBUF_OFFSET[16] (0x1680) and
+ * VERTEX_DATA_BASE (0x1738). The offsets change with almost every mesh, so
+ * they are not part of the key: while the rest is unchanged the last plan
+ * is copied and only base offset and the per-attribute offset/location are
+ * decoded again (as rsx_dsp_get_vertex_attr does). Layout as before.
+ * PS3RECOMP_ENGINE_PLAN_MEMO=0 turns it off; PLAN_MEMO_PHASE=0|1 (A/B test
+ * only): on only in PS3_AB phases of that parity;
+ * PS3RECOMP_ENGINE_PLAN_VERIFY=1 also builds every hit fresh and compares. */
+extern volatile int g_ab_phase;
+static int s_pm_on = -2, s_pm_phase = -1, s_pm_verify, s_pm_valid;
+static u32 s_pm_fmt[16], s_pm_def[64], s_pm_div;
+static rsx_vertex_fetch_plan s_pm_plan;
+static u64 s_pm_hits, s_pm_draws, s_pm_checked, s_pm_differ;
+
+static int eng_plan_memo_on(void)
+{
+    if (__builtin_expect(s_pm_on == -2, 0)) {
+        const char* e = getenv("PS3RECOMP_ENGINE_PLAN_MEMO");
+        const char* p = getenv("PLAN_MEMO_PHASE");
+        const char* v = getenv("PS3RECOMP_ENGINE_PLAN_VERIFY");
+        s_pm_on = !(e && *e == '0');
+        s_pm_phase = (p && (*p == '0' || *p == '1')) ? *p - '0' : -1;
+        s_pm_verify = v && *v == '1';
+        if (!s_pm_on || s_pm_phase >= 0 || s_pm_verify)
+            fprintf(stderr, "[rsx engine] fetch plan memo %s%s%s\n", s_pm_on ? "on" : "off",
+                    s_pm_phase >= 0 ? (s_pm_phase ? ", odd A/B phases" : ", even A/B phases") : "",
+                    s_pm_verify ? ", verify" : "");
+    }
+    if (!s_pm_on) return 0;
+    return s_pm_phase < 0 || (g_ab_phase & 1) == s_pm_phase;
+}
+
+static void eng_plan_memo_init(const rsx_vertex_layout_plan* layout)
+{
+    const u32* r = g.rsx.regs;
+    s_pm_draws++;
+    if (s_pm_valid && r[0x1FC0 >> 2] == s_pm_div &&
+        !memcmp(&r[0x1740 >> 2], s_pm_fmt, sizeof s_pm_fmt) &&
+        !memcmp(&r[0x1C00 >> 2], s_pm_def, sizeof s_pm_def)) {
+        s_pm_hits++;
+        memcpy(&dc.fetch_plan, &s_pm_plan, sizeof s_pm_plan);
+        dc.fetch_plan.layout = *layout;
+        dc.fetch_plan.base_offset = r[0x1738 >> 2];
+        for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
+            const u32 off = r[(0x1680 >> 2) + a];
+            dc.fetch_plan.attr[a].desc.offset = off & 0x7FFFFFFF;
+            dc.fetch_plan.attr[a].desc.location = off >> 31;
+        }
+        if (__builtin_expect(s_pm_verify, 0)) {
+            static rsx_vertex_fetch_plan fresh;
+            rsx_vertex_fetch_plan_init(&fresh, &g.rsx, layout, eng_guest_ptr, NULL);
+            s_pm_checked++;
+            if (memcmp(&fresh, &dc.fetch_plan, sizeof fresh) && s_pm_differ++ < 8)
+                fprintf(stderr, "[rsx engine] PLAN_VERIFY: cached fetch plan differs\n");
+            if ((s_pm_checked & 0xFFFFu) == 0)
+                fprintf(stderr, "[rsx engine] PLAN_VERIFY: %llu hits checked, %llu differ"
+                                " (%llu of %llu draws hit)\n",
+                        (unsigned long long)s_pm_checked, (unsigned long long)s_pm_differ,
+                        (unsigned long long)s_pm_hits, (unsigned long long)s_pm_draws);
+        }
+        return;
+    }
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    memcpy(&s_pm_plan, &dc.fetch_plan, sizeof s_pm_plan);
+    s_pm_div = r[0x1FC0 >> 2];
+    memcpy(s_pm_fmt, &r[0x1740 >> 2], sizeof s_pm_fmt);
+    memcpy(s_pm_def, &r[0x1C00 >> 2], sizeof s_pm_def);
+    s_pm_valid = 1;
+}
+#endif
+
 static void dc_plan_init(const rsx_vertex_layout_plan* layout)
 {
     dc.layout = *layout;
+#if defined(__APPLE__)
+    if (eng_plan_memo_on())
+        eng_plan_memo_init(layout);
+    else
+#endif
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_set_immediate(&dc.fetch_plan, dc.imm, dc.imm_count);
