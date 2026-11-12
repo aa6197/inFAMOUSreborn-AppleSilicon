@@ -3515,8 +3515,16 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
                   | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
                   | ((u64)(u32)(d->max_lod * 256.0f) << 32);
+    /* Hint table: the slot a key was last found in, checked against the key,
+     * so a miss falls back to the scan (same slot either way). The scan over
+     * every sampler for each bound unit of each draw was ~2% of the iPad
+     * RSX thread. */
+    static u16 hint[64];   /* slot + 1 */
+    const u32 h = (u32)((key * 0x9E3779B97F4A7C15ull) >> 58);
+    { const u32 s = hint[h];
+      if (s && s - 1u < s_eng_samp_count && s_eng_samp[s - 1u].key == key) return (int)(s - 1u); }
     for (u32 i = 0; i < s_eng_samp_count; i++)
-        if (s_eng_samp[i].key == key) return (int)i;
+        if (s_eng_samp[i].key == key) { hint[h] = (u16)(i + 1u); return (int)i; }
     if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
     MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
     sd.minFilter = d->min_linear ? MTLSamplerMinMagFilterLinear
