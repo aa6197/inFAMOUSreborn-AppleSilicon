@@ -4391,6 +4391,13 @@ static int eng_metalfx_on(void)
     return s_mfx_on;
 }
 
+/* The player's Upscaling setting while the game runs (gfx_settings.h). */
+void rsx_metal_set_metalfx(int on)
+{
+    s_mfx_on = (on && [MTLFXSpatialScalerDescriptor supportsDevice:s_dev]) ? 1 : 0;
+    fprintf(stderr, "[metalfx] upscaling %s (setting)\n", s_mfx_on ? "MetalFX" : "plain");
+}
+
 /* METALFX_PHASE=0|1 (A/B test only): MetalFX only in PS3_AB phases of that parity (ppu_loader.cpp
  * phase clock), plain linear scaling in the others. Unset = always as eng_metalfx_on() says. */
 extern volatile int g_ab_phase;
@@ -4451,6 +4458,8 @@ static id<MTLTexture> eng_metalfx_upscale(id<MTLCommandBuffer> cb, id<MTLTexture
     [s_mfx encodeToCommandBuffer:cb];
     return s_mfx_out;
 }
+#else
+void rsx_metal_set_metalfx(int on) { (void)on; }
 #endif
 
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
@@ -4488,7 +4497,10 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
      * linear filtering for the rest. The full-target blit keeps its sampler. */
     id<MTLTexture>      img  = src;
     id<MTLSamplerState> samp = s_eng_point_sampler;
-    if (letterbox) {
+    /* RENDER_SCALE: a game image below 720p is upscaled like a letterboxed
+     * one even when the shapes match (a 16:9 window). */
+    extern int rsx_engine_render_scaled(void);
+    if (letterbox || rsx_engine_render_scaled()) {
 #if PS3RECOMP_HAVE_METALFX
         if (vp.width > sw && vp.height > sh && eng_metalfx_on() && eng_metalfx_phase_ok()) {
             id<MTLTexture> up = eng_metalfx_upscale(cb, src, (NSUInteger)vp.width, (NSUInteger)vp.height);

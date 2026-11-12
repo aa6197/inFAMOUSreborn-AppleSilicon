@@ -94,6 +94,9 @@ typedef struct {
     u32 w, h;
     rsx_be_format fmt;
     u32 handle;
+#if defined(__APPLE__)
+    u32 aw, ah;            /* RENDER_SCALE: the texture's real size        */
+#endif
     int cwritten;          /* a draw with a colour mask != 0 targeted it   */
     u32 feedback;          /* copy sampled by a draw that writes it, or 0  */
     u32 fb_serial;         /* the bind that last refreshed `feedback`      */
@@ -115,6 +118,10 @@ typedef struct {
     u32 ccopy;             /* A8R8G8B8 colour copy, or 0                   */
     u32 cc_w, cc_h;        /* the region the colour copy holds             */
     int ccopy_valid;
+#if defined(__APPLE__)
+    int rscaled;           /* RENDER_SCALE: the scale (80ths) of the last pass
+                              that drew it, 0 = full size                 */
+#endif
 } eng_zdepth;
 
 typedef struct {
@@ -578,6 +585,76 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
+#if defined(__APPLE__)
+/* RENDER_SCALE=<percent> (Apple port; default 100 = the PS3's own 720p): draw
+ * the game below 720p and let the present upscale it (MetalFX when on). As
+ * the D3D12 backend's v154 RES_SCALE: only targets at the guest display size
+ * (1280x720) are made smaller; shadow maps, the half- and quarter-size effect
+ * buffers and lookup tables keep their size. Draws into a scaled target get a
+ * scaled viewport and scissor, fragment WPOS is scaled back to guest pixels
+ * (fp_alpha.w), and a depth target drawn by a scaled pass is copied at the
+ * scaled size; everything that samples uses 0..1 coordinates, so nothing
+ * else changes. 25..100, snapped to 1/80 steps so 1280x720 stays exact
+ * (50 = 640x360, 62.5 = 800x450, 75 = 960x540, 87.5 = 1120x630). Read once:
+ * a change needs a restart. RENDER_SCALE_PHASE=0|1 (A/B test only): the
+ * scale only in PS3_AB phases of that parity, 720p in the others; the
+ * display-size targets are remade at each flip. */
+extern volatile int g_ab_phase;
+static int s_rs_k = -1;   /* scale = s_rs_k / 80; 80 = off */
+static int s_rs_phase = -1;
+static float s_rs = 1.0f;
+static u32 s_rs_w, s_rs_h;
+static void eng_rscale_init(void)
+{
+    if (__builtin_expect(s_rs_k >= 0, 1)) return;
+    const char* ph = getenv("RENDER_SCALE_PHASE");
+    if (ph && (*ph == '0' || *ph == '1')) s_rs_phase = *ph - '0';
+    const char* e = getenv("RENDER_SCALE");
+    double pc = (e && *e) ? atof(e) : 100.0;
+    if (!(pc >= 25.0)) pc = (e && *e) ? 25.0 : 100.0;
+    if (pc > 100.0) pc = 100.0;
+    s_rs_k = (int)(pc * 0.8 + 0.5);
+    if (s_rs_k < 20) s_rs_k = 20;
+    if (s_rs_k > 80) s_rs_k = 80;
+    s_rs = (float)s_rs_k / 80.0f;
+    s_rs_w = (g.width * (u32)s_rs_k + 40u) / 80u;
+    s_rs_h = (g.height * (u32)s_rs_k + 40u) / 80u;
+    if (s_rs_k != 80)
+        fprintf(stderr, "[rsx engine] RENDER_SCALE %.1f%%: %ux%u targets drawn at %ux%u%s\n",
+                (double)s_rs * 100.0, g.width, g.height, s_rs_w, s_rs_h,
+                s_rs_phase < 0 ? "" : s_rs_phase ? " (odd A/B phases)" : " (even A/B phases)");
+}
+int rsx_engine_render_scaled(void) { eng_rscale_init(); return s_rs_k != 80; }
+/* The scale (in 80ths) a display-size target made now gets. */
+static inline int eng_rs_k_now(void)
+{
+    eng_rscale_init();
+    if (s_rs_phase < 0) return s_rs_k;
+    return (g_ab_phase & 1) == s_rs_phase ? s_rs_k : 80;
+}
+/* A guest w x h region of a depth target last drawn at k/80, in texels. */
+static inline void eng_rscale_region(u32* w, u32* h, int k)
+{
+    *w = (*w * (u32)k + 40u) / 80u; if (!*w) *w = 1;
+    *h = (*h * (u32)k + 40u) / 80u; if (!*h) *h = 1;
+}
+/* Nearest-neighbour shrink of a decoded RGBA8 seed to the scaled size. */
+static const void* eng_rscale_seed(const void* seed, u32* row, u32 w, u32 h, u32 aw, u32 ah)
+{
+    static u8* buf; static size_t cap;
+    if (!seed || !*row) return seed;
+    const size_t need = (size_t)aw * ah * 4u;
+    if (cap < need) { u8* n = (u8*)realloc(buf, need); if (!n) return NULL; buf = n; cap = need; }
+    for (u32 y = 0; y < ah; y++) {
+        const u8* src = (const u8*)seed + (size_t)((y * h) / ah) * *row;
+        u32* dst = (u32*)(buf + (size_t)y * aw * 4u);
+        for (u32 x = 0; x < aw; x++) memcpy(&dst[x], src + (size_t)((x * w) / aw) * 4u, 4);
+    }
+    *row = aw * 4u;
+    return buf;
+}
+#endif
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
@@ -591,8 +668,17 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
             if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-                g.surfaces[i].fmt == want_fmt)
+                g.surfaces[i].fmt == want_fmt) {
+#if defined(__APPLE__)
+                /* RENDER_SCALE_PHASE: remade at the size of the current phase. */
+                if (s_rs_phase >= 0 && want_w == g.width && want_h == g.height &&
+                    g.surfaces[i].aw != (g.width * (u32)eng_rs_k_now() + 40u) / 80u) {
+                    slot = i;
+                    break;
+                }
+#endif
                 return i;
+            }
             slot = i;
             break;
         }
@@ -615,8 +701,17 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 seed_row = 0;
     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
                                         want_fmt, &seed_row);
+    u32 real_w = want_w, real_h = want_h;
+#if defined(__APPLE__)
+    const int rk = eng_rs_k_now();
+    if (rk != 80 && want_w == g.width && want_h == g.height) {
+        real_w = (want_w * (u32)rk + 40u) / 80u; real_h = (want_h * (u32)rk + 40u) / 80u;
+        seed = eng_rscale_seed(seed, &seed_row, want_w, want_h, real_w, real_h);
+        if (!seed) seed_row = 0;
+    }
+#endif
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
-                                                 want_w, want_h, seed, seed_row);
+                                                 real_w, real_h, seed, seed_row);
     if (!handle)
         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
 
@@ -626,6 +721,10 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->location = location; s->offset = offset;
     eng_rt_note(location, offset);
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
+#if defined(__APPLE__)
+    s->aw = real_w; s->ah = real_h;
+#endif
+    (void)real_w; (void)real_h;
     s->handle = handle;
     s->cwritten = 0;
     s->feedback = 0;
@@ -733,6 +832,9 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->cleared = 0;
     z->had_write = 0;
     z->snapshot_valid = 0;
+#if defined(__APPLE__)
+    z->rscaled = 0;
+#endif
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
 }
@@ -750,6 +852,9 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 w, u32 h)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !z->had_write) return 0;
+#if defined(__APPLE__)
+    if (z->rscaled && w && h) eng_rscale_region(&w, &h, z->rscaled);
+#endif
     if (!w || w > z->w) w = z->w;
     if (!h || h > z->h) h = z->h;
     if (z->snapshot_valid && z->snapshot && z->snap_w == w && z->snap_h == h)
@@ -773,6 +878,9 @@ static u32 eng_zdepth_color_copy(u32 slot, u32 w, u32 h)
 {
     eng_zdepth* z = &g.zdepths[slot];
     if (!z->handle || !(z->cleared || z->had_write) || !g.be->depth_color_copy) return 0;
+#if defined(__APPLE__)
+    if (z->rscaled && w && h) eng_rscale_region(&w, &h, z->rscaled);
+#endif
     if (!w || w > z->w) w = z->w;
     if (!h || h > z->h) h = z->h;
     if (z->ccopy_valid && z->ccopy && z->cc_w == w && z->cc_h == h) return z->ccopy;
@@ -1073,6 +1181,37 @@ static void eng_fp_sun_ndl_clamp(char* hlsl, size_t cap)
  * of its zeta on a spare unit and the fragment program discards outside the
  * bounds, which ride in fp_alpha.y/z. */
 #define ENG_DBT_UNIT 15u
+#if defined(__APPLE__)
+/* RENDER_SCALE: the program's WPOS reads (the decompiler's input.position)
+ * become rsx_wpos, guest pixels: SV_Position * fp_alpha.w on x and y, set per
+ * draw (1 on a target that is not scaled). z and w are unchanged. Runs before
+ * the depth-bounds insert, whose Load wants real texels. 1 = rewritten, 0 =
+ * no WPOS read, -1 = no room / no main. */
+static int eng_fp_wpos_rewrite(char* hlsl, size_t cap)
+{
+    if (!strstr(hlsl, "input.position")) return 0;
+    char* m = strstr(hlsl, " main(PSInput input)");
+    if (!m) return -1;
+    static const char from[] = "input.position", to[] = "rsx_wpos";
+    const size_t fl = sizeof from - 1, tl = sizeof to - 1;
+    for (char* q = strstr(m, from); q; q = strstr(q + tl, from)) {
+        memmove(q + tl, q + fl, strlen(q + fl) + 1);
+        memcpy(q, to, tl);
+    }
+    char* body = strchr(m, '{');
+    if (!body) return -1;
+    body++;
+    if (*body == '\n') body++;
+    static const char ins[] =
+        "    const float4 rsx_wpos = float4(input.position.xy * fp_alpha.w, input.position.zw);\n";
+    const size_t il = sizeof ins - 1, used = strlen(hlsl);
+    if (used + il + 1 > cap) return -1;
+    memmove(body + il, body, used + 1 - (size_t)(body - hlsl));
+    memcpy(body, ins, il);
+    return 1;
+}
+#endif
+
 static int eng_dbt_on(void)
 {
     static int v = -1;
@@ -2375,6 +2514,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 fprintf(stderr, "[rsx engine] TEX_XF: %d sample(s) wrapped (unit modes 0x%04X)\n", nx, texk);
             }
         }
+#if defined(__APPLE__)
+        if (fi > 0 && rsx_engine_render_scaled()) {
+            const int r = eng_fp_wpos_rewrite(s_ps_hlsl, sizeof s_ps_hlsl);
+            if (r < 0) fi = -1;
+            static u32 logs = 0;
+            if (r && (logs < 8 || r < 0)) {
+                logs++;
+                fprintf(stderr, "[rsx engine] RENDER_SCALE: fragment WPOS %s\n",
+                        r < 0 ? "NOT rewritten (program dropped)" : "scaled to guest pixels");
+            }
+        }
+#endif
         /* A failed insert keeps the draw, untested, as before this switch. */
         if (fi > 0 && dbt) {
             const int r = eng_fp_dbt_rewrite(s_ps_hlsl, sizeof s_ps_hlsl, cube_mask);
@@ -3933,13 +4084,18 @@ static void eng_dump_one(const char* dir, u32 i, const char* tag)
         default: break;
         }
         if (!s->handle || !bpp || !s->w || !s->h) return;
-        u8* raw = (u8*)malloc((size_t)s->w * s->h * bpp);
-        u8* rgb = (u8*)malloc((size_t)s->w * s->h * 3);
+#if defined(__APPLE__)
+        const u32 sw_ = s->aw ? s->aw : s->w, sh_ = s->ah ? s->ah : s->h;
+#else
+        const u32 sw_ = s->w, sh_ = s->h;
+#endif
+        u8* raw = (u8*)malloc((size_t)sw_ * sh_ * bpp);
+        u8* rgb = (u8*)malloc((size_t)sw_ * sh_ * 3);
         if (!raw || !rgb) { free(raw); free(rgb); return; }
-        g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, raw, s->w * bpp);
+        g.be->readback(g.be->user, s->handle, 0, 0, sw_, sh_, raw, sw_ * bpp);
         double sum[4] = {0, 0, 0, 0};
         float mx[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
-        const size_t n = (size_t)s->w * s->h;
+        const size_t n = (size_t)sw_ * sh_;
         for (size_t p = 0; p < n; p++) {
             float v[4] = {0, 0, 0, 1};
             const u8* px = raw + p * bpp;
@@ -3960,7 +4116,7 @@ static void eng_dump_one(const char* dir, u32 i, const char* tag)
                  dir, g.frames, tag, i, s->offset, s->w, s->h, (int)s->fmt);
         FILE* f = fopen(path, "wb");
         if (f) {
-            fprintf(f, "P6\n%u %u\n255\n", s->w, s->h);
+            fprintf(f, "P6\n%u %u\n255\n", sw_, sh_);
             fwrite(rgb, 1, n * 3, f);
             fclose(f);
         }
@@ -4409,6 +4565,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);
+#if defined(__APPLE__)
+    /* RENDER_SCALE: this pass draws into a scaled target (A's size rules an
+     * MRT set), and so does its depth from here on. */
+    const int rscaled = g.surfaces[target].aw != g.surfaces[target].w ||
+                        g.surfaces[target].ah != g.surfaces[target].h;
+    if (zslot != ENG_INVALID)
+        g.zdepths[zslot].rscaled = rscaled ? (int)((g.surfaces[target].aw * 80u +
+                                   g.surfaces[target].w / 2u) / g.surfaces[target].w) : 0;
+#endif
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -4494,7 +4659,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
       alpha[1] = alpha[2] = alpha[3] = 0.0f;
-      if (g.dbt) { alpha[1] = eng_reg_f32(0x0384u); alpha[2] = eng_reg_f32(0x0388u); } }
+      if (g.dbt) { alpha[1] = eng_reg_f32(0x0384u); alpha[2] = eng_reg_f32(0x0388u); }
+#if defined(__APPLE__)
+      /* RENDER_SCALE: WPOS * fp_alpha.w = guest pixels (see eng_fp_wpos_rewrite). */
+      if (rsx_engine_render_scaled())
+          alpha[3] = rscaled ? (float)g.surfaces[target].w / (float)g.surfaces[target].aw : 1.0f;
+#endif
+    }
 
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
@@ -4523,6 +4694,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+#if defined(__APPLE__)
+    if (rscaled)
+        g.be->set_viewport(g.be->user, 0.0f, 0.0f, (float)g.surfaces[target].aw,
+                           (float)g.surfaces[target].ah);
+    else
+#endif
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
@@ -4545,6 +4722,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
             sw = right > sx ? right - sx : 0;
             sh = bottom > sy ? bottom - sy : 0;
         }
+#if defined(__APPLE__)
+        if (rscaled) {   /* guest pixels -> the scaled target's, covering every touched texel */
+            const eng_surface* ts = &g.surfaces[target];
+            u32 x0 = (sx * ts->aw) / ts->w, y0 = (sy * ts->ah) / ts->h;
+            u32 x1 = ((sx + sw) * ts->aw + ts->w - 1u) / ts->w;
+            u32 y1 = ((sy + sh) * ts->ah + ts->h - 1u) / ts->h;
+            if (x1 > ts->aw) x1 = ts->aw;
+            if (y1 > ts->ah) y1 = ts->ah;
+            sx = x0; sy = y0;
+            sw = x1 > x0 ? x1 - x0 : 0;
+            sh = y1 > y0 ? y1 - y0 : 0;
+        }
+#endif
         g.be->set_scissor(g.be->user, sx, sy, sw, sh);
     }
     /* Dynamic, and deliberately outside the pipeline key. */
@@ -4925,6 +5115,10 @@ u32 rsx_draw_engine_readback_center(void)
     const eng_surface* s = &g.surfaces[slot];
     if (!s->handle || s->fmt != RSX_BE_FMT_R8G8B8A8 || !s->w || !s->h) return 0;
     u8 px[4] = { 0, 0, 0, 0 };
+#if defined(__APPLE__)
+    if (s->aw && s->ah) { g.be->readback(g.be->user, s->handle, s->aw / 2u, s->ah / 2u, 1, 1, px, 4); }
+    else
+#endif
     g.be->readback(g.be->user, s->handle, s->w / 2u, s->h / 2u, 1, 1, px, 4);
     /* Decoded rows are R,G,B,A; the guest's own clear colour is A8R8G8B8, and
      * a host comparing the two wants them in the same order. */

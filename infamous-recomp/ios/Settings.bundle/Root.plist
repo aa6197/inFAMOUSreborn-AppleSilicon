@@ -11,7 +11,7 @@
 			<key>Title</key>
 			<string>Graphics</string>
 			<key>FooterText</key>
-			<string>Shadows take a lot of work every frame. Near only or Off gives a higher frame rate. A change applies when you go back to the game.</string>
+			<string>Shadows take a lot of work every frame. Near only or Off gives a higher frame rate. Upscaling and Shadows change when you go back to the game. Resolution changes the next time the game starts.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
@@ -31,6 +31,52 @@
 			<key>Values</key>
 			<array>
 				<integer>2</integer>
+				<integer>1</integer>
+				<integer>0</integer>
+			</array>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Title</key>
+			<string>Resolution</string>
+			<key>Key</key>
+			<string>RenderScale</string>
+			<key>DefaultValue</key>
+			<real>100</real>
+			<key>Titles</key>
+			<array>
+				<string>720p (PS3)</string>
+				<string>630p</string>
+				<string>540p</string>
+				<string>450p</string>
+				<string>360p</string>
+			</array>
+			<key>Values</key>
+			<array>
+				<real>100</real>
+				<real>87.5</real>
+				<real>75</real>
+				<real>62.5</real>
+				<real>50</real>
+			</array>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Title</key>
+			<string>Upscaling</string>
+			<key>Key</key>
+			<string>Upscaling</string>
+			<key>DefaultValue</key>
+			<integer>1</integer>
+			<key>Titles</key>
+			<array>
+				<string>MetalFX</string>
+				<string>Simple</string>
+			</array>
+			<key>Values</key>
+			<array>
 				<integer>1</integer>
 				<integer>0</integer>
 			</array>
