@@ -23,8 +23,10 @@ Read this first every session. Newest entry on top.
   the iPhone (A/B, profiling): `IOS_DEV=<iphone>` with
   the iOS tools. Nothing else on the iPhone.
 - **iPhone speed now (11-12):** the long freezes (2–55 s) are fixed
-  (d09eb0b, lock-line wait yields and sleeps). Steady speed is still
-  ~18–20 flips/s, hot (thermal 2). See entry "iPhone speed: freezes fixed".
+  (d09eb0b, lock-line wait yields and sleeps). Lane workers now run at
+  user-initiated QoS on 6-core devices (074495d, +8–12%): 23–26 flips/s
+  hot in the afternoon, ~30 cool. Goal: high 30s. See entries
+  "iPhone: lane workers at higher priority" and "iPhone speed: freezes fixed".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -101,6 +103,65 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-12 — iPhone: lane workers at higher priority (+8–12%)
+
+Same 330 s script (`ios_ab.sh`, `IOS_DEV=<iPhone udid>`), build `build-ios-pgo`.
+
+### Test
+
+- `SPURS_LANE_QOS`: QoS of the SPURS lane worker threads. iOS default was
+  `ut` (utility), picked on the iPad. Tried `in` (user-initiated) and
+  `ui` (user-interactive).
+- Round 4, ABCCBA (flips/s 150–250 s):
+
+| run | setup | flips/s | thermal |
+|---|---|---|---|
+| 1 | normal (`ut`) | 28.9 | 0 |
+| 2 | `in` | 30.2 | 1 |
+| 3 | `ui` | 27.3 | 2 |
+| 4 | `ui` | 27.1 | 2 |
+| 5 | `in` | 25.8 | 2 |
+| 6 | normal | 22.8 | 2 |
+
+- Round 5, ABBAABBA, normal vs `in` (all at thermal 2):
+  normal 21.0, 19.9, 19.8, 21.5 (avg 20.6);
+  `in` 22.7, 22.4, 23.3, 24.0 (avg 23.1, +12%).
+- Every `in` run beat its mirrored normal run in both rounds.
+- No freezes and no `[LL-WAIT]` in any run. The only gaps were times
+  the app went to the background (`[ios] frame clock parked`).
+
+### Change (074495d)
+
+- iOS default for `SPURS_LANE_QOS`: `in` with 6 or fewer CPUs
+  (iPhone), `ut` above (iPad, so the iPad is unchanged). macOS unchanged.
+- Check run with the new build, no switches: log says
+  `SPURS_LANE_QOS=in`, 25.5 flips/s, no freezes.
+
+### What else we learned
+
+- The phone's state changes a lot. Same build (07:57) in the morning:
+  game got ~300% CPU, lock waits of 50+ ms, 18–20 flips/s. In the
+  afternoon: ~450–500% CPU, no lock waits, 20–30 flips/s. Probably other
+  work on the phone in the morning (not proven). Compare runs only
+  within one round.
+- Hot, the P cores sit at their floor (1.26 GHz), E cores ~1.8 GHz.
+  All 6 cores are busy; 11–21 threads wait for a core.
+- The morning profile (`-prof1`) can't be read now: the app was rebuilt
+  after it, so the symbols don't match.
+
+### Next
+
+- Fresh gameplay profile with this build: where does SPURS kernel time go
+  (real SPU jobs or waiting)?
+- Then try fewer SPURS threads / shorter spins on the 6-core phone.
+- PGO profile is stale (`spu_coherency.c` changed). Regenerate later.
+- A 30 fps cap might keep the phone cooler and steadier.
+
+Runs: `runs/20261112-1[345]*-iphone-r4*`, `-r5*`, `-r6newdef`.
+Speed chart page: "inFamous iPhone Speed".
 
 ---
 
