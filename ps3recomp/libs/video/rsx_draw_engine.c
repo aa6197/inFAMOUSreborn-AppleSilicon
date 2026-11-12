@@ -1984,9 +1984,86 @@ static eng_fp_memo* eng_fp_memo_get(u32 loc, u32 off, const u8** io_uc)
  * program declares all sixteen inputs, so narrowing the layout for it would
  * leave the pipeline's vertex descriptor short of what the shader reads.
  * out_vm / out_fm get the PROG_MEMO entries (NULL when there is none). */
+#if defined(__APPLE__)
+/* GP_REUSE (Apple): sink_end asks twice per draw, for the layout and then for
+ * the pipeline, and nothing in between changes the program registers or the
+ * memo slots, so the second ask takes the first answer (armed by the layout,
+ * used once). PS3RECOMP_ENGINE_GP_REUSE=0 asks twice again; GP_REUSE_PHASE=
+ * 0|1 (A/B test only): reuse only in PS3_AB phases of that parity. With
+ * PS3RECOMP_ENGINE_PROG_VERIFY=1 the second ask runs too and is compared. */
+extern volatile int g_ab_phase;
+static int s_gpr_on = -2, s_gpr_phase = -1, s_gpr_armed;
+static struct {
+    int ret; const u8* vp; u32 vp_instrs; const u8* fp; u32 fp_size;
+    eng_vp_memo* vm; eng_fp_memo* fm;
+} s_gpr;
+static int eng_gp_reuse_on(void)
+{
+    if (__builtin_expect(s_gpr_on == -2, 0)) {
+        const char* e = getenv("PS3RECOMP_ENGINE_GP_REUSE");
+        const char* p = getenv("GP_REUSE_PHASE");
+        s_gpr_on = !(e && *e == '0');
+        s_gpr_phase = (p && (*p == '0' || *p == '1')) ? *p - '0' : -1;
+        if (!s_gpr_on || s_gpr_phase >= 0)
+            fprintf(stderr, "[rsx engine] program lookup reuse %s%s\n", s_gpr_on ? "on" : "off",
+                    s_gpr_phase >= 0 ? (s_gpr_phase ? ", odd A/B phases" : ", even A/B phases") : "");
+    }
+    if (!s_gpr_on) return 0;
+    return s_gpr_phase < 0 || (g_ab_phase & 1) == s_gpr_phase;
+}
+#endif
+
+static int eng_guest_programs_scan(const u8** out_vp, u32* out_vp_instrs,
+                                   const u8** out_fp, u32* out_fp_size,
+                                   eng_vp_memo** out_vm, eng_fp_memo** out_fm);
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                               const u8** out_fp, u32* out_fp_size,
                               eng_vp_memo** out_vm, eng_fp_memo** out_fm)
+{
+#if defined(__APPLE__)
+    if (s_gpr_armed) {
+        s_gpr_armed = 0;
+        if (eng_prog_verify_on()) {
+            const u8 *vp, *fp; u32 vpi, fps; eng_vp_memo* vm; eng_fp_memo* fm;
+            const int ret = eng_guest_programs_scan(&vp, &vpi, &fp, &fps, &vm, &fm);
+            eng_prog_verify("gp reuse", (u64)(uintptr_t)s_gpr.fp ^ ((u64)s_gpr.fp_size << 1) ^
+                                        (u64)(uintptr_t)s_gpr.vp ^ ((u64)s_gpr.vp_instrs << 7) ^
+                                        (u64)(uintptr_t)s_gpr.vm ^ (u64)(uintptr_t)s_gpr.fm ^ (u64)s_gpr.ret,
+                            (u64)(uintptr_t)fp ^ ((u64)fps << 1) ^ (u64)(uintptr_t)vp ^ ((u64)vpi << 7) ^
+                            (u64)(uintptr_t)vm ^ (u64)(uintptr_t)fm ^ (u64)ret);
+        }
+        if (out_vp) *out_vp = s_gpr.vp;
+        if (out_vp_instrs) *out_vp_instrs = s_gpr.vp_instrs;
+        if (out_fp) *out_fp = s_gpr.fp;
+        if (out_fp_size) *out_fp_size = s_gpr.fp_size;
+        if (out_vm) *out_vm = s_gpr.vm;
+        if (out_fm) *out_fm = s_gpr.fm;
+        return s_gpr.ret;
+    }
+#endif
+    return eng_guest_programs_scan(out_vp, out_vp_instrs, out_fp, out_fp_size, out_vm, out_fm);
+}
+
+/* For sink_end's first ask: answer it and keep the answer for the second. */
+static int eng_guest_programs_arm(const u8** out_vp, u32* out_vp_instrs,
+                                  eng_vp_memo** out_vm)
+{
+#if defined(__APPLE__)
+    s_gpr_armed = 0;
+    if (eng_gp_reuse_on()) {
+        s_gpr.ret = eng_guest_programs_scan(&s_gpr.vp, &s_gpr.vp_instrs, &s_gpr.fp,
+                                            &s_gpr.fp_size, &s_gpr.vm, &s_gpr.fm);
+        s_gpr_armed = 1;
+        *out_vp = s_gpr.vp; *out_vp_instrs = s_gpr.vp_instrs; *out_vm = s_gpr.vm;
+        return s_gpr.ret;
+    }
+#endif
+    return eng_guest_programs_scan(out_vp, out_vp_instrs, NULL, NULL, out_vm, NULL);
+}
+
+static int eng_guest_programs_scan(const u8** out_vp, u32* out_vp_instrs,
+                                   const u8** out_fp, u32* out_fp_size,
+                                   eng_vp_memo** out_vm, eng_fp_memo** out_fm)
 {
     const u8* vp_uc = NULL;
     u32 vp_instrs = 0;
@@ -2049,7 +2126,7 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
     const u8* uc = NULL;
     u32 instrs = 0;
     eng_vp_memo* vm = NULL;
-    if (eng_guest_programs(&uc, &instrs, NULL, NULL, &vm, NULL)) {
+    if (eng_guest_programs_arm(&uc, &instrs, &vm)) {
         if (vm && vm->mask_ok && !eng_prog_verify_on()) {
             mask = vm->in_mask;
         } else {
