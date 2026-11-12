@@ -2246,6 +2246,8 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
+    u8 zuse;    /* PASS_TRIM: tests or writes depth/stencil */
+    u8 cwrite;  /* PASS_TRIM: writes any colour channel */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2381,6 +2383,7 @@ static _Atomic u32 s_gpu_cbs;
  * resolves, draws, and the attachment pixels each pass loads from / stores to memory. On a tile GPU
  * (all Apple GPUs) every loaded or stored pixel is memory traffic. */
 static _Atomic u64 s_gs_pass, s_gs_copy, s_gs_resolve, s_gs_draw, s_gs_load_px, s_gs_store_px;
+static _Atomic u64 s_gs_zload_px, s_gs_zstore_px;  /* the depth share of the two above */
 static _Atomic u64 s_gs_zfb;   /* passes on the shared depth (no guest zeta) */
 static os_unfair_lock s_gpu_ulock = OS_UNFAIR_LOCK_INIT;
 static double s_gpu_last_end;  /* latest GPUEndTime seen (under s_gpu_ulock) */
@@ -2399,8 +2402,12 @@ static void eng_gs_pass(MTLRenderPassDescriptor* rp, u32 ncolor)
     id<MTLTexture> z = rp.depthAttachment.texture;
     if (z) {
         const u64 px = (u64)[z width] * [z height];
-        if (rp.depthAttachment.loadAction == MTLLoadActionLoad) ld += px;
-        if (rp.depthAttachment.storeAction == MTLStoreActionStore) st += px;
+        if (rp.depthAttachment.loadAction == MTLLoadActionLoad) {
+            ld += px; atomic_fetch_add(&s_gs_zload_px, px);
+        }
+        if (rp.depthAttachment.storeAction == MTLStoreActionStore) {
+            st += px; atomic_fetch_add(&s_gs_zstore_px, px);
+        }
     }
     atomic_fetch_add(&s_gs_pass, 1);
     atomic_fetch_add(&s_gs_load_px, ld);
@@ -2442,11 +2449,13 @@ static void eng_gpu_commit(id<MTLCommandBuffer> cb)
                         n ? (double)b / 1e6 / n : 0.0);
                 const double sec = win / 1e9;
                 fprintf(stderr, "[rsx metal] per second: %.0f passes (%.0f on the shared depth), %.0f copies, "
-                                "%.0f depth resolves, %.0f draws, %.0f Mpx loaded, %.0f Mpx stored\n",
+                                "%.0f depth resolves, %.0f draws, %.0f Mpx loaded, %.0f Mpx stored "
+                                "(depth: %.0f loaded, %.0f stored)\n",
                         atomic_exchange(&s_gs_pass, 0) / sec, atomic_exchange(&s_gs_zfb, 0) / sec,
                         atomic_exchange(&s_gs_copy, 0) / sec,
                         atomic_exchange(&s_gs_resolve, 0) / sec, atomic_exchange(&s_gs_draw, 0) / sec,
-                        atomic_exchange(&s_gs_load_px, 0) / sec / 1e6, atomic_exchange(&s_gs_store_px, 0) / sec / 1e6);
+                        atomic_exchange(&s_gs_load_px, 0) / sec / 1e6, atomic_exchange(&s_gs_store_px, 0) / sec / 1e6,
+                        atomic_exchange(&s_gs_zload_px, 0) / sec / 1e6, atomic_exchange(&s_gs_zstore_px, 0) / sec / 1e6);
             }
         }];
     }
@@ -3426,6 +3435,10 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     const u32 slot = __atomic_fetch_add(&s_eng_pipe_count, 1u, __ATOMIC_RELAXED);
     s_eng_pipe[slot].pso = pso;
     s_eng_pipe[slot].ds  = ds;
+    /* Depth writes need the depth test here (dd above); stencil writes need
+     * the stencil test. */
+    s_eng_pipe[slot].zuse   = (rs->depth_test || rs->stencil_enable) ? 1 : 0;
+    s_eng_pipe[slot].cwrite = (wm != MTLColorWriteMaskNone) ? 1 : 0;
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
     s_eng_pipe[slot].cull = MTLCullModeNone;
@@ -3927,6 +3940,52 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
  * clears immediately ahead of it folded into its load actions. A clear whose
  * targets the following draw does not share becomes a pass of its own, which
  * is what keeps a mid-frame clear ordered against the draws around it. */
+/* PS3RECOMP_METAL_PASS_TRIM (Apple GPUs; default on, 0 = off): an attachment that no draw of
+ * the pass touches -- depth/stencil with every draw's depth and stencil
+ * tests off, colour with every draw's write mask empty -- and that the pass
+ * does not clear is swapped for a memoryless stand-in of the same format and
+ * size. The real surface is then neither loaded into tile memory nor stored
+ * back: it keeps exactly what it held, as it would have after a load and an
+ * unchanged store. Pipelines see the same formats. iPhone 16 Pro at
+ * thermal "Serious": +0.83 +- 0.18 flips/s (+2.9%); Mac: -31% load/store.
+ * PS3RECOMP_METAL_PASS_TRIM_PHASE=0|1 (A/B test only): on only in PS3_AB
+ * phases of that parity. */
+extern volatile int g_ab_phase;
+static int eng_pass_trim_on(void)
+{
+    static int on = -2, ph = -1;
+    if (__builtin_expect(on == -2, 0)) {
+        const char* e = getenv("PS3RECOMP_METAL_PASS_TRIM");
+        const char* p = getenv("PS3RECOMP_METAL_PASS_TRIM_PHASE");
+        ph = (p && (*p == '0' || *p == '1')) ? *p - '0' : -1;
+        on = (ph >= 0 || !(e && *e == '0')) ? 1 : 0;   /* default on (iPhone: +2.9% flips/s) */
+        if (on && ![s_dev supportsFamily:MTLGPUFamilyApple1]) on = 0;
+        if (on) fprintf(stderr, "[rsx metal] PASS_TRIM: untouched attachments memoryless%s\n",
+                        ph >= 0 ? (ph ? " (odd A/B phases)" : " (even A/B phases)") : "");
+    }
+    return on && (ph < 0 || (g_ab_phase & 1) == ph);
+}
+/* A memoryless render target of that shape, kept for reuse (encoding thread
+ * only: the RSX thread, or the ENC_THREAD encoder). */
+static id<MTLTexture> eng_memoryless(MTLPixelFormat fmt, NSUInteger w, NSUInteger h)
+{
+    enum { N = 16 };
+    static struct { MTLPixelFormat fmt; NSUInteger w, h; id<MTLTexture> t; } c[N];
+    static u32 n, next;
+    for (u32 k = 0; k < n; k++)
+        if (c[k].fmt == fmt && c[k].w == w && c[k].h == h) return c[k].t;
+    MTLTextureDescriptor* d =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget;
+    if (@available(macOS 11.0, iOS 10.0, *)) d.storageMode = MTLStorageModeMemoryless;
+    else return nil;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:d];
+    if (!t) return nil;
+    const u32 k = (n < N) ? n++ : (next++ % N);
+    c[k].fmt = fmt; c[k].w = w; c[k].h = h; c[k].t = t;
+    return t;
+}
+
 static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
                                const EngRecord* recs, u32 count, id<MTLTexture> zfb)
 {
@@ -4051,13 +4110,37 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
          * for a guest that never declared a zeta. */
         if (attach && !zbuf) zbuf = zfb;
 
+        /* PASS_TRIM: what the draws this pass will encode (the loop below)
+         * do to depth/stencil and colour. A draw that will not encode
+         * (no live pipeline) touches nothing. */
+        int p_zuse = 1, p_cwrite = 1;
+        if (eng_pass_trim_on()) {
+            p_zuse = p_cwrite = 0;
+            const u32 npipe = __atomic_load_n(&s_eng_pipe_count, __ATOMIC_RELAXED);
+            for (u32 j = i; j < count && recs[j].kind == ENG_REC_DRAW &&
+                            eng_record_targets_are(&recs[j], rt, nrt) &&
+                            (recs[j].depth == depth || (!recs[j].depth && zbuf == zfb)); j++) {
+                const u32 pl = recs[j].pipeline;
+                if (!pl || pl > npipe || !s_eng_pipe[pl - 1].pso) continue;
+                p_zuse   |= s_eng_pipe[pl - 1].zuse;
+                p_cwrite |= s_eng_pipe[pl - 1].cwrite;
+                if (p_zuse && p_cwrite) break;
+            }
+        }
+
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         for (u32 k = 0; k < attach; k++) {
             rp.colorAttachments[k].texture     = tex[k];
             rp.colorAttachments[k].storeAction = MTLStoreActionStore;
             int cleared = -1;
             for (u32 c = 0; c < n_cc; c++) if (cc_surf[c] == rt[k]) cleared = (int)c;
-            if (cleared >= 0) {
+            id<MTLTexture> ml = (!p_cwrite && cleared < 0)
+                ? eng_memoryless([tex[k] pixelFormat], [tex[k] width], [tex[k] height]) : nil;
+            if (ml) {
+                rp.colorAttachments[k].texture     = ml;
+                rp.colorAttachments[k].loadAction  = MTLLoadActionDontCare;
+                rp.colorAttachments[k].storeAction = MTLStoreActionDontCare;
+            } else if (cleared >= 0) {
                 rp.colorAttachments[k].loadAction = MTLLoadActionClear;
                 rp.colorAttachments[k].clearColor =
                     MTLClearColorMake(cc_rgba[cleared][0], cc_rgba[cleared][1],
@@ -4093,6 +4176,16 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
             rp.stencilAttachment.storeAction = zfb_tmp ? MTLStoreActionDontCare : MTLStoreActionStore;
             rp.stencilAttachment.loadAction  = (cl_s || zfb_tmp) ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.stencilAttachment.clearStencil = cl_s ? cstencil : 0;
+            id<MTLTexture> zml = (!p_zuse && !clear_here && !zfb_tmp)
+                ? eng_memoryless(MTL_DEPTH_FORMAT, [zbuf width], [zbuf height]) : nil;
+            if (zml) {
+                rp.depthAttachment.texture       = zml;
+                rp.depthAttachment.loadAction    = MTLLoadActionDontCare;
+                rp.depthAttachment.storeAction   = MTLStoreActionDontCare;
+                rp.stencilAttachment.texture     = zml;
+                rp.stencilAttachment.loadAction  = MTLLoadActionDontCare;
+                rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+            }
         }
         if (!attach) {
             rp.renderTargetWidth  = [zbuf width];
