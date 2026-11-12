@@ -408,6 +408,14 @@ void rsx_draw_index_run(rsx_state* state, u32 first, u32 count)
         s_backend->draw_indexed(s_backend->userdata, state->primitive_type, first, count);
     }
 }
+#if defined(__APPLE__)
+/* DEAD_SKIP (see rsx_process_method): one bit per method, set once it reached
+ * the end of the chain. FIFO (RSX) thread only. */
+static u64 s_dead_bits[0x4000u / 64u];
+static int s_dead_on = -1, s_dead_verify, s_dead_phase = -1;
+extern volatile int g_ab_phase;
+static unsigned long long s_dead_checked, s_dead_reached;
+#endif
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_MHIST=<k>[:<len_k>]: after <k> thousand methods, count the next len_k thousand (default 4000) and
@@ -427,6 +435,38 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * (immediate-mode vertex data order matters: attribute 0 provokes the vertex). */
     { static int _it=-1; if(_it<0){ const char* e=getenv("IMM_MTRACE"); _it = e ? atoi(e) : 0; }
       if(_it && state->in_begin_end){ static int _m=0; if((_m < _it && _m++ < _it)) fprintf(stderr,"[immm] method=0x%04X data=0x%08X\n", method, data); } }
+#if defined(__APPLE__)
+    /* Apple DEAD_SKIP: a method that once fell through every test below to the
+     * "[RSX-UNK]" end has no handler, and always falls through: each top-level
+     * test of the chain is a test of `method` alone and each handler it guards
+     * returns. Such words (~4% of the FIFO in the city: 0x0B40.., 0x1EF8, ...)
+     * skip the ~100 tests and the seen-list scan. RSX_DEAD_SKIP=0 turns it off,
+     * RSX_DEAD_SKIP_PHASE=0|1 only in A/B phases of that parity;
+     * RSX_DEAD_VERIFY=1 runs the chain anyway and counts skipped words that did
+     * not reach the end (must be 0). */
+    if (method < 0x10000u) {
+        if (__builtin_expect(s_dead_on < 0, 0)) {
+            const char* e = getenv("RSX_DEAD_SKIP");
+            s_dead_on = (e && *e == '0') ? 0 : 1;
+            e = getenv("RSX_DEAD_VERIFY");
+            s_dead_verify = (e && *e == '1') ? 1 : 0;
+            e = getenv("RSX_DEAD_SKIP_PHASE");
+            s_dead_phase = (e && (*e == '0' || *e == '1')) ? *e - '0' : -1;
+            if (!s_dead_on || s_dead_verify || s_dead_phase >= 0)
+                fprintf(stderr, "[RSX] unhandled-method skip %s%s%s\n", s_dead_on ? "on" : "off",
+                        s_dead_verify ? " (RSX_DEAD_VERIFY: chain still runs)" : "",
+                        s_dead_phase < 0 ? "" : (s_dead_phase ? ", odd A/B phases" : ", even A/B phases"));
+        }
+        const u32 k = method >> 2;
+        if (s_dead_on && (s_dead_phase < 0 || (g_ab_phase & 1) == s_dead_phase) &&
+            ((s_dead_bits[k >> 6] >> (k & 63u)) & 1u)) {
+            if (!s_dead_verify) return -1;
+            if ((++s_dead_checked & 0xFFFFFull) == 0)
+                fprintf(stderr, "[RSX] DEAD_VERIFY: %llu checked, %llu differ\n",
+                        s_dead_checked - 1u, s_dead_checked - 1u - s_dead_reached);
+        }
+    }
+#endif
     /* v181 hot-method pre-dispatch (perf181 [mhist], generic FIFO methods: BEGIN_END 13.3 %, DRAW_INDEX_ARRAY 11.2 %,
      * INDEX_ARRAY_ADDRESS / _DMA 6.6 % each, TRANSFORM_PROGRAM words ~10 %). They sat 60-90 comparisons down the chain
      * below. Every statement between here and their handlers is guarded by its own method test (checked), so jumping
@@ -1116,6 +1156,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * The draw engine handles the actual present; suppress the unknown log. */
     if (method == 0xE920 || method == 0xE924) return 0;
 
+#if defined(__APPLE__)
+    if (method < 0x10000u) {   /* DEAD_SKIP: no handler for this method */
+        const u32 k = method >> 2;
+        if (s_dead_verify && ((s_dead_bits[k >> 6] >> (k & 63u)) & 1u)) s_dead_reached++;
+        s_dead_bits[k >> 6] |= 1ull << (k & 63u);
+    }
+#endif
     /* v36: every DISTINCT unparsed method once, in release builds too (first 96): what the
      * title programs that the backend silently ignores (depth bounds hid here for a week). */
     { static u32 seen[96]; static int ns = 0; int k = 0;
