@@ -24,9 +24,12 @@ Read this first every session. Newest entry on top.
   the iOS tools. Nothing else on the iPhone.
 - **iPhone speed now (11-12):** the long freezes (2–55 s) are fixed
   (d09eb0b, lock-line wait yields and sleeps). Lane workers now run at
-  user-initiated QoS on 6-core devices (074495d, +8–12%): 23–26 flips/s
-  hot in the afternoon, ~30 cool. Goal: high 30s. See entries
-  "iPhone: lane workers at higher priority" and "iPhone speed: freezes fixed".
+  user-initiated QoS on 6-core devices (074495d, +8–12%). Main-loop fix
+  (20678f5) and PASS_TRIM (c3ed3d0) added ~4%. Now ~23 flips/s hot
+  (start: ~14), ~31 cool. Goal: high 30s. The hot phone is CPU-bound:
+  GPU-only cuts no longer raise fps. Two short freezes came back in
+  rounds 7–8 (open). See entries "iPhone: in-run A/B, profile, ..." and
+  "iPhone: lane workers at higher priority".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -105,6 +108,177 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-12 — iPhone: in-run A/B, profile, main-loop fix, PASS_TRIM, GPU tests
+
+### In-run A/B on Apple (ec54bd5)
+
+- `PS3_AB=1` phase clock now runs on Apple too (pthread). Every
+  `PS3_AB_SEC` s the phase number goes up. A switch with
+  `<NAME>_PHASE=0|1` is on only in phases of that parity
+  (`2|3` = bit 1). Both sides share the same heat, so heat drift
+  cancels out.
+- Tools in `$WORK_DIR/tools`: `ios_phase.sh <tag> VAR=val ...`
+  (one 480 s run, 15 s phases, flips/s 150–450 s) and
+  `abphase.py <run>` (paired diff: each phase vs its two neighbours).
+- Use `PS3_AB_SEQ=0,0` (now the default in `ios_phase.sh`). Without it
+  the clock also cycles the old phase mask 0–4, which turns some fast
+  paths off in 4 of 5 phases (−0.4 to −0.8 flips/s in those phases).
+- Noise: an empty switch can still read ±0.3–0.6 flips/s in one run.
+  Trust a result only if it repeats.
+- Only shows quick effects. Effects through heat need between-run ABBA.
+
+### Phase results (iPhone, thermal 1–2, ~24–25 flips/s)
+
+| run | switch (on = odd phases) | effect |
+|---|---|---|
+| ph1 | `V242A_SERIAL=1` | −6.2 flips/s (−26%), as on the iPad |
+| ph1 | `V242A_NOBOOST` off (bit 1) | +0.45 for "on" = keep default (on) |
+| ph2 | `V242A_NAP` | no-op on Apple (needs `SPURS_KICK_APPLE`); read +0.3 = noise |
+| ph2 | `V242A_WIDTH` (bit 1) | 0.0 |
+| aa1 | nothing (A/A) | −0.02 ± 0.20 |
+| ph3 | `V242A_AUDSPIN` | +0.13 ± 0.06 (+0.5%), too small, stays off |
+| ph3 | `V242A_LLSPIN` (bit 1) | 0.0 |
+| ph4 | main-loop wait (`IOS_PUMP_PHASE=1`) | +0.77 ± 0.13 (+3%) |
+| ph5 | same, clean mask | +0.32 ± 0.11 (+1.3%), kept |
+| ph6 | MetalFX on (`METALFX_PHASE=1`, e484708) | −0.56 ± 0.08 (−2.4%) vs linear scaling |
+| ph7 | `PS3RECOMP_METAL_PASS_TRIM_PHASE=1` | +0.83 ± 0.18 (+2.9%), now default (c3ed3d0) |
+
+### Profile (prof4, 30 s of gameplay, thermal 2)
+
+- Power/heat limited: P cores at their 1.26 GHz floor (~80% busy),
+  E cores ~1.8 GHz, ~20 threads waiting for a core. A cool phone
+  does ~29 flips/s, a hot one 21–25. Less work per frame = more fps.
+- CPU per thread: rsx fifo 70%, SPURS lanes w0 49% + 49%, game main
+  32%, audio SPURS kernel 27%, kernel 0 23%, other lanes/kernels
+  10–16% each, 3 texture checksum workers 6–7% each, iOS main thread
+  ~12%.
+- rsx fifo: `sink_end` 58% (20% self), `eng_encode_and_commit_ex` 21%,
+  `eng_encode_records` 18%, texture slots 6%, XXH3 3%.
+- SPU job code: lifted functions spill registers to `ctx->gpr`
+  around calls. Fixing that is a lifter change (not now).
+- Spin waits are already short in lean mode. Most CPU time is real
+  SPU job work and RSX encoding.
+
+### Fix: iOS main thread no longer polls (20678f5)
+
+- SDL3 has no real event wait on UIKit. `SDL_WaitEventTimeout` pumps
+  the run loop and sleeps 1 ms, again and again: ~1000 wake-ups/s,
+  ~12% of a core.
+- Now: one `SDL_PollEvent`, then wait in the run loop for up to
+  `IOS_PUMP_MS` (default 4) ms. Touches and other run-loop sources
+  wake it at once. Gamepads are read at 250 Hz instead of 1000 Hz.
+- `IOS_PUMP_MS=0` = old loop. `IOS_PUMP_PHASE=0|1` for in-run A/B.
+- iOS only (`ios_shell.mm`). macOS and Windows unchanged.
+
+### Power and GPU (pow1/pow2, thermal 2 "Serious")
+
+- CPU (`IOS_CPU_LOG_SECS`): P cores held at 1.26 GHz (112% of 200%
+  used), E cores 1.79 GHz (328% of 400%). App total ~412%.
+- GPU (`PS3RECOMP_METAL_GPU_STATS=1`): busy 59%, 2 command buffers per
+  frame, ~25 ms GPU time per frame. MetalFX 1280x720 -> 2144x1206.
+- Power Profiler on a wired phone reads 0 %/hr and no per-process
+  split (USB power). Use `inst:Power Profiler,Thermal State` in
+  `ios_prof.sh`; the full template fails ("All Processes").
+- The phone charges while wired: extra heat during every test.
+
+### GPU trace (gpu1, Metal System Trace, thermal 2)
+
+- iOS holds the GPU at its **minimum** performance state (heat).
+  The "induced" flag is not an Xcode device condition: the
+  InduceCondition signposts are empty.
+- One frame on the GPU: game fragment ~18 ms and vertex ~9 ms
+  (overlapping), MetalFX scale 3.0 ms + sharpen 0.9 ms, blits ~2.3 ms.
+- ~53 render passes and ~8,300 draws per frame. Per second:
+  1,468 Mpx loaded and 1,934 Mpx stored by render passes.
+- Lesson: the phone is heat-limited. Less power per frame = higher
+  clocks = more fps. Memory traffic is a big part of GPU power.
+
+### PASS_TRIM: skip untouched attachments (c3ed3d0)
+
+- Many passes attach a target they never touch: depth with every
+  draw's depth and stencil test off, or colour with every write mask
+  empty. Metal still loads and stores it each pass.
+- Now such an attachment is a memoryless stand-in of the same format
+  and size. The real surface keeps its contents. No visual change
+  (Mac frames checked).
+- Mac gameplay: load/store traffic −31%. iPhone: +2.9% flips/s.
+- Default on for Apple GPUs. `PS3RECOMP_METAL_PASS_TRIM=0` = off.
+  Metal file only, so Windows is unaffected.
+- GPU stats (`PS3RECOMP_METAL_GPU_STATS=1`) now also print the depth
+  share. After PASS_TRIM, depth is still ~42% of the traffic. Most of
+  it is real: the same depth is reloaded after a pass break (depth
+  snapshot or copy) mid-frame.
+- Tried: skip the depth store when the next use is a clear
+  (ZSTORE_TRIM). Mac: depth stores −7%, ~1.7% of all traffic. Too
+  small to measure on the phone. Dropped.
+
+### Checked, not worth it
+
+- Bigger SDL audio buffer: cellAudio keeps only 4 blocks (1024
+  frames) queued, so a 1024-frame device buffer would run dry.
+  The audio wake-ups come from cellAudio's own 5.3 ms timer anyway.
+- `-mcpu` above apple-a14: no gain on the iPad before.
+- Profiles can't be read after a rebuild (symbols move).
+  `ios_prof.sh` now keeps the binary that ran as `<run>/app.bin`.
+
+### Colour targets compressed (round 7, between-run ABBA)
+
+- Existing switch `PS3RECOMP_METAL_RT_PRIVATE=1` (colour targets in
+  GPU-only memory, so the GPU can compress them).
+- iPhone: base 31.3 / 23.7, on 29.0 / 26.2 flips/s. Average 27.5 vs
+  27.6: no gain. Stays off.
+
+### Compressed depth (ZPRIV): dropped
+
+- Same idea for depth targets. On the Mac it turned a car grey (wrong
+  colour). A split test showed compressed depth itself caused it, not
+  the copy path. Code removed, never committed.
+
+### Relaxed shader math (88f4957, round 8, between-run ABBA)
+
+- `PS3RECOMP_METAL_MATH=relaxed|fast`: Metal math mode for guest
+  fragment programs. Relaxed lets the compiler reorder and fuse float
+  math but keeps NaN and Inf rules, so `x == x` checks still hold.
+  Vertex programs always stay safe: depth-equal passes need the same
+  bits. Default safe. Metal file only.
+- Mac: GPU time −15%, frames look the same.
+- iPhone: base 23.2 / 23.0, relaxed 23.6 / 22.6 flips/s (23.1 vs 23.1).
+  GPU time per frame 25.2 → 17.9 ms, GPU busy 58% → 41%. No speed gain,
+  so it stays off.
+
+### Lesson: the hot iPhone is CPU-bound
+
+- At thermal 2 the GPU is only ~58% busy at 23 flips/s. Cutting GPU work
+  (PASS_TRIM traffic, compression, relaxed math) frees GPU time but
+  barely moves fps. PASS_TRIM still helped (+2.9%), likely through
+  less power and heat.
+- The lever now is CPU work per frame: rsx fifo (`sink_end`, encode)
+  and SPU job code.
+
+### Two freezes came back (open)
+
+- `rpon2`: 14.1 s at 124 s. `mrel1`: 4.7 s at 60 s. The other 22 iPhone
+  runs since 15:00 had none. Both had a GPU-only test switch on, so
+  the switch is probably not the cause.
+- During the gap: all SPURS workers idle 500 ms with no queue change,
+  and one "late pickup ... MISSED" line. Looks like a missed wake-up,
+  like the old freezes.
+
+### Start vs now (iPhone, thermal 2 "Serious")
+
+- First test (11-11): 12.6–15.8 flips/s steady (avg 14.2), 52–60 s
+  frozen per run, P cores ~2.1 GHz.
+- Now (round 8 base): 23.0–23.2 steady (avg 23.1, +63%), no freezes,
+  even with P cores held at 1.26 GHz. A cool phone does ~31.
+
+### Next
+
+- Find the cause of the two new freezes.
+- Fresh Time Profiler at thermal 2 for CPU hot spots.
+- Test over Wi‑Fi: wired, the phone charges, which adds heat. The phone
+  is now paired over the local network (`devicectl` transport
+  `localNetwork`).
 
 ## 2026-11-12 — iPhone: lane workers at higher priority (+8–12%)
 
