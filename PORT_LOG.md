@@ -34,6 +34,11 @@ Read this first every session. Newest entry on top.
   Shadows setting (On / Near only / Off, default On). Three exact RSX
   thread trims (plan memo, program reuse, dead-method skip), each small.
   See entry "iPad: effect costs, shadow setting, RSX thread trims".
+- **11-12 night:** new Resolution setting (below 720p, MetalFX upscale;
+  iPad 360p +16%) and the yellow/blue flash cause found: the particle
+  buffer was read as depth. Fix `ZS_CLEAR_CW=1` is opt-in, waiting for
+  the user's OK. See entry "Lower resolution setting, present shots,
+  yellow/blue flicker".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -112,6 +117,69 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-12 (night) — Lower resolution setting, present shots, yellow/blue flicker
+
+### Resolution below 720p (7250177)
+
+- `RENDER_SCALE=<percent>` (25–100, default 100 = no change): targets
+  at the display size (1280x720) are drawn at k/80 of that size. WPOS
+  reads, viewport, scissor, depth copies and readback follow the real
+  size. The present upscales: MetalFX (up to 2x per axis), then linear.
+- iOS Settings: **Resolution** (read at start, default 100%) and
+  **Upscaling** (MetalFX on/off, live, default on). Opt-in: the default
+  picture is unchanged.
+- iPad, same run, both with MetalFX: 720p 47.36 → 360p 54.93 fps,
+  **+8.20 ± 0.30 fps (+16%)**. 360p phases sat near the 60 Hz cap, so
+  the real gain may be bigger.
+- Picture: 360p is softer and a little flatter; brightness is the same.
+  Comparison set (iPad with MetalFX, iPhone simulator with and without
+  — the simulator has no MetalFX) is in the user's iCloud Drive,
+  folder "inFamous low-res comparison". Not in git.
+
+### Present shots (6520240, test)
+
+- `PRESENT_SHOT=<secs>` saves the final presented image (after MetalFX
+  and the letterbox, no touch controls) as BMP. `PRESENT_SHOT_SIZE=WxH`
+  presents at a set size (e.g. iPhone screen on the Mac).
+
+### Yellow/blue flicker (user report)
+
+- User: while panning, the screen sometimes flashes yellow (sky) and
+  blue (ground) for a moment, "normally when something's obscuring
+  something". It happened before the resolution work too.
+- Colour match: a D24S8 depth buffer read as ARGB8 gives A = depth
+  high byte, R = mid, G = low, B = stencil. Far depth → yellow; near
+  geometry with stencil → blue/lavender. Blurry = half-size buffer.
+- `FP_CONST_WATCH=1` (6-minute pan): the final composite's
+  desaturation constant (c7.x) never moved. Not the cause.
+- `ZS_SUB_WATCH=1` caught it: the composite reads the 512x288 particle
+  buffer at 0x01AB8000, and on some frames the v73c rule
+  (`ZS_CWRITTEN`: a colour target nothing drew into reads the depth at
+  its address) swaps it for the 1280x720 depth at the same address.
+  Seen in short bursts (frames 13810–13854, 14922).
+- Why: the surface is made new every frame (the address changes size),
+  so `cwritten` resets; on frames with no particle draws the buffer is
+  only cleared, and a clear did not count as a colour write.
+- Proof picture (Mac, frame dump on the first bad frame): without the
+  fix the final image is yellow sky over the normal ground (mean RGB
+  200/200/55); with the fix a frame in the same window looks normal.
+  Seen ~0.5 s right after Start (~51 s) and once at ~64 s in the pan
+  test.
+
+### Fix (62dda0c, opt-in)
+
+- `ZS_CLEAR_CW=1`: a colour clear counts as a colour write for the
+  v73c rule, so a target that was only cleared reads as colour.
+- Mac pan test (6 min): all 48 bad reads at 0x01AB8000 became colour
+  reads (`[zskeep]`); the reads at 0x0F340000 (shadow maps, soft smoke
+  depth) are unchanged (154/267 vs 151/267 log lines). No speed cost.
+- **Default off** until the user OKs it (default picture change).
+  To turn on: make `eng_zs_clear_cw()` default 1.
+- New test switches: `ZS_SUB_WATCH=1`, `ZS_SUB_DUMP=<hex>`,
+  `TEX_KIND_WATCH=1`, `FP_CONST_WATCH=1` (see the port notes).
+- Not checked yet: the iPad, and a long gameplay soak with the fix on.
+
 
 ## 2026-11-12 (evening) — iPad: effect costs, shadow setting, RSX thread trims
 
