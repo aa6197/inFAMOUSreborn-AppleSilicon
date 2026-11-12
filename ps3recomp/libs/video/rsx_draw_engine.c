@@ -866,7 +866,11 @@ static int eng_shadows_on(void)
 {
     static int v = -1;
     if (v < 0) {
+#if defined(__APPLE__)
+        v = 1;   /* Apple: SHADOWS=0 skips the maps' draws instead (eng_shadow_skip) */
+#else
         v = eng_env_flag("SHADOWS", 1);
+#endif
         fprintf(stderr, "[rsx engine] shadow maps %s (SHADOWS)\n", v ? "compared" : "off");
     }
     return v;
@@ -905,6 +909,16 @@ static int eng_shadow_lit(void)
     if (v < 0) v = eng_env_flag("SHADOW_LIT", 1);
     return v;
 }
+/* Apple: a shadow map the SHADOWS / SHADOW_MAPS setting skipped has no
+ * draws, so it is never snapshotted. It must read as lit even with the
+ * launcher's SHADOW_LIT=0, which would sample stale guest memory (the whole
+ * scene in shadow). */
+#if defined(__APPLE__)
+static int eng_shadow_maps_limit(void);
+static int eng_shadow_skipping(void) { return eng_shadow_maps_limit() >= 0; }
+#else
+static int eng_shadow_skipping(void) { return 0; }
+#endif
 
 /* The compare and its 2x2 PCF, the D3D12 backend's s_shadow_fn (v34, v92,
  * v94, v148) unchanged: the RSX compares TEXEL func REF, so zfunc GREATER is
@@ -4020,7 +4034,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                 if (cmp) g.shkey |= (1u << u) | (((t.wrap >> 28) & 7u) << (4 + 3 * u));
                 continue;
             }
-            if (cmp && eng_shadow_lit()) {
+            if (cmp && (eng_shadow_lit() || eng_shadow_skipping())) {
                 g.shkey |= (1u << u) | (7u << (4 + 3 * u));   /* ALWAYS: lit */
                 s_tex_kind[u] = 'L';
             }
@@ -4052,10 +4066,121 @@ static u32 sink_bind_vertex_textures(
     return bound;
 }
 
+#if defined(__APPLE__)
+/* SHADOWS (Apple port; a user setting, default 1 = on). inFamous draws the
+ * sun's shadow into four 1024x1024 depth-only maps a frame: on a city street
+ * ~40% of all draws and more vertices than the scene itself (Mac pass dump,
+ * PS3RECOMP_METAL_PASS_DUMP). Skipping them saves RSX-thread and GPU time.
+ *   SHADOWS=0          no shadow maps are drawn
+ *   SHADOW_MAPS=<n>    only the first n maps of each frame are drawn
+ * A map with no draws stays cleared (had_write 0), so it is never resolved
+ * and every lookup into it reads as lit (eng_shadow_skipping, whatever
+ * SHADOW_LIT says). The sun still lights the scene, it just casts no shadow.
+ * Mac frames: SHADOW_MAPS=1 keeps the map around the player (Cole's own
+ * shadow); SHADOWS=0 drops all.
+ * A shadow-map draw writes depth only (colour mask 0, depth test and write
+ * on) into a square surface of 512 or more; the frame's own targets are
+ * 16:9. A depth clear of such a surface starts the next map.
+ * SHADOWS_PHASE=0|1 (A/B test only): maps skipped only in PS3_AB phases of
+ * that parity (SHADOW_MAPS, else none drawn). */
+extern volatile int g_ab_phase;
+static int s_sh_lim = -2;   /* -1: all drawn; n: maps drawn per frame */
+static int s_sh_phase = -1;
+static u32 s_sh_frame, s_sh_maps;
+static int eng_shadow_maps_limit(void)
+{
+    if (__builtin_expect(s_sh_lim == -2, 0)) {
+        const char* e = getenv("SHADOWS");
+        const char* n = getenv("SHADOW_MAPS");
+        const char* p = getenv("SHADOWS_PHASE");
+        s_sh_phase = (p && (*p == '0' || *p == '1')) ? *p - '0' : -1;
+        s_sh_lim = (n && *n) ? atoi(n) : -1;
+        if ((e && *e == '0') || (s_sh_phase >= 0 && s_sh_lim < 0)) s_sh_lim = 0;
+        if (s_sh_lim < -1) s_sh_lim = 0;
+        if (s_sh_lim >= 0)
+            fprintf(stderr, "[rsx engine] shadow maps: %d drawn per frame (SHADOWS/SHADOW_MAPS)%s\n",
+                    s_sh_lim, s_sh_phase >= 0 ? (s_sh_phase ? ", odd A/B phases" : ", even A/B phases") : "");
+    }
+    if (s_sh_lim < 0) return -1;
+    if (s_sh_phase >= 0 && (g_ab_phase & 1) != s_sh_phase) return -1;
+    return s_sh_lim;
+}
+static int eng_shadow_shaped(const rsx_dsp_surface* sf)
+{
+    return sf->clip_w == sf->clip_h && sf->clip_w >= 512u;
+}
+static void eng_shadow_map_cleared(const rsx_dsp_surface* sf)
+{
+    if (s_sh_lim < 0 || !eng_shadow_shaped(sf)) return;
+    if (s_sh_frame != g.frames) { s_sh_frame = g.frames; s_sh_maps = 0; }
+    s_sh_maps++;
+}
+static int eng_shadow_skip(void)
+{
+    const int lim = eng_shadow_maps_limit();
+    if (lim < 0) return 0;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    if (!eng_shadow_shaped(&sf)) return 0;
+    rsx_be_render_state rs;
+    rsx_draw_engine_decode_render_state(&g.rsx, &rs);
+    if (rs.color_mask || !rs.depth_test || !rs.depth_write) return 0;
+    if (s_sh_frame != g.frames) { s_sh_frame = g.frames; s_sh_maps = 0; }
+    const u32 map = s_sh_maps ? s_sh_maps : 1u;
+    return map > (u32)lim;
+}
+/* The player's Graphics setting, changed while the game runs (macOS menu,
+ * iOS Settings app on return to the game): -1 all maps, 0 none, n the first n. */
+void rsx_engine_set_shadow_maps(int n)
+{
+    if (n < -1) n = -1;
+    s_sh_phase = -1;
+    __atomic_store_n(&s_sh_lim, n, __ATOMIC_RELAXED);
+    fprintf(stderr, "[rsx engine] shadow maps: %d drawn per frame (setting; -1 = all)\n", n);
+}
+int rsx_engine_shadow_maps(void)
+{
+    if (__atomic_load_n(&s_sh_lim, __ATOMIC_RELAXED) == -2) (void)eng_shadow_maps_limit();
+    return __atomic_load_n(&s_sh_lim, __ATOMIC_RELAXED);
+}
+#endif
+
+#if defined(__APPLE__)
+/* FX_SKIP=<mask> (Apple port, A/B test only; default 0): drop every draw into
+ * inFamous' small post-effect surfaces, to measure what they cost.
+ *   1  512x288: the low-resolution particle/smoke buffer and its depth copy
+ *   2  320x180 and smaller, and 1280x180: the bloom / blur chain
+ * The surfaces keep their clear value. FX_SKIP_PHASE=0|1: only in PS3_AB
+ * phases of that parity. */
+static int s_fx_mask = -1, s_fx_phase = -1;
+static int eng_fx_skip(void)
+{
+    if (__builtin_expect(s_fx_mask < 0, 0)) {
+        const char* e = getenv("FX_SKIP");
+        const char* p = getenv("FX_SKIP_PHASE");
+        s_fx_mask = (e && *e) ? atoi(e) : 0;
+        s_fx_phase = (p && (*p == '0' || *p == '1')) ? *p - '0' : -1;
+        if (s_fx_mask) fprintf(stderr, "[rsx engine] FX_SKIP=%d%s\n", s_fx_mask,
+                               s_fx_phase >= 0 ? (s_fx_phase ? " (odd A/B phases)" : " (even A/B phases)") : "");
+    }
+    if (!s_fx_mask || (s_fx_phase >= 0 && (g_ab_phase & 1) != s_fx_phase)) return 0;
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    const u32 w = sf.clip_w, h = sf.clip_h;
+    if ((s_fx_mask & 1) && w == 512u && h == 288u) return 1;
+    if ((s_fx_mask & 2) && ((w <= 320u && h <= 180u && w != h) || (w == 1280u && h == 180u))) return 1;
+    return 0;
+}
+#endif
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
+#if defined(__APPLE__)
+    if (__builtin_expect(s_sh_lim != -1, 0) && eng_shadow_skip()) return;
+    if (__builtin_expect(s_fx_mask != 0, 0) && eng_fx_skip()) return;
+#endif
     if (ENG_TRACING()) eng_trace_pass_boundary(0);
 
     const u32 prim = g.rsx.current_primitive;
@@ -4370,6 +4495,9 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                          sf.clip_w, sf.clip_h);
         if (zslot == ENG_INVALID) return;
+#if defined(__APPLE__)
+        if (mask & RSX_CLEAR_DEPTH) eng_shadow_map_cleared(&sf);
+#endif
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;

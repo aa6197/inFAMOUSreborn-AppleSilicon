@@ -301,6 +301,14 @@ void rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
 
+#if defined(__APPLE__)
+/* Sun shadow maps drawn per frame (Apple port's Graphics setting; SHADOWS /
+ * SHADOW_MAPS in rsx_draw_engine.c): -1 all, 0 none, n the first n.
+ * Any thread; takes effect from the next draw. */
+void rsx_engine_set_shadow_maps(int n);
+int  rsx_engine_shadow_maps(void);
+#endif
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* Draws that ran the guest's OWN programs in the last presented frame. A draw
