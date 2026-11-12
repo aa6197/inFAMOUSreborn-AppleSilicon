@@ -4525,6 +4525,104 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     [e endEncoding];
 }
 
+/* PRESENT_SHOT=<s> (test only): every s seconds the finished screen image
+ * (after MetalFX and the letterbox; without the touch controls or system
+ * pop-ups) is drawn once more into a texture of its own and saved as a
+ * 24-bit BMP, p001.bmp, p002.bmp, ... (at most PRESENT_SHOT_MAX, default 12)
+ * in PRESENT_SHOT_DIR (default: Documents on iOS, the working folder on
+ * macOS). PRESENT_SHOT_SIZE=WxH draws it at that size instead of the
+ * screen's: on the Mac, an iPhone's 2622x1206 goes through the iPhone's
+ * present (letterbox, MetalFX, linear). Unset: nothing changes. */
+static void eng_write_bmp(const char* path, const u8* px, u32 w, u32 h, int rgba)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[present shot] cannot write %s\n", path); return; }
+    const u32 row = (w * 3u + 3u) & ~3u, img = row * h;
+    u8 hd[54] = { 'B', 'M' };
+    const u32 v[] = { 54u + img, 0, 54u, 40u, w, h };
+    for (int i = 0; i < 6; i++) memcpy(hd + 2 + i * 4, &v[i], 4);
+    hd[26] = 1; hd[28] = 24;
+    memcpy(hd + 34, &img, 4);
+    fwrite(hd, 1, sizeof hd, f);
+    u8* line = (u8*)calloc(1, row);
+    if (line) {
+        for (u32 y = h; y-- > 0;) {   /* bottom-up rows, B G R */
+            const u8* sp = px + (size_t)y * w * 4u;
+            for (u32 x = 0; x < w; x++) {
+                line[x * 3u + 0] = sp[x * 4u + (rgba ? 2 : 0)];
+                line[x * 3u + 1] = sp[x * 4u + 1];
+                line[x * 3u + 2] = sp[x * 4u + (rgba ? 0 : 2)];
+            }
+            fwrite(line, 1, row, f);
+        }
+        free(line);
+    }
+    fclose(f);
+    fprintf(stderr, "[present shot] %s %ux%u\n", path, w, h);
+}
+
+static void eng_present_shot(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst)
+{
+    static int inited, n, max_n = 12;
+    static double every;
+    static u64 next_ns;
+    static u32 fw, fh;
+    static char dir[1024];
+    if (__builtin_expect(inited, 1)) {
+        if (every <= 0.0) return;
+    } else {
+        inited = 1;
+        const char* e = getenv("PRESENT_SHOT");
+        every = (e && *e) ? atof(e) : 0.0;
+        if (every <= 0.0) return;
+        const char* m = getenv("PRESENT_SHOT_MAX");
+        if (m && atoi(m) > 0) max_n = atoi(m);
+        const char* sz = getenv("PRESENT_SHOT_SIZE");
+        unsigned a = 0, b = 0;
+        if (sz && sscanf(sz, "%ux%u", &a, &b) == 2 && a && b && a <= 8192 && b <= 8192) { fw = a; fh = b; }
+        const char* d = getenv("PRESENT_SHOT_DIR");
+#if TARGET_OS_IPHONE
+        if (!d || !*d)
+            snprintf(dir, sizeof dir, "%s/Documents", [NSHomeDirectory() UTF8String]);
+        else
+#endif
+            snprintf(dir, sizeof dir, "%s", (d && *d) ? d : ".");
+        next_ns = eng_now_ns() + (u64)(every * 1e9);
+        fprintf(stderr, "[present shot] every %.0f s, up to %d, into %s\n", every, max_n, dir);
+    }
+    if (!src || n >= max_n) return;
+    const u64 now = eng_now_ns();
+    if (now < next_ns) return;
+    next_ns = now + (u64)(every * 1e9);
+    const u32 w = fw ? fw : (dst ? (u32)[dst width] : 0u), h = fh ? fh : (dst ? (u32)[dst height] : 0u);
+    if (!w || !h) return;
+    const MTLPixelFormat pf = dst ? [dst pixelFormat] : MTLPixelFormatBGRA8Unorm;
+    const int rgba = pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatRGBA8Unorm_sRGB;
+    if (!rgba && pf != MTLPixelFormatBGRA8Unorm && pf != MTLPixelFormatBGRA8Unorm_sRGB) return;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                 width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    id<MTLBuffer> buf = [s_dev newBufferWithLength:(NSUInteger)w * h * 4u options:MTLResourceStorageModeShared];
+    if (!t || !buf) return;
+    eng_blit_to_display(cb, src, t);
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(w, h, 1) toBuffer:buf destinationOffset:0
+    destinationBytesPerRow:(NSUInteger)w * 4u destinationBytesPerImage:(NSUInteger)w * h * 4u];
+    [bl endEncoding];
+    char path[1100];
+    snprintf(path, sizeof path, "%s/p%03d.bmp", dir, ++n);
+    NSString* ps = [NSString stringWithUTF8String:path];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        (void)c;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            eng_write_bmp([ps UTF8String], (const u8*)[buf contents], w, h, rgba);
+        });
+    }];
+}
+
 /* Make the next ring slot current, waiting only if the GPU still reads it. */
 static void eng_stage_next(void)
 {
@@ -4582,6 +4680,7 @@ static void eng_enc_run(const EngBatch* b)
         eng_encode_records(cb, b->stage, b->recs, b->count, b->zfallback);
         s_eng_enc_serial = 0;
         if (b->present && dst) eng_blit_to_display(cb, b->present, dst);
+        if (b->present) eng_present_shot(cb, b->present, dst);
         if (drawable) [cb presentDrawable:drawable];
         const u32 serial = b->serial;
         const int pipelined = b->pipelined;
@@ -4759,6 +4858,7 @@ static void eng_encode_and_commit_ex(id<MTLTexture> present_dst, int nowait)
         s_eng_enc_serial = 0;
         const u32 serial = s_eng_serial++;
         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+        if (present_dst) eng_present_shot(cb, present_dst, dst);
         if (drawable) [cb presentDrawable:drawable];
         if (pipelined) {
             dispatch_semaphore_t sem = s_inflight;
