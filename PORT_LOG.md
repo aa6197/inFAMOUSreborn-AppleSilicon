@@ -30,6 +30,10 @@ Read this first every session. Newest entry on top.
   GPU-only cuts no longer raise fps. Two short freezes came back in
   rounds 7–8 (open). See entries "iPhone: in-run A/B, profile, ..." and
   "iPhone: lane workers at higher priority".
+- **11-12 evening (iPad only):** shadows cost ~10% on the iPad; new
+  Shadows setting (On / Near only / Off, default On). Three exact RSX
+  thread trims (plan memo, program reuse, dead-method skip), each small.
+  See entry "iPad: effect costs, shadow setting, RSX thread trims".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -108,6 +112,74 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-12 (evening) — iPad: effect costs, shadow setting, RSX thread trims
+
+All device tests tonight on the iPad (the user said: no iPhone tonight).
+In-run A/B (`ios_phase.sh`), 15 s phases. Noise: the "bit1" line (no
+switch) moves by up to ±0.7 fps, so a gain under ~0.7 fps is not proven.
+The iPad also cools/heats during a run (53 → 46 fps).
+
+### What effects cost (iPad, in-run A/B)
+
+| Switch | Skips | Paired gain |
+|---|---|---|
+| `SHADOWS=0` | all 4 sun shadow maps (~40% of draws) | +5.2 fps (+9.7%) |
+| `SHADOW_MAPS=1` | 3 of 4 maps (keeps the one round the player) | +4.6 fps (+9.5%) |
+| `FX_SKIP=1` (test) | 512x288 particle/smoke buffer | +1.1 fps (+2.0%) |
+| `FX_SKIP=2` (test) | bloom/blur chain | +0.4 fps (noise) |
+
+- New commits: skip switches (0402e42), Graphics settings for shadows
+  (13bafce: iOS Settings page and Mac Graphics menu, On / Near only /
+  Off, default On), pass dump (a9754fd), Mac window vsync switch
+  (beb143f: `PS3RECOMP_METAL_DISPLAY_SYNC=0`).
+- Mac window, gameplay: 50.5 flips/s with vsync, 80.6 without.
+- Not checked yet: the iOS Settings page on the iPad itself.
+- Open (user's call): bloom/particles as user settings; a render
+  resolution below 720p plus upscale.
+
+### Where the RSX thread goes (iPad profile prof6)
+
+- RSX thread ~98.5% busy: it is the limit (3 fast cores).
+- `sink_end` 66% (encode/commit 18.8%, fetch plan 5.4%, guest programs 4%,
+  texture slot 4%, geometry hash + XXH3 ~7.5%, sampler 2.1%).
+- FIFO parse ~25%: walker 10.1%, `rsx_dispatch_method` 6.7%,
+  `rsx_process_method` 4.6%, const blocks 3.7%.
+- FIFO words (Mac, 200M methods): BEGIN_END 12%, DRAW_INDEX_ARRAY 11%,
+  INDEX_ARRAY_ADDRESS/DMA 6% each, VTXBUF_OFFSET 4.6%. 44 methods with
+  no handler = 3.9% of words.
+
+### Trims (all exact, Apple only, on by default)
+
+| Commit | Change | Exact check | iPad |
+|---|---|---|---|
+| 08ab493 | `PLAN_MEMO`: reuse the vertex fetch plan while vertex registers are unchanged | `PS3RECOMP_ENGINE_PLAN_VERIFY=1`: 168M hits, 0 differ (98% hit rate) | +0.46 ± 0.19 fps |
+| a97b8ee | Sampler hint table before the full sampler scan |  | Mac run clean, 92.3 flips/s |
+| 3a49c16 | `GP_REUSE`: one guest program lookup per draw, not two | `PROG_VERIFY`: 1.37 billion, 0 differ | +0.32 ± 0.16 fps |
+| 515dbb0 | `RSX_DEAD_SKIP`: methods with no handler skip the ~100-test chain | `RSX_DEAD_VERIFY=1`: 144.7M, 0 differ (Mac) | −0.13 ± 0.33 fps (no change) |
+
+- Each is small. Plan memo and program reuse point up (inside the noise
+  alone); dead-method skip shows no change. All kept: exact and cheap.
+- Off switches: `PS3RECOMP_ENGINE_PLAN_MEMO=0`, `PS3RECOMP_ENGINE_GP_REUSE=0`,
+  `RSX_DEAD_SKIP=0`. A/B: `PLAN_MEMO_PHASE`, `GP_REUSE_PHASE`,
+  `RSX_DEAD_SKIP_PHASE` (=0|1).
+
+### Next
+
+- Skip `seen[idx]++` in `rsx_dispatch_method` on Apple (only Windows
+  live draw and TC_VERIFY read it).
+- Inline the walker → engine → dispatch calls.
+- Encode/commit (18.8%), geometry hash memo.
+- Render targets: the game reuses one address for targets of different
+  sizes in a frame (0x01AB8000: 1280x720 → 1280x180 → 512x288), so
+  `eng_surface_get` frees and makes new Metal textures every frame.
+  ~1% of the RSX thread (kernel calls). A texture pool would fix it, but
+  a reused texture holds old pixels instead of a fresh one: needs a clear
+  on reuse and a frame check.
+- SPU threads use the most CPU in total (3 lanes + kernels, ~2.5 cores):
+  spread over many job functions, no single hot spot. `_tlv_get_addr`
+  is 1.4–2% per SPU thread (callers: job code, `spu_drain_call`, MFC).
+- SPU lifter register spills (opt-in flag), wait loops.
 
 ## 2026-11-12 — iPhone: in-run A/B, profile, main-loop fix, PASS_TRIM, GPU tests
 
