@@ -101,6 +101,81 @@ static inline void ll_acq(volatile long* l)
     ((LLStripe*)(void*)l)->owner = GetCurrentThreadId();
 }
 static inline void ll_rel(volatile long* l) { _InterlockedExchange(l, 0); }
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <time.h>
+/* Apple side of the Windows v100 slow path above. The POSIX ll_acq below spins forever with no
+ * pause and no yield. iPhone 16 Pro (6 cores, 2026-11-12): game-main (UI QoS) and 7 SPURS kernel threads
+ * sat 100% in spu_lockline_lock_ea for 2-55 s while the stripe holder (a lower-QoS thread preempted inside
+ * the lock) got no CPU -> the game froze: no flips, audio silent. The iPad (10 cores) has spare cores, so
+ * the holder got one. sched_yield only gives way to threads of the same or higher priority, so after
+ * SPU_LL_SLEEP_MS (default 4, as on Windows) of waiting every 4th round sleeps 1 ms, which lets ANY ready
+ * thread run. SPU_LL_SLEEP_MS=0: yield only. A wait >= 50 ms is reported ("[LL-WAIT]", rate-limited)
+ * with the waiter's and the holder's thread names. The fast path only adds one store (the owner). */
+typedef struct { volatile long v; const char* volatile owner; char pad[64 - sizeof(long) - sizeof(void*)]; } LLStripe;
+#define LL_STRIPES 64
+static LLStripe g_ll[LL_STRIPES];
+static int g_ll_n = -1;
+static inline int ll_count(void)
+{
+    if (g_ll_n < 0) { const char* e = getenv("SPU_LOCKLINE_STRIPES"); g_ll_n = (e && *e == '0') ? 1 : LL_STRIPES; }
+    return g_ll_n;
+}
+static inline unsigned ll_idx(uint32_t ea) { return (ll_count() == 1) ? 0u : ((ea >> 7) & (LL_STRIPES - 1)); }
+static __thread char t_ll_name[32];
+static inline const char* ll_me(void)
+{
+    if (__builtin_expect(!t_ll_name[0], 0)) {
+        pthread_getname_np(pthread_self(), t_ll_name, sizeof t_ll_name);
+        if (!t_ll_name[0]) { uint64_t tid = 0; pthread_threadid_np(NULL, &tid); snprintf(t_ll_name, sizeof t_ll_name, "tid%llu", (unsigned long long)tid); }
+    }
+    return t_ll_name;
+}
+static inline void ll_pause(void)
+{
+#if defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__)
+    __asm__ __volatile__("pause" ::: "memory");
+#endif
+}
+static int ll_sleep_ms(void) { static int v = -1; if (v < 0) { const char* e = getenv("SPU_LL_SLEEP_MS"); v = e ? atoi(e) : 4; if (v < 0) v = 0; } return v; }
+static __attribute__((noinline)) void ll_slow_round(volatile long* l, uint64_t* t0, unsigned* rounds, int* reported)
+{
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!*t0) { *t0 = now; sched_yield(); return; }
+    const long long us = (long long)((now - *t0) / 1000u);
+    const int sl = ll_sleep_ms();
+    ++*rounds;
+    if (sl > 0 && us >= (long long)sl * 1000LL && (*rounds & 3u) == 0) { struct timespec ts = { 0, 1000000L }; nanosleep(&ts, NULL); }
+    else sched_yield();
+    { int lvl = us >= 1000000 ? 3 : us >= 250000 ? 2 : us >= 50000 ? 1 : 0;
+      if (lvl > *reported) {
+        static volatile long s_n = 0;
+        *reported = lvl;
+        const long n = __atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED);
+        if (n <= 60 || (n % 100) == 0) {
+            const LLStripe* st = (const LLStripe*)(const void*)l;
+            const char* ow = st->owner;
+            fprintf(stderr, "[LL-WAIT] #%ld stripe %d held >= %lld ms: waiter '%s', holder '%s' (apple)\n",
+                    n, (int)(st - g_ll), us / 1000, ll_me(), ow ? ow : "?");
+        }
+      } }
+}
+static inline void ll_acq(volatile long* l)
+{
+    unsigned spins = 0, rounds = 0; uint64_t t0 = 0; int reported = 0;
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) {
+        do {
+            ll_pause();
+            if (++spins >= 4096) { spins = 0; ll_slow_round(l, &t0, &rounds, &reported); }
+        } while (__atomic_load_n(l, __ATOMIC_RELAXED));
+    }
+    ((LLStripe*)(void*)l)->owner = ll_me();
+}
+static inline void ll_rel(volatile long* l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
 #else
 static inline int ll_count(void);
 #define LL_STRIPES 64
