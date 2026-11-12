@@ -504,6 +504,16 @@ static int create_window_impl(const char* title)
     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
     s_layer.framebufferOnly = YES;
     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
+    /* PS3RECOMP_METAL_DISPLAY_SYNC=0: present without waiting for the
+     * display's refresh (frame rate above the refresh rate; may tear in
+     * full screen). Default: synced, as CAMetalLayer comes. */
+    {
+        const char* ds = getenv("PS3RECOMP_METAL_DISPLAY_SYNC");
+        if (ds && *ds == '0') {
+            s_layer.displaySyncEnabled = NO;
+            fprintf(stderr, "[rsx metal] display sync off (PS3RECOMP_METAL_DISPLAY_SYNC=0)\n");
+        }
+    }
 
     NSView* view = [s_window contentView];
     [view setWantsLayer:YES];
