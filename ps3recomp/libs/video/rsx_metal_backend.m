@@ -4151,6 +4151,16 @@ static int eng_metalfx_on(void)
     return s_mfx_on;
 }
 
+/* METALFX_PHASE=0|1 (A/B test only): MetalFX only in PS3_AB phases of that parity (ppu_loader.cpp
+ * phase clock), plain linear scaling in the others. Unset = always as eng_metalfx_on() says. */
+extern volatile int g_ab_phase;
+static int eng_metalfx_phase_ok(void)
+{
+    static int ph = -2;
+    if (ph == -2) { const char* e = getenv("METALFX_PHASE"); ph = (e && (*e == '0' || *e == '1')) ? *e - '0' : -1; }
+    return ph < 0 || (g_ab_phase & 1) == ph;
+}
+
 /* Upscale src towards ow x oh; returns the scaled image, or nil to fall back
  * to the plain blit. Kept within 2x per axis (the final blit, linear, scales
  * whatever is left). */
@@ -4240,7 +4250,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     id<MTLSamplerState> samp = s_eng_point_sampler;
     if (letterbox) {
 #if PS3RECOMP_HAVE_METALFX
-        if (vp.width > sw && vp.height > sh && eng_metalfx_on()) {
+        if (vp.width > sw && vp.height > sh && eng_metalfx_on() && eng_metalfx_phase_ok()) {
             id<MTLTexture> up = eng_metalfx_upscale(cb, src, (NSUInteger)vp.width, (NSUInteger)vp.height);
             if (up) img = up;
         }
