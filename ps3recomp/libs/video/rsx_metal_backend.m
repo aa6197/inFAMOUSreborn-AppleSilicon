@@ -658,9 +658,36 @@ static void dump_shader(const char* name, const char* text)
     fclose(f);
 }
 
-static MTLCompileOptions* guest_compile_options(void)
+/* PS3RECOMP_METAL_MATH=relaxed|fast (Apple port, test; default safe): the
+ * math mode for guest fragment programs. Relaxed lets the compiler reorder
+ * and fuse float math but keeps NaN and Inf rules, so the `x == x` and
+ * isunordered checks below still hold. Fast drops those too. Vertex programs
+ * always stay safe: two programs that compute the same position must get the
+ * same bits, or depth-equal passes flicker. */
+static int guest_math_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("PS3RECOMP_METAL_MATH");
+        m = (e && e[0] == 'r') ? 1 : (e && e[0] == 'f') ? 2 : 0;
+        if (m) fprintf(stderr, "[rsx metal] fragment programs: %s math\n", m == 2 ? "fast" : "relaxed");
+    }
+    return m;
+}
+
+static MTLCompileOptions* guest_compile_options(int frag)
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
+    const int m = frag ? guest_math_mode() : 0;
+#if (defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000) || \
+    (defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000)
+    if (m) {
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            o.mathMode = (m == 2) ? MTLMathModeFast : MTLMathModeRelaxed;
+            return o;
+        }
+    }
+#endif
     /* IEEE comparisons. The decompilers flush a NaN result to zero with
      * `x == x`, and the alpha test compares with isunordered; Metal's default
      * fast math is free to fold both away. */
@@ -679,11 +706,11 @@ static MTLCompileOptions* guest_compile_options(void)
 
 /* MSL source -> its `main0` function, or nil with the compiler's diagnostic
  * on stderr. */
-static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
+static id<MTLFunction> compile_guest_function(const char* msl, const char* what, int frag)
 {
     NSError* err = nil;
     id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
-                                             options:guest_compile_options()
+                                             options:guest_compile_options(frag)
                                                error:&err];
     if (!lib) {
         fprintf(stderr, "[RSX metal] %s: MSL compile failed: %s\n", what,
@@ -734,7 +761,7 @@ static int vp_slot_for(const rsx_state* st, u32 vtex_mask)
         } else {
             snprintf(name, sizeof name, "vp_%08x.msl", hash); dump_shader(name, s_msl);
             snprintf(name, sizeof name, "vertex program %08X", hash);
-            fn = compile_guest_function(s_msl, name);
+            fn = compile_guest_function(s_msl, name, 0);
         }
     }
     { static int n = 0; if (n++ < 32)
@@ -809,7 +836,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
             snprintf(name, sizeof name, "fp_%016llx.msl", (unsigned long long)key);
             dump_shader(name, s_msl);
             snprintf(name, sizeof name, "fragment program %016llX", (unsigned long long)key);
-            fn = compile_guest_function(s_msl, name);
+            fn = compile_guest_function(s_msl, name, 1);
         }
     }
     { static int n = 0; if (n++ < 32)
@@ -3319,7 +3346,7 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
         dump_shader(name, s_msl);
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
-        fn = compile_guest_function(s_msl, name);
+        fn = compile_guest_function(s_msl, name, stage == RSX_SHADER_STAGE_FRAGMENT);
     }
     s_eng_func[s_eng_func_count].hash = hash;
     s_eng_func[s_eng_func_count].fn   = fn;
