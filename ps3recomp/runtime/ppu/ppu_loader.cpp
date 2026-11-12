@@ -895,8 +895,10 @@ void ps3_sampler_start(void) {}
 
 #endif
 #ifndef _WIN32
-/* The sampler is Windows-only; POSIX builds still link the call. */
-void ps3_sampler_start(void) {}
+/* The sampler is Windows-only; POSIX builds still link the call. It still starts the PS3_AB
+ * phase clock (in-run A/B; Apple implements it, other POSIX builds get the empty stub). */
+extern "C" void ps3_ab_start(void);
+void ps3_sampler_start(void) { ps3_ab_start(); }
 #endif
 
 extern "C" uint8_t* vm_base;   /* defined by the host */
@@ -4683,6 +4685,45 @@ extern "C" void ps3_ab_start(void)
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_ab_main_h,
                     THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, 0);
     CreateThread(NULL, 0, ab_thread, (LPVOID)(uintptr_t)sec, 0, NULL);
+}
+#elif defined(__APPLE__)
+/* Apple port: the same PS3_AB phase clock on a pthread, so a phone test can flip <NAME>_PHASE switches inside one
+ * run (cancels heat drift between runs). Phase index, PS3_AB_SEQ masks and PS3_ABX_SEQ bits as on Windows. */
+#include <pthread.h>
+static void* ab_thread_apple(void* p)
+{
+    unsigned sec = (unsigned)(uintptr_t)p;
+    int masks[16] = { 0, 1, 2, 3, 4 };
+    unsigned np = 5; { const char* e = getenv("PS3_AB_N"); if (e) np = (unsigned)atoi(e); if (np < 2 || np > 5) np = 5; }
+    { const char* e = getenv("PS3_AB_SEQ");
+      if (e && *e) { unsigned n = 0; while (*e && n < 16) { int v = atoi(e); if (v >= 0 && v <= 31) masks[n++] = v;
+              while (*e && *e != ',') e++; if (*e == ',') e++; }
+          if (n >= 2) np = n; else { masks[0] = 0; masks[1] = 1; masks[2] = 2; masks[3] = 3; masks[4] = 4; } } }
+    int xs[64]; unsigned nx = 0;
+    { const char* e = getenv("PS3_ABX_SEQ");
+      if (e && *e) { while (*e && nx < 64) { char* q; long v = strtol(e, &q, 0); if (q == e) break; xs[nx++] = (int)v; e = q;
+              while (*e && *e != ',') e++; if (*e == ',') e++; }
+          if (nx < 2) nx = 0;
+          if (nx) { const char* a = getenv("PS3_AB_SEQ"); if (!a || !*a) { np = 1; masks[0] = 0; } } } }
+    for (unsigned k = 0;; k++) {
+        int m = masks[k % np];
+        g_ab_phase = (int)k;
+        if (nx) { const int x = xs[k % nx]; g_abx = x;
+            fprintf(stderr, "[ABX] phase %u x 0x%02X (v132 factorial A/B bits)\n", k, x); }
+        g_ab_mask = m;
+        fprintf(stderr, "[AB] phase %u mask 0x%X\n", k, m);
+        fflush(stderr);
+        sleep(sec);
+    }
+    return 0;
+}
+extern "C" void ps3_ab_start(void)
+{
+    const char* e = getenv("PS3_AB");
+    if (!e || *e != '1') return;
+    unsigned sec = 12; { const char* s2 = getenv("PS3_AB_SEC"); if (s2) sec = (unsigned)atoi(s2); if (sec < 3) sec = 3; }
+    pthread_t t;
+    if (pthread_create(&t, NULL, ab_thread_apple, (void*)(uintptr_t)sec) == 0) pthread_detach(t);
 }
 #else
 extern "C" void ps3_ab_start(void) {}
