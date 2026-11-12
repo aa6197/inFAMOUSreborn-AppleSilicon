@@ -2275,6 +2275,9 @@ typedef struct {
     MTLWinding  winding;
     u8 zuse;    /* PASS_TRIM: tests or writes depth/stencil */
     u8 cwrite;  /* PASS_TRIM: writes any colour channel */
+    u8 blend;   /* PASS_DUMP: blending on */
+    u8 zwrite;  /* PASS_DUMP: writes depth */
+    u64 fph;    /* PASS_DUMP: fragment program (HLSL) hash */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -3466,6 +3469,9 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
      * the stencil test. */
     s_eng_pipe[slot].zuse   = (rs->depth_test || rs->stencil_enable) ? 1 : 0;
     s_eng_pipe[slot].cwrite = (wm != MTLColorWriteMaskNone) ? 1 : 0;
+    s_eng_pipe[slot].blend  = rs->blend_enable ? 1 : 0;
+    s_eng_pipe[slot].zwrite = (rs->depth_test && rs->depth_write) ? 1 : 0;
+    s_eng_pipe[slot].fph    = fnv1a64(ps_hlsl, (u32)strlen(ps_hlsl), 1469598103934665603ull);
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
     s_eng_pipe[slot].cull = MTLCullModeNone;
@@ -4013,10 +4019,97 @@ static id<MTLTexture> eng_memoryless(MTLPixelFormat fmt, NSUInteger w, NSUIntege
     return t;
 }
 
+/* PS3RECOMP_METAL_PASS_DUMP=<sec> (Apple port, debug; default off): from
+ * the first commit <sec> s after the first one, log every pass of the next
+ * PS3RECOMP_METAL_PASS_DUMP_N (default 4) commits to stderr as "[pass]"
+ * lines -- targets (handle:Metal pixel format:size), clears, draw count,
+ * what the draws do to colour and depth, their fragment programs and the
+ * textures they sample. Used to map passes to effects (shadow maps, bloom,
+ * blur, particles). Nothing else changes. */
+static int s_pd_left = -1;
+static double s_pd_at;
+static u32 s_pd_commit;
+static int eng_pass_dump_begin(u32 count)
+{
+    if (s_pd_left == -1) {
+        const char* e = getenv("PS3RECOMP_METAL_PASS_DUMP");
+        const char* n = getenv("PS3RECOMP_METAL_PASS_DUMP_N");
+        s_pd_at = (e && *e) ? atof(e) : -1.0;
+        s_pd_left = (s_pd_at >= 0.0) ? ((n && *n) ? atoi(n) : 4) : 0;
+    }
+    if (s_pd_left <= 0) return 0;
+    static double t0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (t0 == 0.0) t0 = now;
+    if (now - t0 < s_pd_at) return 0;
+    s_pd_left--;
+    s_pd_commit++;
+    fprintf(stderr, "[pass] c=%u begin recs=%u t=%.1f\n", s_pd_commit, count, now - t0);
+    return 1;
+}
+static void eng_pd_tex(char* b, size_t cap, size_t* o, u32 h)
+{
+    if (*o >= cap) return;
+    id<MTLTexture> t = eng_obj_enc(h);
+    int w = t ? snprintf(b + *o, cap - *o, " %u:%u:%ux%u", h, (unsigned)[t pixelFormat],
+                         (unsigned)[t width], (unsigned)[t height])
+              : snprintf(b + *o, cap - *o, " %u:-", h);
+    if (w > 0) *o += (size_t)w;
+}
+static void eng_pass_dump(const EngRecord* recs, u32 first, u32 end, u32 pass,
+                          const u32* rt, u32 nrt, u32 depth, int zfb_used,
+                          u32 n_cc, int clear_ds, int p_cwrite, int p_zuse)
+{
+    char b[4096];
+    size_t o = 0;
+    const size_t cap = sizeof b;
+#define PD(...) do { if (o < cap) { int w_ = snprintf(b + o, cap - o, __VA_ARGS__); if (w_ > 0) o += (size_t)w_; } } while (0)
+    PD("[pass] c=%u p=%u n=%u cc=%u cz=%d cw=%d zu=%d rt=", s_pd_commit, pass, end - first,
+       n_cc, clear_ds, p_cwrite, p_zuse);
+    for (u32 k = 0; k < nrt; k++) eng_pd_tex(b, cap, &o, rt[k]);
+    PD(" z=");
+    if (zfb_used) PD(" zfb"); else eng_pd_tex(b, cap, &o, depth);
+    u64 fp[8]; u32 nfp = 0;
+    u32 tx[16]; u32 ntx = 0;
+    u32 nblend = 0, nzw = 0, verts = 0;
+    const u32 npipe = __atomic_load_n(&s_eng_pipe_count, __ATOMIC_RELAXED);
+    for (u32 j = first; j < end; j++) {
+        const EngRecord* r = &recs[j];
+        verts += r->index_count ? r->index_count : r->vertex_count;
+        if (r->pipeline && r->pipeline <= npipe) {
+            const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
+            nblend += p->blend;
+            nzw    += p->zwrite;
+            u32 f = 0;
+            while (f < nfp && fp[f] != p->fph) f++;
+            if (f == nfp && nfp < 8) fp[nfp++] = p->fph;
+        }
+        for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+            const u32 h = r->tex[u];
+            if (!h) continue;
+            u32 k = 0;
+            while (k < ntx && tx[k] != h) k++;
+            if (k == ntx && ntx < 16) tx[ntx++] = h;
+        }
+    }
+    PD(" blend=%u zw=%u v=%u fp=", nblend, nzw, verts);
+    for (u32 f = 0; f < nfp; f++) PD("%s%016llx", f ? "," : "", (unsigned long long)fp[f]);
+    PD(" tex=");
+    for (u32 k = 0; k < ntx; k++) eng_pd_tex(b, cap, &o, tx[k]);
+#undef PD
+    if (o >= cap) o = cap - 1;
+    b[o] = 0;
+    fprintf(stderr, "%s\n", b);
+}
+
 static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
                                const EngRecord* recs, u32 count, id<MTLTexture> zfb)
 {
     u32 i = 0;
+    const int pd = eng_pass_dump_begin(count);
+    u32 pd_pass = 0;
     while (i < count) {
         if (recs[i].kind == ENG_REC_COPY) {
             /* Back-to-back copies share one blit encoder. */
@@ -4028,6 +4121,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
                 if (!src || !dst) continue;
                 if (!b) b = [cb blitCommandEncoder];
                 if (!b) break;
+                if (pd) fprintf(stderr, "[pass] c=%u p=%u copy %u -> %u (%ux%u fmt %u)\n", s_pd_commit,
+                                pd_pass++, r->copy_src, r->resolve_dst, (unsigned)[src width],
+                                (unsigned)[src height], (unsigned)[src pixelFormat]);
                 [b copyFromTexture:src toTexture:dst];
                 if (s_gpu_stats == 1) atomic_fetch_add(&s_gs_copy, 1);
             }
@@ -4050,6 +4146,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
             if (s_gpu_stats == 1) { atomic_fetch_add(&s_gs_resolve, 1); eng_gs_pass(rp, 1); }
+            if (pd) fprintf(stderr, "[pass] c=%u p=%u resolve%s %u -> %u (%ux%u)\n", s_pd_commit,
+                            pd_pass++, r->resolve_color ? "-color" : "", r->depth, r->resolve_dst,
+                            (unsigned)[src width], (unsigned)[src height]);
             [e setRenderPipelineState:pso];
             [e setFragmentTexture:src atIndex:0];
             if (sv) [e setFragmentTexture:sv atIndex:1];
@@ -4241,8 +4340,11 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
             i++;
         }
         if (s_gpu_stats == 1) atomic_fetch_add(&s_gs_draw, i - i_first);
+        if (pd) eng_pass_dump(recs, i_first, i, pd_pass++, rt, nrt, depth, zbuf == zfb,
+                              n_cc, have_clear_ds, p_cwrite, p_zuse);
         [enc endEncoding];
     }
+    if (pd) fprintf(stderr, "[pass] c=%u end passes=%u\n", s_pd_commit, pd_pass);
 }
 
 /* Put a surface on the drawable. A straight blit would need matching formats
