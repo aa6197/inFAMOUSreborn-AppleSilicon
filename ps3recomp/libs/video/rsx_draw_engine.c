@@ -98,6 +98,9 @@ typedef struct {
     u32 aw, ah;            /* RENDER_SCALE: the texture's real size        */
 #endif
     int cwritten;          /* a draw with a colour mask != 0 targeted it   */
+#if defined(__APPLE__)
+    int ccleared;          /* ZS_CLEAR_CW: a colour clear targeted it      */
+#endif
     u32 feedback;          /* copy sampled by a draw that writes it, or 0  */
     u32 fb_serial;         /* the bind that last refreshed `feedback`      */
     u32 fb_last;           /* FEEDBACK_RUN: the bind that last sampled it  */
@@ -727,6 +730,9 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     (void)real_w; (void)real_h;
     s->handle = handle;
     s->cwritten = 0;
+#if defined(__APPLE__)
+    s->ccleared = 0;
+#endif
     s->feedback = 0;
     s->fb_serial = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
@@ -1005,6 +1011,20 @@ static int eng_zconv_on(void)
     return v;
 }
 
+#if defined(__APPLE__)
+static int eng_zs_clear_cw(void)
+{
+    static int v = -1;
+    if (v < 0) v = eng_env_flag("ZS_CLEAR_CW", 0);
+    return v;
+}
+static int eng_zs_sub_watch(void)
+{
+    static int v = -1;
+    if (v < 0) v = eng_env_flag("ZS_SUB_WATCH", 0);
+    return v;
+}
+#endif
 static int eng_zs_cwritten(void)
 {
     static int v = -1;
@@ -4038,6 +4058,26 @@ static void eng_trace_tick(u32 frame)
     }
 }
 #define ENG_TRACING() (eng_trace_at() >= 0 && (long)g.frames == eng_trace_at())
+#if defined(__APPLE__)
+/* ZS_SUB_DUMP=<hex address> (test, with ZS_SUB_WATCH=1 and
+ * PS3RECOMP_ENGINE_SURFACE_DUMP): the first time a display-size pass reads
+ * the colour target at that address through the ZS_CWRITTEN rule (swapped
+ * or, with ZS_CLEAR_CW, kept), trace and dump the next frame. */
+static void eng_zs_dump_trigger(u32 tex_offset, const u32* target_slots, u32 n_targets)
+{
+    static long addr = -2;
+    if (addr == -2) {
+        const char* e = getenv("ZS_SUB_DUMP");
+        addr = (e && *e) ? (long)strtoul(e, NULL, 16) : -1;
+    }
+    if (addr < 0 || (u32)addr != tex_offset || !n_targets) return;
+    const eng_surface* ts = &g.surfaces[target_slots[0]];
+    if (ts->w != g.width || ts->h != g.height) return;
+    if (eng_trace_at() >= 0) return;
+    s_trace_at = (long)g.frames + 1;
+    fprintf(stderr, "[zssub] dump trigger: tracing frame %ld\n", s_trace_at);
+}
+#endif
 
 static char s_tex_kind[RSX_BE_MAX_TEXTURES];   /* 'S' surface, 'Z' depth, 'T' texture */
 static u32  s_tex_src[RSX_BE_MAX_TEXTURES];    /* surface slot or guest offset          */
@@ -4295,7 +4335,56 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              * inFamous' 0x0F340000 is bound as colour (mask 0) AND zeta by
              * its shadow pass; the light pass then samples it as a depth
              * texture. The D3D12 backend's v73c rule (ZS_CWRITTEN). */
-            if (zc != ENG_INVALID && !g.surfaces[i].cwritten && eng_zs_cwritten()) break;
+#if defined(__APPLE__)
+            /* ZS_CLEAR_CW=1 (test): a colour clear counts as a colour write,
+             * so a target that was only cleared reads as colour, not as the
+             * depth at its address. The 512x288 particle buffer at
+             * 0x01AB8000 is made new each frame (the address changes size);
+             * on a frame with no particle draws it was read as that depth:
+             * the yellow/blue flash. ZS_SUB_WATCH also logs these keeps. */
+            if (zc != ENG_INVALID && !g.surfaces[i].cwritten && eng_zs_cwritten() &&
+                g.surfaces[i].ccleared && eng_zs_clear_cw()) {
+                static u64 kk[64]; static u32 kn[64], kused;
+                if (eng_zs_sub_watch()) {
+                    const u64 key = g.ps_hash ^ ((u64)t.offset << 20) ^
+                                    ((u64)g.surfaces[i].w << 48) ^ (u64)g.surfaces[i].h;
+                    u32 s = 64u;
+                    for (u32 k = 0; k < kused; k++) if (kk[k] == key) { s = k; break; }
+                    if (s == 64u && kused < 64u) { s = kused++; kk[s] = key; kn[s] = 0; }
+                    if (s < 64u && (++kn[s] & (kn[s] - 1u)) == 0)
+                        fprintf(stderr, "[zskeep] f%u n=%u ps=%016llx u%u tex=%08X/%ux%u depth=%ux%u\n",
+                                g.frames, kn[s], (unsigned long long)g.ps_hash, u, t.offset,
+                                g.surfaces[i].w, g.surfaces[i].h, g.zdepths[zc].w, g.zdepths[zc].h);
+                    eng_zs_dump_trigger(t.offset, target_slots, n_targets);
+                }
+            } else
+#endif
+            if (zc != ENG_INVALID && !g.surfaces[i].cwritten && eng_zs_cwritten()) {
+#if defined(__APPLE__)
+                /* ZS_SUB_WATCH=1 (test): log when this rule swaps a colour
+                 * target for its depth, per program + address + size, at the
+                 * 1st, 2nd, 4th, 8th ... time. */
+                static u64 zk[256]; static u32 zn[256], zused;
+                if (eng_zs_sub_watch()) {
+                    const u64 key = g.ps_hash ^ ((u64)t.offset << 20) ^
+                                    ((u64)g.surfaces[i].w << 48) ^ (u64)g.surfaces[i].h;
+                    u32 s = 256u;
+                    for (u32 k = 0; k < zused; k++) if (zk[k] == key) { s = k; break; }
+                    if (s == 256u && zused < 256u) { s = zused++; zk[s] = key; zn[s] = 0; }
+                    if (s < 256u && (++zn[s] & (zn[s] - 1u)) == 0)
+                        fprintf(stderr, "[zssub] f%u n=%u ps=%016llx u%u fmt=%02X tex=%08X/%ux%u "
+                                "colour=%ux%u depth=%ux%u tgt=%08X/%ux%u\n", g.frames, zn[s],
+                                (unsigned long long)g.ps_hash, u, t.format & 0xFFu, t.offset,
+                                t.width, t.height, g.surfaces[i].w, g.surfaces[i].h,
+                                g.zdepths[zc].w, g.zdepths[zc].h,
+                                n_targets ? g.surfaces[target_slots[0]].offset : 0u,
+                                n_targets ? g.surfaces[target_slots[0]].w : 0u,
+                                n_targets ? g.surfaces[target_slots[0]].h : 0u);
+                    eng_zs_dump_trigger(t.offset, target_slots, n_targets);
+                }
+#endif
+                break;
+            }
             /* One this draw writes (an MRT set writes more than one) cannot
              * be read while it is written on any API: it reads a copy made
              * right before the draw, as the D3D12 backend does. */
@@ -4783,6 +4872,85 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 rsx_dsp_reg(&g.rsx, 0x0380u) & 1u, eng_reg_f32(0x0384u), eng_reg_f32(0x0388u),
                 (unsigned)rs.stencil_enable, rsx_dsp_reg(&g.rsx, 0x1FECu), (unsigned long long)g.ps_hash, tx);
     }
+#if defined(__APPLE__)
+    /* FP_CONST_WATCH=1 (test): a full-screen pass into a display-size target
+     * logs its inline constants when one moves by more than 0.02 since that
+     * program's last line (colour grade passes; 64 programs tracked). */
+    {
+        static int on = -1;
+        static u64 w_ps[64]; static float w_c[64][16][4]; static u32 w_n[64], w_next, lines;
+        if (on < 0) on = eng_env_flag("FP_CONST_WATCH", 0);
+        if (on && n_draw <= 6u && g.fp_constants.count && g.fp_constants.count <= 16u &&
+            g.surfaces[target].w == g.width && g.surfaces[target].h == g.height &&
+            lines < 200000u) {
+            const u32 nc = g.fp_constants.count;
+            u32 s = 64u;
+            for (u32 i = 0; i < 64u; i++) if (w_ps[i] == g.ps_hash) { s = i; break; }
+            int diff = 0;
+            if (s == 64u) { s = w_next++ & 63u; w_ps[s] = g.ps_hash; diff = 1; }
+            if (nc != w_n[s]) diff = 1;
+            for (u32 k = 0; k < nc && !diff; k++)
+                for (u32 j = 0; j < 4; j++) {
+                    float a; memcpy(&a, (const u8*)g.fp_constants.values[k] + 4 * j, 4);
+                    const float d = a - w_c[s][k][j];
+                    if (d > 0.02f || d < -0.02f || a != a) { diff = 1; break; }
+                }
+            if (diff) {
+                char b[1024]; int o = 0;
+                for (u32 k = 0; k < nc && o < (int)sizeof b - 64; k++) {
+                    float f[4]; memcpy(f, g.fp_constants.values[k], 16);
+                    memcpy(w_c[s][k], f, 16);
+                    o += snprintf(b + o, sizeof b - o, " c%u=%.4g/%.4g/%.4g/%.4g", k, f[0], f[1], f[2], f[3]);
+                }
+                w_n[s] = nc; lines++;
+                fprintf(stderr, "[fpwatch] f%u ps=%016llx n=%u%s\n", g.frames,
+                        (unsigned long long)g.ps_hash, n_draw, b);
+            }
+        }
+    }
+    /* TEX_KIND_WATCH=1 (test): a full-screen pass (6 or fewer vertices) logs
+     * where its textures came from whenever that changes for its program:
+     * S surface, F feedback copy, C depth read as colour (ZCONV), Z depth,
+     * T guest memory. 128 programs tracked. */
+    {
+        static int on = -1;
+        static u64 k_ps[128]; static char k_sig[128][RSX_BE_MAX_TEXTURES + 1];
+        static u32 k_next, lines;
+        if (on < 0) on = eng_env_flag("TEX_KIND_WATCH", 0);
+        if (on && n_draw <= 6u && lines < 20000u) {
+            char sig[RSX_BE_MAX_TEXTURES + 1];
+            for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++)
+                sig[u] = (tex_mask & (1u << u)) ? s_tex_kind[u] : '.';
+            sig[RSX_BE_MAX_TEXTURES] = 0;
+            u32 s = 128u;
+            for (u32 i = 0; i < 128u; i++) if (k_ps[i] == g.ps_hash) { s = i; break; }
+            const int fresh = (s == 128u);
+            if (fresh) { s = k_next++ & 127u; k_ps[s] = g.ps_hash; }
+            if (fresh || memcmp(sig, k_sig[s], sizeof sig) != 0) {
+                char b[1024]; int o = 0;
+                for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && o < (int)sizeof b - 64; u++) {
+                    if (!(tex_mask & (1u << u))) continue;
+                    const u32 si = s_tex_src[u];
+                    if ((s_tex_kind[u] == 'S' || s_tex_kind[u] == 'F') && si < g.n_surfaces)
+                        o += snprintf(b + o, sizeof b - o, " u%u=%c%08X/%ux%u/cw%d", u, s_tex_kind[u],
+                                      g.surfaces[si].offset, g.surfaces[si].w, g.surfaces[si].h,
+                                      g.surfaces[si].cwritten);
+                    else if ((s_tex_kind[u] == 'C' || s_tex_kind[u] == 'Z') && si < g.n_zdepths)
+                        o += snprintf(b + o, sizeof b - o, " u%u=%c%08X/%ux%u", u, s_tex_kind[u],
+                                      g.zdepths[si].offset, g.zdepths[si].w, g.zdepths[si].h);
+                    else
+                        o += snprintf(b + o, sizeof b - o, " u%u=%c%X", u, s_tex_kind[u], si);
+                }
+                fprintf(stderr, "[texwatch] f%u ps=%016llx tgt=%08X/%ux%u %s -> %s%s\n", g.frames,
+                        (unsigned long long)g.ps_hash, g.surfaces[target].offset,
+                        g.surfaces[target].w, g.surfaces[target].h,
+                        fresh ? "new" : k_sig[s], sig, b);
+                memcpy(k_sig[s], sig, sizeof sig);
+                lines++;
+            }
+        }
+    }
+#endif
     if (!geo_hit) eng_geo_store(&geo, indexed, n_draw, draw_indices);
     if (geo_hit && eng_geo_direct(geo_hit)) {
         s_geo_st.direct++;
@@ -4834,6 +5002,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * keep whatever the last frame left in them. */
         for (u32 i = 0; i < n_targets; i++)
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+#if defined(__APPLE__)
+        /* ZS_CLEAR_CW (eng_zs_clear_cw): remembered for the ZS_CWRITTEN rule. */
+        for (u32 i = 0; i < n_targets; i++) g.surfaces[targets[i]].ccleared = 1;
+#endif
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
