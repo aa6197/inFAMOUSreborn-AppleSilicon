@@ -56,6 +56,7 @@ extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
 extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
 extern "C" void port_ios_import_show(void* uiwindow, const char* dest_root, void (^done)(void));   /* ios_import.mm */
 extern "C" int  di_installed(const char* dest_root, char* elf_out, size_t elf_out_len);              /* import/disc_import.c */
+extern "C" volatile int g_ab_phase;                     /* ppu_loader.cpp (PS3_AB in-run A/B) */
 
 /* CPU check. The iOS build uses -mcpu=apple-a14 (CMakeLists.txt, PORT_IOS_CPU),
  * so its code may use FRINT32/64 (FEAT_FRINTTS) and AXFLAG/XAFLAG (FEAT_FlagM2).
@@ -709,12 +710,32 @@ int main(int argc, char* argv[])
         }
     }
 
+    /* IOS_PUMP_MS (default 4): SDL3 has no real event wait on UIKit. SDL_WaitEventTimeout
+     * pumps the run loop and sleeps 1 ms, again and again: ~1000 wake-ups/s, ~12% of a core
+     * on the iPhone (profile: SDL_PumpEventsInternal -> UIKit_PumpEvents). Now: take what SDL
+     * has (one pump: gamepads, queued events), then sleep in the run loop for up to this many
+     * ms. A touch, a dispatch to the main queue or any other run-loop source wakes it at once
+     * (touch_pad.mm is a UIKit view, so the on-screen pad never waits on this). Gamepads are
+     * sampled at 1000/<ms> Hz instead of 1000 Hz. 0 = the old SDL_WaitEventTimeout loop.
+     * IOS_PUMP_PHASE=0|1: on only in PS3_AB phases of that parity (in-run A/B). */
+    int pump_ms = 4, pump_phase = -1;
+    if (const char* p = getenv("IOS_PUMP_MS"); p && *p) pump_ms = atoi(p) < 0 ? 0 : atoi(p) > 50 ? 50 : atoi(p);
+    if (const char* p = getenv("IOS_PUMP_PHASE"); p && *p) pump_phase = atoi(p) & 1;
+    fprintf(stderr, "[ios] main loop: %s (IOS_PUMP_MS=%d, phase %d)\n",
+            pump_ms ? "run-loop wait" : "SDL_WaitEventTimeout (1 ms polling)", pump_ms, pump_phase);
     const Uint64 t0 = SDL_GetTicks();
     int geo_step = 0;
     for (;;) {
         @autoreleasepool {
             SDL_Event e;
-            if (SDL_WaitEventTimeout(&e, 100)) {
+            bool got;
+            if (pump_ms && (pump_phase < 0 || (g_ab_phase & 1) == pump_phase)) {
+                got = SDL_PollEvent(&e);
+                if (!got) CFRunLoopRunInMode(kCFRunLoopDefaultMode, pump_ms / 1000.0, true);
+            } else {
+                got = SDL_WaitEventTimeout(&e, 100);
+            }
+            if (got) {
                 if (e.type == SDL_EVENT_QUIT) break;
                 switch (e.type) {
                 case SDL_EVENT_WINDOW_RESIZED:            log_geometry("window resized"); break;
