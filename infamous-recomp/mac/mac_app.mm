@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "../import/disc_import.h"
+#include "../apple/gfx_settings.h"
 
 /* INFAMOUS_DATA_DIR overrides the folder (tests, or a game kept on another drive). */
 static NSString* data_dir(void)
@@ -54,6 +55,7 @@ extern "C" void port_mac_app_init(void)
             freopen([d stringByAppendingPathComponent:@"play.err.log"].fileSystemRepresentation, "w", stderr);
             setvbuf(stderr, NULL, _IONBF, 0);
         }
+        port_gfx_apply_env();   /* the Graphics menu's saved choices, before launch.env */
         NSString* envp = [NSBundle.mainBundle pathForResource:@"launch" ofType:@"env"];
         FILE* f = envp ? fopen(envp.fileSystemRepresentation, "r") : NULL;
         int n = 0;
@@ -324,6 +326,23 @@ static NSTextField* label(NSString* s, CGFloat size, NSFontWeight w, NSColor* c)
 
 @end
 
+/* Graphics menu: Shadows On / Near Only / Off, applied at once. Saved for
+ * the next start only in the app bundle (a terminal run keeps its own env). */
+@interface PortGfxMenu : NSObject <NSMenuItemValidation>
+@end
+@implementation PortGfxMenu
+- (void)setShadows:(NSMenuItem*)item
+{
+    port_gfx_set_shadows((long)item.tag, in_app_bundle());
+}
+- (BOOL)validateMenuItem:(NSMenuItem*)item
+{
+    if (item.action == @selector(setShadows:))
+        item.state = item.tag == port_gfx_shadows_now() ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+}
+@end
+
 /* The app menu (the Metal backend's window comes without one). */
 static void build_menu(void)
 {
@@ -347,6 +366,21 @@ static void build_menu(void)
     NSMenuItem* fs = [wm addItemWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
     fs.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
     winItem.submenu = wm;
+    static PortGfxMenu* gfx;
+    gfx = [PortGfxMenu new];
+    NSMenuItem* gfxItem = [NSMenuItem new];
+    [bar insertItem:gfxItem atIndex:1];
+    NSMenu* gm = [[NSMenu alloc] initWithTitle:@"Graphics"];
+    [gm addItemWithTitle:@"Shadows" action:nil keyEquivalent:@""].enabled = NO;
+    const struct { NSString* title; long value; } shadows[] = {
+        { @"On", PORT_GFX_SHADOWS_ON }, { @"Near Only", PORT_GFX_SHADOWS_NEAR }, { @"Off", PORT_GFX_SHADOWS_OFF } };
+    for (const auto& o : shadows) {
+        NSMenuItem* it = [gm addItemWithTitle:o.title action:@selector(setShadows:) keyEquivalent:@""];
+        it.target = gfx;
+        it.tag = o.value;
+        it.indentationLevel = 1;
+    }
+    gfxItem.submenu = gm;
     NSApp.mainMenu = bar;
     NSApp.windowsMenu = wm;
 }

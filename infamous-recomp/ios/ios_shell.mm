@@ -47,6 +47,8 @@
 
 #include <string>
 
+#include "../apple/gfx_settings.h"
+
 extern "C" int  port_game_main(int argc, char** argv);   /* main.cpp */
 extern "C" void port_app_set_paused(int paused);         /* main.cpp */
 extern "C" int  port_app_rsx_parked(void);               /* main.cpp */
@@ -585,6 +587,7 @@ static bool SDLCALL app_events(void*, SDL_Event* e)
         break;
     }
     case SDL_EVENT_DID_ENTER_FOREGROUND:
+        port_gfx_apply_live();   /* a Graphics choice made in the Settings app meanwhile */
         port_app_set_paused(0);
         fprintf(stderr, "[ios] foreground: resumed\n");
         break;
@@ -621,6 +624,7 @@ int main(int argc, char* argv[])
         fprintf(stderr, "[ios] documents: %s\n", docs.fileSystemRepresentation);
         fprintf(stderr, "[ios] low power mode %d, thermal %ld\n", (int)pi.lowPowerModeEnabled, (long)pi.thermalState);
 
+        port_gfx_apply_env();   /* the Settings app's Graphics choices, before launch.env */
         load_launch_env();
 
         /* INFAMOUS_DATA_DIR (testing): keep the game folder there instead of
