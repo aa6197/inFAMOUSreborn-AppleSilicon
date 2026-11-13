@@ -34,6 +34,9 @@ Read this first every session. Newest entry on top.
   off +7%, near-only +6%. The phone's Settings app has Resolution saved
   at 450p (the user's setting, leave it); tests force 720p with
   `RENDER_SCALE=100`.
+- **In-game menu (11-13):** MENU on the touch pad, or Home / touchpad
+  click on a gamepad: pauses the game; Shadows, Resolution, Upscaling.
+  Tested in the Simulator only. See entry "In-game menu (iOS)".
 - **11-12 evening (iPad only):** shadows cost ~10% on the iPad; new
   Shadows setting (On / Near only / Off, default On). Three exact RSX
   thread trims (plan memo, program reuse, dead-method skip), each small.
@@ -132,6 +135,37 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (afternoon) — In-game menu (iOS)
+
+### In-game menu (iOS/iPadOS)
+
+- The user asked for a settings menu inside the game. Native UIKit
+  overlay, `infamous-recomp/ios/game_menu.mm`.
+- Opens from: a new **MENU** button on the touch pad (top middle, under
+  SELECT/START), the gamepad Home/Guide button, or the DualSense
+  touchpad click. SDL 3.4.18 turns off the system gesture on Home, so
+  the app gets it.
+- The game pauses: `port_app_set_paused(2)` parks the frame clock
+  (`[ios] frame clock parked (in-game menu)`), without BG_TRIM. The
+  touch pad hides while the menu is up.
+- Rows: Shadows (On / Near only / Off), Resolution (720p … 360p),
+  Upscaling (MetalFX / Simple), then Resume. Same keys as the Settings
+  app page. Shadows and Upscaling change at once; Resolution is saved
+  and a note says it changes at the next start.
+- Gamepad: D-pad or left stick moves and changes values; Circle, START,
+  Home or touchpad click closes; Cross on Resume closes. It closes on
+  button release, so the game never sees that press.
+- Coming back from the background with the menu open keeps the game
+  paused.
+- Test: iOS Simulator (iPhone 18 Pro), `TOUCH_PAD=1` (the Simulator
+  sees the Mac's gamepad, which hides the pad). MENU → paused,
+  Shadows Off → `shadow maps: 0 drawn` at once, 540p → note shown and
+  saved, back to On/720p, Resume → `frame clock resumed`, pad back.
+  `$WORK_DIR/runs/20261113-150927-menu-sim2`.
+- Not tested yet: gamepad buttons (no way to press them from here) and
+  a real device (iPad offline; iPhone off-limits until the user is
+  back).
 
 ## 2026-11-13 — Save states phase 0, background trim, iPhone round 9
 

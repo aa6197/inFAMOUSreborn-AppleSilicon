@@ -57,6 +57,12 @@ extern "C" void rsx_metal_backend_set_layer(void* ca_metal_layer);
 extern "C" void rsx_metal_backend_wait_idle(void);
 extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
 extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
+extern "C" void port_game_menu_attach(void* uiwindow);   /* game_menu.mm, main thread */
+extern "C" int  port_game_menu_open(void);
+extern "C" int  port_game_menu_gamepad_event(const SDL_Event* e);
+
+/* game_menu.mm: apply a Graphics choice made in the in-game menu. */
+extern "C" void port_ios_gfx_apply_live(void) { port_gfx_apply_live(); }
 extern "C" void port_ios_import_show(void* uiwindow, const char* dest_root, void (^done)(void));   /* ios_import.mm */
 extern "C" int  di_installed(const char* dest_root, char* elf_out, size_t elf_out_len);              /* import/disc_import.c */
 extern "C" volatile int g_ab_phase;                     /* ppu_loader.cpp (PS3_AB in-run A/B) */
@@ -561,6 +567,7 @@ static void* game_thread(void*)
  * on macOS, more on Windows); iOS gives other threads 512 KB. */
 static void start_game_thread(void)
 {
+    if (s_uiwin) port_game_menu_attach((__bridge void*)s_uiwin);   /* the in-game menu from now on */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64u * 1024 * 1024);
@@ -607,8 +614,15 @@ static bool SDLCALL app_events(void*, SDL_Event* e)
         port_gfx_apply_live();   /* a Graphics choice made in the Settings app meanwhile */
         fprintf(stderr, "[ios-mem] foreground: footprint %zu MB, available %zu MB\n",
                 footprint_mb(), os_proc_available_memory() >> 20);
-        port_app_set_paused(0);
-        fprintf(stderr, "[ios] foreground: resumed\n");
+        /* the in-game menu keeps the game paused until it closes */
+        port_app_set_paused(port_game_menu_open() ? 2 : 0);
+        fprintf(stderr, "[ios] foreground: %s\n", port_game_menu_open() ? "menu still open" : "resumed");
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (NSThread.isMainThread) port_game_menu_gamepad_event(e);
+        else { const SDL_Event c = *e; dispatch_async(dispatch_get_main_queue(), ^{ port_game_menu_gamepad_event(&c); }); }
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:

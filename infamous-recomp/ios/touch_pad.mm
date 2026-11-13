@@ -9,7 +9,8 @@
  * centre, a D-pad on the left under the shoulders, the face buttons bottom
  * right. A touch anywhere else on the left half is a floating left stick
  * (movement); on the right half a floating right stick (camera). Fingers can
- * slide from one face button to the next.
+ * slide from one face button to the next. The small button under SELECT /
+ * START opens the in-game menu (game_menu.mm); the pad hides while it is up.
  */
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -18,6 +19,7 @@
 
 extern "C" void cellPad_set_touch_state(int on, unsigned buttons, unsigned lx, unsigned ly,
                                         unsigned rx, unsigned ry);
+extern "C" void port_game_menu_show(void);   /* game_menu.mm */
 
 /* CELL_PAD_CTRL_* (libs/input/cellPad.h) */
 enum : unsigned {
@@ -52,6 +54,9 @@ enum { ROLE_NONE = -3, ROLE_LSTICK = -2, ROLE_RSTICK = -1 };   /* >= 0: a button
     CGFloat       _stickRadius;
     NSMapTable*   _roles;            /* UITouch -> NSNumber role */
     unsigned      _shown;            /* last published buttons, to skip redraws */
+    CGRect        _menuRect;
+    CAShapeLayer* _menuShape;
+    CATextLayer*  _menuText;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -85,6 +90,17 @@ enum { ROLE_NONE = -3, ROLE_LSTICK = -2, ROLE_RSTICK = -1 };   /* >= 0: a button
         _stickKnob[s].fillColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
         [self.layer addSublayer:_stickKnob[s]];
     }
+    _menuShape = [CAShapeLayer layer];
+    _menuShape.fillColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+    _menuShape.strokeColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
+    _menuShape.lineWidth = 1.5;
+    [self.layer addSublayer:_menuShape];
+    _menuText = [CATextLayer layer];
+    _menuText.string = @"MENU";
+    _menuText.alignmentMode = kCAAlignmentCenter;
+    _menuText.foregroundColor = [UIColor colorWithWhite:1 alpha:0.75].CGColor;
+    _menuText.contentsScale = UIScreen.mainScreen.scale;
+    [self.layer addSublayer:_menuText];
     return self;
 }
 
@@ -123,6 +139,8 @@ enum { ROLE_NONE = -3, ROLE_LSTICK = -2, ROLE_RSTICK = -1 };   /* >= 0: a button
     const CGFloat pw = 1.6 * u, ph = 0.55 * u;
     _rect[12] = CGRectMake(W / 2 - pw - 0.25 * u, T, pw, ph);
     _rect[13] = CGRectMake(W / 2 + 0.25 * u, T, pw, ph);
+    /* MENU: centred under them */
+    _menuRect = CGRectMake(W / 2 - 0.6 * u, T + ph + 0.3 * u, 1.2 * u, 0.5 * u);
 
     /* L3 / R3: small, beside the stick homes */
     _stickRadius = 1.25 * u;
@@ -143,6 +161,11 @@ enum { ROLE_NONE = -3, ROLE_LSTICK = -2, ROLE_RSTICK = -1 };   /* >= 0: a button
         _text[i].fontSize = fs;
         _text[i].frame = CGRectMake(r.origin.x, r.origin.y + (r.size.height - fs * 1.2) / 2, r.size.width, fs * 1.25);
     }
+    _menuShape.path = [UIBezierPath bezierPathWithRoundedRect:_menuRect cornerRadius:_menuRect.size.height / 2].CGPath;
+    const CGFloat mfs = _menuRect.size.height * 0.42;
+    _menuText.fontSize = mfs;
+    _menuText.frame = CGRectMake(_menuRect.origin.x, _menuRect.origin.y + (_menuRect.size.height - mfs * 1.2) / 2,
+                                 _menuRect.size.width, mfs * 1.25);
     [CATransaction commit];
     for (int s = 0; s < 2; s++)
         if (![self stickHeld:s]) { _stickOrigin[s] = _stickPos[s] = _stickHome[s]; }
@@ -171,6 +194,10 @@ enum { ROLE_NONE = -3, ROLE_LSTICK = -2, ROLE_RSTICK = -1 };   /* >= 0: a button
 {
     for (UITouch* t in touches) {
         const CGPoint p = [t locationInView:self];
+        if (CGRectContainsPoint(CGRectInset(_menuRect, -0.15 * _menuRect.size.width, -0.3 * _menuRect.size.height), p)) {
+            dispatch_async(dispatch_get_main_queue(), ^{ port_game_menu_show(); });
+            continue;
+        }
         int role = [self buttonAt:p];
         if (role < 0) {
             const int s = (p.x < self.bounds.size.width / 2) ? 0 : 1;
@@ -283,6 +310,15 @@ static unsigned stick_axis(CGFloat d, CGFloat radius)
 
 static PortTouchPad* s_pad;
 static int           s_mode = -1;   /* TOUCH_PAD: -1 auto, 0 off, 1 always */
+static int           s_gamepads;
+static int           s_menu_open;
+
+static void touch_pad_apply(void)
+{
+    if (!s_pad) return;
+    const BOOL hide = s_menu_open || (s_mode != 1 && s_gamepads > 0);
+    if (s_pad.hidden != hide) s_pad.hidden = hide;
+}
 
 extern "C" void port_touch_pad_attach(void* uiwindow)
 {
@@ -300,9 +336,16 @@ extern "C" void port_touch_pad_attach(void* uiwindow)
 extern "C" void port_touch_pad_gamepads(int count)
 {
     if (!s_pad || s_mode == 1) return;
-    const BOOL hide = count > 0;
-    if (s_pad.hidden != hide) {
-        s_pad.hidden = hide;
-        fprintf(stderr, "[ios] touch pad %s (%d gamepad%s)\n", hide ? "hidden" : "shown", count, count == 1 ? "" : "s");
-    }
+    const BOOL was = s_pad.hidden;
+    s_gamepads = count;
+    touch_pad_apply();
+    if (s_pad.hidden != was)
+        fprintf(stderr, "[ios] touch pad %s (%d gamepad%s)\n", s_pad.hidden ? "hidden" : "shown", count, count == 1 ? "" : "s");
+}
+
+/* Main thread: the in-game menu is up (1) or closed (0). */
+extern "C" void port_touch_pad_menu(int open)
+{
+    s_menu_open = open;
+    touch_pad_apply();
 }

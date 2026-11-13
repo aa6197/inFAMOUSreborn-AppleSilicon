@@ -734,11 +734,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_port_toml}")
     configure_file(ios/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
 
-    target_sources(${PROJECT_NAME} PRIVATE ios/ios_shell.mm ios/touch_pad.mm ios/ios_import.mm "${_port_launch_env}")
+    target_sources(${PROJECT_NAME} PRIVATE ios/ios_shell.mm ios/touch_pad.mm ios/ios_import.mm ios/game_menu.mm "${_port_launch_env}")
     # The inFamous page in the Settings app: Graphics choices (apple/gfx_settings.h).
     target_sources(${PROJECT_NAME} PRIVATE ios/Settings.bundle/Root.plist)
     set_source_files_properties(ios/Settings.bundle/Root.plist PROPERTIES MACOSX_PACKAGE_LOCATION "Settings.bundle")
-    set_property(SOURCE ios/ios_shell.mm ios/touch_pad.mm ios/ios_import.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
+    set_property(SOURCE ios/ios_shell.mm ios/touch_pad.mm ios/ios_import.mm ios/game_menu.mm APPEND PROPERTY COMPILE_OPTIONS -fobjc-arc)
     target_link_libraries(${PROJECT_NAME} PRIVATE "-framework UniformTypeIdentifiers")
     # Only main.cpp changes under PORT_IOS: a target-wide define would also
     # change the compile command of every lifted TU.

@@ -198,7 +198,8 @@ extern "C" volatile int g_abx;   /* v198: ppu_loader.cpp (in-run A/B bits) */
 #include <atomic>
 static std::atomic<int> s_app_paused{0};
 static std::atomic<int> s_rsx_parked{1};
-extern "C" void port_app_set_paused(int paused) { s_app_paused.store(paused ? 1 : 0, std::memory_order_release); }
+/* 0 run, 1 app in the background, 2 in-game menu (ios/game_menu.mm: no BG_TRIM) */
+extern "C" void port_app_set_paused(int paused) { s_app_paused.store(paused < 0 ? 0 : paused > 2 ? 2 : paused, std::memory_order_release); }
 extern "C" int  port_app_rsx_parked(void)       { return s_rsx_parked.load(std::memory_order_acquire); }
 /* BG_TRIM (default on, BG_TRIM=0 turns it off): while parked, let go of GPU
  * memory that is refilled on use (rsx_metal_backend_bg_trim), so iOS is less
@@ -265,9 +266,9 @@ static DWORD WINAPI frame_clock(LPVOID)
     if (s_flat < 0) { const char* e = getenv("RSX_IDLE_SLEEP"); s_flat = (e && *e == '1') ? 1 : 0; }
     for (;;) {
 #if defined(PORT_IOS)
-        if (s_app_paused.load(std::memory_order_acquire)) {
-            fprintf(stderr, "[ios] frame clock parked (app in background)\n");
-            const int trim = bg_trim_on();
+        if (const int why = s_app_paused.load(std::memory_order_acquire)) {
+            fprintf(stderr, "[ios] frame clock parked (%s)\n", why == 2 ? "in-game menu" : "app in background");
+            const int trim = why == 1 && bg_trim_on();
             if (trim) rsx_metal_backend_bg_trim();
             s_rsx_parked.store(1, std::memory_order_release);
             while (s_app_paused.load(std::memory_order_acquire)) usleep(10000);
