@@ -60,6 +60,7 @@ extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main th
 extern "C" void port_game_menu_attach(void* uiwindow);   /* game_menu.mm, main thread */
 extern "C" void port_game_menu_test(const char* what);   /* game_menu.mm, main thread */
 extern "C" int  port_game_menu_open(void);
+extern "C" int  port_game_menu_restarting(void);   /* game_menu.mm */
 extern "C" int  port_game_menu_gamepad_event(const SDL_Event* e);
 
 /* game_menu.mm: apply a Graphics choice made in the in-game menu. */
@@ -565,9 +566,10 @@ static void* game_thread(void*)
 }
 
 /* Test: MENU_SCRIPT="<secs>:<step>,..." runs steps at those seconds after the game starts,
- * on the main thread, as a tap or the home gesture would: open, close, save, load0 (the
- * menu save), load1 (the background save) for the in-game menu; bg / fg send the app
- * events of going to the background and back (the app stays on screen). */
+ * on the main thread, as a tap or the home gesture would: open, close, save, load0 / load1
+ * (pick the menu save / the background save to load), res0..res4 (pick a Resolution),
+ * restart (Restart now) for the in-game menu; bg / fg send the app events of going to
+ * the background and back (the app stays on screen). */
 static bool SDLCALL app_events(void*, SDL_Event* e);
 static void menu_script_start(void)
 {
@@ -648,6 +650,12 @@ static void ss_autosave(void)
 {
     const char* e = getenv("SS_AUTOSAVE");
     if (!port_ss_available() || (e && *e == '0') || s_ss_bg != UIBackgroundTaskInvalid) return;
+    /* the menu's Restart now asks for notifications, and that alert counts as going to the
+     * background: a save then would write over a picked auto.ss */
+    if (port_game_menu_restarting()) {
+        fprintf(stderr, "[ios] background: no save (the menu is restarting the game)\n");
+        return;
+    }
     s_ss_bg = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"save state" expirationHandler:^{
         fprintf(stderr, "[ios] background save: out of time\n");
         ss_autosave_end();
