@@ -5,7 +5,8 @@
 #   release_apple.sh [version] [out dir]
 #
 # In:   infamous-recomp/build-mac-release   macOS release build (static deps, see README)
-#       infamous-recomp/build-ios           iPadOS/iOS device build (Release-iphoneos)
+#       infamous-recomp/build-ios           iPadOS/iOS device build (Release-iphoneos);
+#                                           IOS_BUILD=<dir> takes another one (e.g. build-ios-ss)
 # Out:  inFamous-<ver>-mac.zip      inFamous.app (ad-hoc signed, not notarized)
 #       inFamous-<ver>-ios.ipa      ad-hoc signed; keeps the two kernel entitlements.
 #                                   SideStore, AltStore or Sideloadly re-sign it.
@@ -59,9 +60,9 @@ else
 fi
 
 # --- iPadOS / iOS -----------------------------------------------------------------
-IOS_APP=$ROOT/build-ios/Release-iphoneos/inFamousRecomp.app
+IOS_APP=${IOS_BUILD:-$ROOT/build-ios}/Release-iphoneos/inFamousRecomp.app
 if [[ -d $IOS_APP ]]; then
-    echo "== iPadOS / iOS"
+    echo "== iPadOS / iOS (${IOS_APP:h:h:t})"
     mkdir -p $STAGE/ios/Payload
     ditto $IOS_APP $STAGE/ios/Payload/inFamousRecomp.app
     A=$STAGE/ios/Payload/inFamousRecomp.app
