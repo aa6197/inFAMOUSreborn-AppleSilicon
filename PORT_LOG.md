@@ -63,8 +63,11 @@ Read this first every session. Newest entry on top.
   (FIOS) task is saved and restored. Audio restore works, and with it
   **a load from the title reaches gameplay** (START, cutscene,
   tutorial; 4 of 4 runs). Clocks: the guest clock goes on from the
-  save. Next: longer play after a load, save from gameplay. See
-  entries "Save states: clocks", "Save states: audio",
+  save. **iPad (11-13):** in-game menu "Save state" / "Load state"
+  and a save on the way to the background work (save ~0.55 s, load
+  ~0.3–0.55 s, gameplay after a load). Next: the same on the iPhone,
+  save from gameplay, then Mac. See entries "Save states on iPad",
+  "Save states: clocks", "Save states: audio",
   "Save states: SPURS taskset task",
   "Save states: HLE libraries", "Save states: SPURS",
   "Save states: graphics",
@@ -153,6 +156,53 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states on iPad: menu Save / Load, background save
+
+### What is new (save-state build only; normal builds unchanged)
+
+- Build: `IOS_BUILD_DIR=$REPO/infamous-recomp/build-ios-ss tools/ios_device.sh build ON
+  -DPORT_SAVE_STATES=ON -DPORT_SAVE_STATES_ELF=<EBOOT.elf>`, then `install` with the
+  same `IOS_BUILD_DIR`.
+- In-game menu: two new rows.
+  - "Save state": saves to Documents/save.ss while the game stays paused.
+    Writes save.ss.part, renamed only when the save worked (a failed save
+    keeps the old one). Button shows "Saving...", "Saved 19:20" or
+    "Save failed, try again".
+  - "Load state": two buttons, "Save <time>" (save.ss) and "Auto <time>"
+    (auto.ss). First press arms it ("Press again to load", 4 s). Second
+    press writes Documents/ss_load_next and closes the app. Opening the
+    app again loads that save once (the marker is deleted first, so a
+    load that crashes does not loop).
+- Background: going to the background saves Documents/auto.ss inside a
+  background task (`SS_AUTOSAVE=0` off).
+- `SS_MENU=0` turns all of it off. Hooks are on from the start in these
+  builds (needed for a save at any time).
+- Fix: the menu pause held the frame clock in its own loop, so a save's
+  graphics hold (ss_gcm_hold) would wait 10 s and fail. The pause loop
+  now answers the park request (main.cpp, PORT_IOS only).
+- Test hook: `MENU_SCRIPT="40:open,43:save,58:close,62:bg,80:fg"`
+  (open, close, save, load0, load1, bg, fg) drives the menu and the
+  app background events on a device with no touch.
+
+### Results
+
+iPad Pro 11 M4, save-state build, title screen:
+
+| Test | Result |
+|---|---|
+| `SS_SAVE_AT=30` save (run 191645) | ok: 36 threads (0 without chain), safe in 0.9 ms, frozen 522 ms, total 569 ms, file 241 MB. Check: 0 pages differ (g_sys_timers byte 137: host cond var, harmless) |
+| `SS_LOAD` of that save (run 191812) | ok: 36 threads back in 283 ms. START → intro cutscene → tutorial (gameplay) |
+| Menu "Save now" (run 192233, `MENU_SCRIPT`) | ok: graphics held after 12 ms, frozen 531 ms, total 565 ms, 0 pages differ. Button shows "Saved 19:23" |
+| Go to background (same run) | ok: auto.ss saved inside the background task, frozen 506 ms, total 531 ms. Back to the foreground: clock resumed |
+| Menu "Load state" ×2 (run 192412) | first press: "Press again to load" + note; second press: marker written, app closed |
+| Next start (run 192505) | marker read once ("this start loads save.ss"), load 551 ms, START → gameplay |
+
+- Before the main.cpp fix the menu save would have waited 10 s for the
+  frame clock and failed (the menu pause loop never answered the park).
+- iPhone: not tested yet (locked during its test window). Next: the same
+  tests on the iPhone (short screen: the rows now shrink to fit), then
+  a save from gameplay, then Mac.
 
 ## 2026-11-13 (evening) — Save states: clocks (Mac)
 
