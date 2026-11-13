@@ -26,7 +26,7 @@ This is a Mac and iPad port of [inFAMOUSreborn](https://github.com/whompay/inFAM
 - **Works now:** inFamous (Europe, `BCES00220`)
 - **Not yet:** other regions
 - **Tested on:** a Mac with an M5 Pro (60+ fps) and an iPad Pro 11-inch (M4, about 50–55 fps)
-- **iPhone:** runs on an iPhone 16 Pro, but slowly (about 13–16 fps)
+- **iPhone:** runs on an iPhone 16 Pro, slower than on an iPad (about 25–30 fps)
 - **Game files are not included.** You choose your own copy of the game when the app first starts. The app copies what it needs from it
 
 ## Install
@@ -97,7 +97,11 @@ Your own file isn't changed. After this the app doesn't need it, so you can dele
   - Start (pause): Enter or Esc. Esc also frees the pointer. Click the game to grab it again
   - Map: Tab. In menus: W / S or arrows to move, Enter to pick, Backspace to go back
   - A connected controller still works and wins
-- On iPad, touch controls show up when no controller is connected
+- On iPad and iPhone, touch controls show up when no controller is connected
+- **In-game menu (iPad and iPhone):** tap MENU on the touch controls, or press Home (or the touchpad on a DualSense) on a controller. It pauses the game and has two groups:
+  - **Saves and resolution:** Save state, Load state and Resolution. These need a restart: tap **Restart now**. The app closes, and a notification lets you open it again with one tap (allow notifications the first time). Without it, open the app again from the Home Screen
+  - **Graphics:** Shadows and Upscaling. These change straight away
+- **Save states (iPad and iPhone):** save anywhere from the menu. Going to the Home Screen also saves (the "Auto" save). A save only loads in the same app version it was made with
 - Your saves and settings are kept in the app's folder. Mac: `~/Library/Application Support/inFamous`. iPad: Files → On My iPad → inFamous
 - The game runs in English
 
@@ -108,13 +112,13 @@ Controllers, touch and keyboard controls have only been lightly tested. If yours
 | | Mac (M5 Pro) | iPad Pro 11 (M4) | iPhone 16 Pro |
 |---|---|---|---|
 | Runs | Yes | Yes | Yes |
-| Speed | 60+ fps | about 50–55 fps | about 13–16 fps |
+| Speed | 60+ fps | about 50–55 fps | about 25–30 fps |
 
 Known issues:
 
 - 3D surfaces close to the camera look too bright
 - The iPad gets a little slower when it's hot
-- The iPhone gets hot within a minute and then slows down a lot
+- The iPhone gets hot and then slows down. A lower Resolution in the in-game menu helps
 - Only tested on one Mac so far. Older chips (M1, M2) will be slower
 
 Please report bugs here, not on inFAMOUSreborn. This port isn't part of the original project.
@@ -177,6 +181,8 @@ You also need a paid Apple Developer account, signed in to Xcode (Xcode → Sett
    infamous-recomp/tools/ios_build.sh <team id> <device id>
    ```
 5. Copy your game folder (`~/inFamous/BCES00220`) to the device or a USB drive. Then open the app and [add your game](#add-your-game)
+
+The build has save states when your game folder is at `~/inFamous/BCES00220` (set `GAME=<folder>` if it is somewhere else, or `SAVE_STATES=0` to leave them out).
 
 Want an `.ipa` file instead, to install with SideStore or AltStore? After step 4, run:
 
