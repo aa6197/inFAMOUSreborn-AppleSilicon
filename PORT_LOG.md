@@ -29,7 +29,8 @@ Read this first every session. Newest entry on top.
   (start: ~14), ~31 cool. Goal: high 30s. The hot phone is CPU-bound:
   GPU-only cuts no longer raise fps. Two short freezes came back in
   rounds 7–8 (open). See entries "iPhone: in-run A/B, profile, ..." and
-  "iPhone: lane workers at higher priority".
+  "iPhone: lane workers at higher priority". 11-13 in-run test: ~37–43
+  at default; 360p +28%, near-only shadows +6%.
 - **11-12 evening (iPad only):** shadows cost ~10% on the iPad; new
   Shadows setting (On / Near only / Off, default On). Three exact RSX
   thread trims (plan memo, program reuse, dead-method skip), each small.
@@ -40,9 +41,16 @@ Read this first every session. Newest entry on top.
   shots, yellow/blue flicker".
 - **11-13:** the flash fix is always on (user's OK), no switch. Checked
   on the Mac and the iPad. See entry "Yellow/blue flash fix always on".
-- **Save states (11-13, plan only):** the user wants save-anywhere.
-  Plan in `SAVE_STATES_PLAN.md`: quick memory win first, then a Mac
-  proof (safe-point stop + call-chain check) before any lifter work.
+- **Save states (11-13):** the user wants save-anywhere. Plan in
+  `SAVE_STATES_PLAN.md`. Phase 0 on the Mac: **go**. Every thread stops
+  at a safe point in ≤1.3 ms; save ~233 MB (LZ4). Call chains are
+  complete in 100/100 checks once bctrl sets the guest LR (now 0/100).
+  Next: phase 1, an opt-in lifter flag for that. See entry "Save states
+  phase 0, background trim, iPhone round 9".
+- **BG_TRIM=1 (11-13, iOS, opt-in):** lets go of the texture pool,
+  stage ring and geometry memo in the background. Built; not yet
+  tested on a device (iPad was offline). Ask the user about the default
+  after the test.
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -121,6 +129,57 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 — Save states phase 0, background trim, iPhone round 9
+
+### Save states phase 0 (Mac, 77f9e84, test only)
+
+- `SS_PROBE=17 SS_PROBE_START=30` run, 1900 s (`$WORK_DIR/runs/20261113-105913-ss-probe`),
+  100 checks from 51 s on. Check with `ps3recomp/tools/ss_probe_check.py`.
+- Stop: all threads at a safe point in 100/100. Stop time median 0.0 ms,
+  p90 0.8, max 1.3. Suspend + read median 0.22 ms.
+- Where threads stop: in an HLE call 2330, in a system call 900, at the
+  HLE/system-call edge 370.
+- Call chains (host frames lined up with guest LR words, in order):
+  with bctrl setting the guest LR, **100/100 checks complete** (threads:
+  2500 ok, 1100 only wrong at bctrl links, 0 missing, 0 extra). As the
+  lifter is now: 0/100, because bctrl leaves the guest LR as it was and
+  the callee saves an older one.
+- Memory: 355 MB non-zero of 4 GB guest space; LZ4 233 MB in ~380 ms.
+- No hang: flips kept rising. RSS 1668 → 2561 MB over the run; not yet
+  compared with a run without the probe.
+- RSX report memory: the game does not import
+  `cellGcmGetReportDataAddress` or the Location calls (EBOOT NID
+  search), so nothing extra to save there.
+- Verdict: **go** for phase 1: an opt-in lifter flag so bctrl sets the
+  guest LR (default = old output, Windows unchanged).
+- Checker fix (same day): it now lines chains up one entry per frame and
+  keeps recursion (was 97/100 from checker limits).
+
+### Background memory trim (6e290c8, iOS, opt-in)
+
+- `BG_TRIM=1`: in the background, free the texture pool, stage ring and
+  geometry memo (refilled on use), and ask malloc to give memory back.
+  Logs `[ios-mem] background: footprint A -> B MB` and the foreground
+  number. Default off.
+- Builds for the Mac and iOS. Not yet tested on a device: the iPad was
+  offline. Next: one run with and one without, then ask the user about
+  the default.
+
+### iPhone round 9 (in-run A/B, 300 s window, 18 pairs each)
+
+- Resolution 720p → 360p: 37.3 → 47.6 flips/s (+27.7%), thermal fair.
+- Shadows All → Near only: 43.2 → 45.8 (+6.0%), thermal serious.
+- Shadows Off and the flash check: no data (Control Center was open on
+  the phone). Re-run when the phone is free and charged.
+
+### Speed now (11-13)
+
+- Mac static scene 99.2 / 100.7 flips/s (was ~92).
+- iPad 53.8 / 53.0 (11-11: 55.6 / 51.9, same within noise).
+- iPhone ~37–43 at default in the in-run test (a 300 s window, so not
+  the same test as the 11-12 ~23 hot / ~31 cool). A full-run baseline
+  is still to do.
 
 ## 2026-11-13 — Yellow/blue flash fix always on
 
