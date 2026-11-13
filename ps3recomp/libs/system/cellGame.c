@@ -814,3 +814,27 @@ s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName)
 
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_game_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("game.title_id", s_title_id, sizeof s_title_id);
+    add("game.title", s_title, sizeof s_title);
+    add("game.version", s_version, sizeof s_version);
+    add("game.system_ver", s_system_ver, sizeof s_system_ver);
+    add("game.app_ver", s_app_ver, sizeof s_app_ver);
+    add("game.content_path", s_content_path, sizeof s_content_path);
+    add("game.content_resolved", &s_content_path_resolved, sizeof s_content_path_resolved);
+    add("game.content_info", s_content_info_path, sizeof s_content_info_path);
+    add("game.usrdir", s_usrdir_path, sizeof s_usrdir_path);
+    add("game.tmp", s_tmp_path, sizeof s_tmp_path);
+    add("game.exit_param", s_exit_param, sizeof s_exit_param);
+    add("game.boot_checked", &s_boot_checked, sizeof s_boot_checked);
+    add("game.type", &s_game_type, sizeof s_game_type);
+    add("game.check_disc", &s_check_is_disc, sizeof s_check_is_disc);
+    add("game.check_dir", s_check_dir, sizeof s_check_dir);
+}
+#endif

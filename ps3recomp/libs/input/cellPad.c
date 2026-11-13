@@ -2605,3 +2605,26 @@ void ps3_pad_rstick_read(u32 site, u32 which, u32 kind) { (void)site; (void)whic
 void ps3_pad_mouse_cam_spring(u32 cam) { (void)cam; }
 int  ps3_pad_mouse_raw_turn(void) { return 0; }
 #endif
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_pad_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("pad.init", (void*)&s_pad_initialized, sizeof s_pad_initialized);
+    add("pad.max", &s_max_connect, sizeof s_max_connect);
+    add("pad.ports", s_port_setting, sizeof s_port_setting);
+}
+/* After a load: open the host side again as cellPadInit did. Returns 1 if the pad is open. */
+int ss_pad_restore(void)
+{
+    if (!s_pad_initialized) return 0;
+    memset(s_host_state, 0, sizeof s_host_state);
+    memset(s_data_fresh, 0, sizeof s_data_fresh);
+    pad_init_backend();
+    pad_poll_backend();
+    pad_thread_start();
+    return 1;
+}
+#endif

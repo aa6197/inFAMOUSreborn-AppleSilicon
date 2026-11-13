@@ -495,3 +495,32 @@ void cellMsgDialog_tick(void)
         queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
     }
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_msgdialog_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("msgdlg.open", &s_dialog_open, sizeof s_dialog_open);
+    add("msgdlg.cb", (void*)&s_callback, sizeof s_callback);
+    add("msgdlg.user", (void*)&s_userdata, sizeof s_userdata);
+    add("msgdlg.type", &s_type, sizeof s_type);
+    add("msgdlg.nobutton", &s_nobutton_deadline, sizeof s_nobutton_deadline);
+    add("msgdlg.overlay", &s_overlay, sizeof s_overlay);
+    add("msgdlg.overlay_msg", s_overlay_msg, sizeof s_overlay_msg);
+    add("msgdlg.progress", s_progress, sizeof s_progress);
+}
+/* After a load: an open in-game dialog is shown again, and a no-button one gets a fresh
+ * grace period (the saved deadline is another process's clock). Returns 1 if a dialog is open. */
+int ss_msgdialog_restore(void)
+{
+    if (!s_dialog_open) { s_overlay = 0; s_nobutton_deadline = 0; return 0; }
+    if (s_nobutton_deadline) s_nobutton_deadline = GetTickCount64() + nobutton_grace_ms();
+    if (s_overlay)
+        uiov_dialog_open(s_overlay_msg,
+                         (s_type & 0x00000030) == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO ? 2 : 1,
+                         (s_type & CELL_MSGDIALOG_TYPE_DEFAULT_CURSOR_NO) ? 1 : 0);
+    return 1;
+}
+#endif

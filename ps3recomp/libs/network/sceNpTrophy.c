@@ -574,3 +574,15 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
            context, pct);
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_trophy_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("trophy.init", &s_trophy_initialized, sizeof s_trophy_initialized);
+    add("trophy.contexts", s_contexts, sizeof s_contexts);
+    add("trophy.handles", s_handles, sizeof s_handles);
+}
+#endif

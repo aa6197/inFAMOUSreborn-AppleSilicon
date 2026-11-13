@@ -279,3 +279,15 @@ s32 cellKbClearBuf(u32 port_no)
     s_kb_ports[port_no].event_count = 0;
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_kb_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("kb.init", &s_kb_initialized, sizeof s_kb_initialized);
+    add("kb.max", &s_kb_max_connect, sizeof s_kb_max_connect);
+    add("kb.ports", s_kb_ports, sizeof s_kb_ports);
+}
+#endif

@@ -253,3 +253,16 @@ s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
            videoOut, resolutionId);
     return (videoOut == CELL_VIDEO_OUT_PRIMARY) ? 1 : 0;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_videoout_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("videoout.res", &s_resolution_id, sizeof s_resolution_id);
+    add("videoout.format", &s_color_format, sizeof s_color_format);
+    add("videoout.aspect", &s_aspect, sizeof s_aspect);
+    add("videoout.pitch", &s_pitch, sizeof s_pitch);
+}
+#endif

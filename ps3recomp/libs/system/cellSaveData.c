@@ -1579,3 +1579,15 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
     return cellSaveDataAutoLoad(version, dirName, errDialog, setBuf,
                                 funcStat, funcFile, container, NULL);
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_savedata_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("savedata.scratch_base", &s_scratch_base, sizeof s_scratch_base);
+    add("savedata.scratch_size", &s_scratch_size, sizeof s_scratch_size);
+    add("savedata.scratch_next", &s_scratch_next, sizeof s_scratch_next);
+}
+#endif

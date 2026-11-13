@@ -282,13 +282,13 @@ enum { SS_NBLOBS = sizeof s_blobs / sizeof s_blobs[0] };
 /* Module host state: static blobs each module names through ss_file_mod_add
  * (ppu_ss_load.cpp collects them once, before the first save or load). Stored as
  * sections "mod:<name>", raw bytes like the tables. */
-enum { SS_MOD_MAX = 128 };
+enum { SS_MOD_MAX = 512 };
 static ss_blob s_mods[SS_MOD_MAX];
-static int s_nmods;
+static int s_nmods, s_mods_dropped;
 extern "C" void ss_file_mod_add(const char* name, void* p, size_t n)
 {
     if (s_nmods < SS_MOD_MAX) s_mods[s_nmods++] = ss_blob{ name, p, n };
-    else fprintf(stderr, "[ss] too many module blobs (%s dropped)\n", name);
+    else { s_mods_dropped++; fprintf(stderr, "[ss] too many module blobs (%s dropped)\n", name); }
 }
 
 static void ss_tab_name(char* out, size_t n, const char* v)
@@ -318,7 +318,7 @@ extern "C" int ss_file_tables(ss_out* o, uint64_t* bytes)
         total += s_mods[i].n;
     }
     if (bytes) *bytes = total;
-    return !o->err;
+    return !o->err && !s_mods_dropped;   /* a dropped blob would not load */
 }
 
 extern "C" int ss_file_sync(ss_out* o)
@@ -331,7 +331,7 @@ extern "C" int ss_file_sync(ss_out* o)
 
 typedef size_t (*ss_dec_fn)(uint8_t*, size_t, const uint8_t*, size_t, void*, int);
 
-enum { SS_SEC_MAX = 128 };
+enum { SS_SEC_MAX = 1024 };
 struct ss_sec { const char* name; uint32_t nl; const uint8_t* p; uint64_t n; };
 
 struct ss_in {

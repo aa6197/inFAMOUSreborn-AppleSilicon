@@ -21,7 +21,9 @@
  * (ss_gcm_hold); the walker then carries on from the saved FIFO position.
  * SPURS: the workload tables and the persistent policy-module contexts come back,
  * then the kernel threads start again (they were parked between passes at the save).
- * Not yet: audio, SPURS taskset tasks and the HLE libraries (the next steps).
+ * HLE libraries: init flags, callbacks and an open dialog come back as blobs; the
+ * pad opens its host side again (ss_pad_restore).
+ * Not yet: audio and SPURS taskset tasks (the next steps).
  */
 #if defined(__APPLE__)
 
@@ -61,6 +63,19 @@ extern "C" void rsx_draw_engine_ss_restore(void);
 extern "C" void ss_spurs_blobs(ss_add_fn add);            /* libs/spurs/cellSpurs.c */
 extern "C" int  ss_spurs_restore(void);
 extern "C" int  spurs_pm_ss_load(const uint8_t* p, uint64_t n);   /* runtime/spu/spurs_policy.c */
+extern "C" void ss_pad_blobs(ss_add_fn add);                  /* libs/input/cellPad.c */
+extern "C" int  ss_pad_restore(void);
+extern "C" void ss_kb_blobs(ss_add_fn add);                   /* libs/input/cellKb.c */
+extern "C" void ss_mouse_blobs(ss_add_fn add);                /* libs/input/cellMouse.c */
+extern "C" void ss_sysutil_blobs(ss_add_fn add);              /* libs/system/cellSysutil.c */
+extern "C" int  ss_sysutil_restore(void);
+extern "C" void ss_msgdialog_blobs(ss_add_fn add);            /* libs/system/cellMsgDialog.c */
+extern "C" int  ss_msgdialog_restore(void);
+extern "C" void ss_videoout_blobs(ss_add_fn add);             /* libs/video/cellVideoOut.c */
+extern "C" void ss_trophy_blobs(ss_add_fn add);               /* libs/network/sceNpTrophy.c */
+extern "C" void ss_sysmodule_blobs(ss_add_fn add);            /* libs/system/cellSysmodule.c */
+extern "C" void ss_savedata_blobs(ss_add_fn add);             /* libs/system/cellSaveData.c */
+extern "C" void ss_game_blobs(ss_add_fn add);                 /* libs/system/cellGame.c */
 extern "C" int  ss_site_has(uint32_t fn, uint64_t key);       /* ppu_ss_resume.cpp */
 
 #define SS_NID_LWCOND_WAIT 0x2A6D9D51u
@@ -78,6 +93,17 @@ static void ss_mods_do(void)
     ss_gcm_blobs(ss_file_mod_add);
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
     ss_spurs_blobs(ss_file_mod_add);
+    /* HLE libraries with host-side state (init flags, callbacks, open dialog) */
+    ss_pad_blobs(ss_file_mod_add);
+    ss_kb_blobs(ss_file_mod_add);
+    ss_mouse_blobs(ss_file_mod_add);
+    ss_sysutil_blobs(ss_file_mod_add);
+    ss_msgdialog_blobs(ss_file_mod_add);
+    ss_videoout_blobs(ss_file_mod_add);
+    ss_trophy_blobs(ss_file_mod_add);
+    ss_sysmodule_blobs(ss_file_mod_add);
+    ss_savedata_blobs(ss_file_mod_add);
+    ss_game_blobs(ss_file_mod_add);
 }
 extern "C" void ss_mods_init(void)
 {
@@ -289,6 +315,11 @@ static int ss_load_all(const char* path)
 
     const int nsi = ss_spurs_restore();
     fprintf(stderr, "[ss] load: SPURS back (%d instances, %d policy contexts)\n", nsi, npm);
+    const int pad = ss_pad_restore();
+    const int ncomp = ss_sysutil_restore();
+    const int dlg = ss_msgdialog_restore();
+    fprintf(stderr, "[ss] load: libraries back (pad %s, %d sysutil completions, dialog %s)\n",
+            pad ? "open" : "closed", ncomp, dlg ? "open" : "none");
 
     const int ns = ss_start_threads();
     if (ns < 0) { fprintf(stderr, "[ss] load FAILED: threads\n"); abort(); }

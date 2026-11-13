@@ -129,3 +129,13 @@ s32 cellSysmoduleIsLoaded(u16 id)
 
     return s_module_loaded[slot] ? CELL_OK : CELL_SYSMODULE_ERROR_UNLOADED;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_sysmodule_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("sysmodule.loaded", s_module_loaded, sizeof s_module_loaded);
+}
+#endif

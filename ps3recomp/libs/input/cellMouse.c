@@ -340,3 +340,15 @@ s32 cellMouseClearBuf(u32 port_no)
 
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+void ss_mouse_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("mouse.init", &s_mouse_initialized, sizeof s_mouse_initialized);
+    add("mouse.max", &s_mouse_max_connect, sizeof s_mouse_max_connect);
+    add("mouse.ports", s_mouse_ports, sizeof s_mouse_ports);
+}
+#endif

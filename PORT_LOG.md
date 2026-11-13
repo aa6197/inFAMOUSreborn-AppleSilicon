@@ -59,8 +59,11 @@ Read this first every session. Newest entry on top.
   (memory, kernel, files, 36/36 threads back in 130 ms, no crash).
   Graphics (GCM / RSX) restore works: the walker runs on from the saved
   FIFO spot and a flip goes through. SPURS restore works: the title
-  runs on after a load. Next: the SPURS taskset task, audio. See entries
-  "Save states: SPURS", "Save states: graphics",
+  runs on after a load. HLE library state works: START plays the
+  opening cutscene after a load, then black (the game waits on file
+  loads). Next: the SPURS taskset (FIOS) task, audio, clocks. See
+  entries "Save states: HLE libraries", "Save states: SPURS",
+  "Save states: graphics",
   "Save states: load, PPU core",
   "Save states: save file writer", "Save states: re-entry test" and
   "Save states phase 1: resume chains".
@@ -146,6 +149,44 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: HLE libraries (Mac)
+
+### Library state (Mac, test build only)
+
+- Problem: after a load the title ran but START did nothing. cellPad
+  was not initialised in the new process, so the game read no pad.
+- Now saved as `mod:` blobs: pad, keyboard, mouse (init, ports),
+  sysutil (callbacks, events, BGM, disc callback, queued completions),
+  message dialog (open, callback, type, overlay text, progress),
+  video out, trophies, sysmodule (loaded list), save data scratch,
+  cellGame (all its state).
+- Load: blobs come back, then the pad opens its host side again
+  (`ss_pad_restore`), queued sysutil completions are queued again
+  (`ss_sysutil_restore`), an open dialog shows again and gets a fresh
+  no-button deadline (`ss_msgdialog_restore`).
+- Save: the sysutil completion list is copied under its lock
+  (try-lock; busy = the save fails, no wait).
+- Limits: blob table 128 -> 512, sections 128 -> 1024. A dropped blob
+  now fails the save (it used to say "save ok").
+- **Name rule:** `ps3recomp/tools/gen_hle_nids.py` registers every
+  non-static `cell*` / `sys*` / `sce*` / `_sys*` function in `libs/`,
+  even inside `#if` blocks. Apple-only helpers there must start with
+  `ss_` (not `cell*_ss_*`, not `sysutil_*`), or the Windows NID table
+  names a function Windows does not have (link error).
+- Results: save (`runs/20261113-173609-ss-libsave2`, at 30 s): all
+  safe after 1.1 ms, frozen 547 ms, file 241 MB, check 1 page and the
+  timer table differ (as before). Load
+  (`runs/20261113-173641-ss-libload2`): "libraries back (pad open, 0
+  sysutil completions, dialog none)", 36 threads in 169 ms. START at
+  8 s works: the opening cutscene plays.
+- Still broken: after the cutscene the screen stays black. A normal
+  run (`runs/20261113-173832-ss-base2`) is black ~6-12 s, then
+  gameplay. The loaded run opens no files (normal: 236) and its SPURS
+  taskset task never runs. Audio is also not running (0 `[audio-rate]`
+  lines, normal 28). Next: the taskset (FIOS) task, then audio.
+- Normal Mac build builds and boots to the title
+  (`runs/20261113-174212-mac-spurschk`).
 
 ## 2026-11-13 (evening) — Save states: SPURS (Mac)
 

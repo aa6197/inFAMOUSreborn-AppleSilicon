@@ -395,6 +395,7 @@ extern "C" void ss_mods_init(void);                                  /* ppu_ss_l
 extern "C" int  ss_gcm_hold(int on);                             /* libs/video/cellGcmSys.c */
 extern "C" int  ss_spurs_hold(int on, long* threads, long* parked);   /* libs/spurs/cellSpurs.c */
 extern "C" void spurs_pm_ss_save(void (*put)(void*, const void*, size_t), void* o);   /* runtime/spu/spurs_policy.c */
+extern "C" int  ss_sysutil_presave(void);                           /* libs/system/cellSysutil.c */
 static void ss_put_cb(void* o, const void* p, size_t n) { ss_file_put((ss_out*)o, p, n); }
 #endif
 static int s_load;   /* SS_LOAD=<file> */
@@ -710,6 +711,8 @@ static int ss_save(const char* path, int wait_ms)
     const int gcm_ok = ss_gcm_hold(1);
     const double t_held = ss_now() - t_hold;
     ok = ss_file_mem(o, &ms) && ok;
+    const int ncomp = ss_sysutil_presave();   /* -1: list busy or too long */
+    ok = ncomp >= 0 && ok;
     ok = ss_file_tables(o, &tab) && ok;
     ss_file_sec_begin(o, "spurs.pm");
     spurs_pm_ss_save(ss_put_cb, o);
@@ -727,8 +730,9 @@ static int ss_save(const char* path, int wait_ms)
     ss_gcm_hold(0);
     ss_spurs_hold(0, NULL, NULL);
     ss_resume_all(nrec);
-    fprintf(stderr, "[ss] save: SPURS %ld of %ld kernel threads parked after %.1f ms; graphics %s after %.1f ms\n",
-            sk_p, sk_n, t_spurs * 1000.0, gcm_ok ? "held" : "NOT held", t_held * 1000.0);
+    fprintf(stderr, "[ss] save: SPURS %ld of %ld kernel threads parked after %.1f ms; graphics %s after %.1f ms; "
+            "sysutil completions %d\n",
+            sk_p, sk_n, t_spurs * 1000.0, gcm_ok ? "held" : "NOT held", t_held * 1000.0, ncomp);
     const double t_frozen = ss_now() - t0;
     if (chk) {
         if (c_ok) {

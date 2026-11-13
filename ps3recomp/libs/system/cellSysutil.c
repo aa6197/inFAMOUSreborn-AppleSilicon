@@ -537,3 +537,52 @@ s32 cellSysutilIsMeetingApp(void)
 {
     return 0; /* Not a meeting app */
 }
+
+#if defined(__APPLE__)
+/* Save states (runtime/ppu/ppu_ss_load.cpp): the host-side state this library keeps.
+ * The ss_ prefix matters: gen_hle_nids.py registers every non-static cell* / sys* / sce*
+ * function in libs/, #if blocks included, and these exist only on Apple. */
+/* Completions waiting for the next cellSysutilCheckCallback: copied here before the save
+ * (no malloc while the threads are stopped), made a list again after the load. */
+enum { SS_COMP_MAX = 32 };
+static struct { u32 opd; u32 pad; u64 args[8]; } s_ss_comp[SS_COMP_MAX];
+static int s_ss_comp_n = 0;
+void ss_sysutil_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("sysutil.callbacks", s_callbacks, sizeof s_callbacks);
+    add("sysutil.events", s_event_queue, sizeof s_event_queue);
+    add("sysutil.ev_head", &s_event_head, sizeof s_event_head);
+    add("sysutil.ev_tail", &s_event_tail, sizeof s_event_tail);
+    add("sysutil.bgm_on", &s_bgm_enabled, sizeof s_bgm_enabled);
+    add("sysutil.bgm_status", &s_bgm_status, sizeof s_bgm_status);
+    add("sysutil.disc_cb", (void*)&s_disc_change_cb, sizeof s_disc_change_cb);
+    add("sysutil.disc_arg", (void*)&s_disc_change_arg, sizeof s_disc_change_arg);
+    add("sysutil.pump_seen", &s_pump_seen, sizeof s_pump_seen);
+    add("sysutil.comp", s_ss_comp, sizeof s_ss_comp);
+    add("sysutil.comp_n", &s_ss_comp_n, sizeof s_ss_comp_n);
+}
+/* Before the save, threads stopped. Returns the count, or -1 if the list is busy or too long. */
+int ss_sysutil_presave(void)
+{
+    if (pthread_mutex_trylock(&s_completion_lock) != 0) return -1;
+    int n = 0;
+    for (GuestCompletion* c = s_completion_head; c; c = c->next) {
+        if (n == SS_COMP_MAX) { n = -1; break; }
+        s_ss_comp[n].opd = c->opd;
+        memcpy(s_ss_comp[n].args, c->args, sizeof c->args);
+        n++;
+    }
+    pthread_mutex_unlock(&s_completion_lock);
+    s_ss_comp_n = n < 0 ? 0 : n;
+    return n;
+}
+/* After a load (threads not started yet). Returns the completions queued again. */
+int ss_sysutil_restore(void)
+{
+    s_completion_head = s_completion_tail = NULL;
+    const int n = s_ss_comp_n;
+    for (int i = 0; i < n; i++) cellSysutilQueueGuestCallbackArgs(s_ss_comp[i].opd, s_ss_comp[i].args);
+    s_ss_comp_n = 0;
+    return n;
+}
+#endif
