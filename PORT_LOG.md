@@ -40,6 +40,9 @@ Read this first every session. Newest entry on top.
   shots, yellow/blue flicker".
 - **11-13:** the flash fix is always on (user's OK), no switch. Checked
   on the Mac and the iPad. See entry "Yellow/blue flash fix always on".
+- **Save states (11-13, plan only):** the user wants save-anywhere.
+  Plan in `SAVE_STATES_PLAN.md`: quick memory win first, then a Mac
+  proof (safe-point stop + call-chain check) before any lifter work.
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
