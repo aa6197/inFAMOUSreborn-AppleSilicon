@@ -58,6 +58,7 @@ extern "C" void rsx_metal_backend_wait_idle(void);
 extern "C" void port_touch_pad_attach(void* uiwindow);   /* touch_pad.mm */
 extern "C" void port_touch_pad_gamepads(int count);     /* touch_pad.mm, main thread */
 extern "C" void port_game_menu_attach(void* uiwindow);   /* game_menu.mm, main thread */
+extern "C" void port_game_menu_test(const char* what);   /* game_menu.mm, main thread */
 extern "C" int  port_game_menu_open(void);
 extern "C" int  port_game_menu_gamepad_event(const SDL_Event* e);
 
@@ -563,11 +564,45 @@ static void* game_thread(void*)
     return NULL;
 }
 
+/* Test: MENU_SCRIPT="<secs>:<step>,..." runs steps at those seconds after the game starts,
+ * on the main thread, as a tap or the home gesture would: open, close, save, load0 (the
+ * menu save), load1 (the background save) for the in-game menu; bg / fg send the app
+ * events of going to the background and back (the app stays on screen). */
+static bool SDLCALL app_events(void*, SDL_Event* e);
+static void menu_script_start(void)
+{
+    const char* e = getenv("MENU_SCRIPT");
+    if (!e || !*e) return;
+    std::string all(e);
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t end = all.find(',', pos);
+        if (end == std::string::npos) end = all.size();
+        const std::string item = all.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t c = item.find(':');
+        if (c == std::string::npos) continue;
+        const double at = atof(item.c_str());
+        const std::string step = item.substr(c + 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(at * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            fprintf(stderr, "[ios] menu script %.0f s: %s\n", at, step.c_str());
+            if (step == "bg" || step == "fg") {
+                SDL_Event ev;
+                SDL_zero(ev);
+                ev.type = step == "bg" ? SDL_EVENT_WILL_ENTER_BACKGROUND : SDL_EVENT_DID_ENTER_FOREGROUND;
+                app_events(NULL, &ev);
+            } else
+                port_game_menu_test(step.c_str());
+        });
+    }
+}
+
 /* The desktop build runs the guest on the process main thread (8 MB
  * on macOS, more on Windows); iOS gives other threads 512 KB. */
 static void start_game_thread(void)
 {
     if (s_uiwin) port_game_menu_attach((__bridge void*)s_uiwin);   /* the in-game menu from now on */
+    menu_script_start();
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64u * 1024 * 1024);
@@ -589,6 +624,43 @@ static size_t footprint_mb(void)
     return (size_t)(vi.phys_footprint >> 20);
 }
 
+/* Save-state builds (port_ss_available(), runtime/ppu/ppu_ss_probe.cpp): on the way to
+ * the background, save to Documents/auto.ss (the in-game menu's "Load state" offers it).
+ * The game is already paused; a background task gives the save time to end (a save that
+ * runs out of time leaves the old auto.ss as it was). SS_AUTOSAVE=0 turns it off. */
+extern "C" int port_ss_available(void);
+extern "C" int port_ss_save_async(const char* path, void (*done)(int ok, void* user), void* user);
+static UIBackgroundTaskIdentifier s_ss_bg = UIBackgroundTaskInvalid;
+static void ss_autosave_end(void)
+{
+    if (s_ss_bg == UIBackgroundTaskInvalid) return;
+    [UIApplication.sharedApplication endBackgroundTask:s_ss_bg];
+    s_ss_bg = UIBackgroundTaskInvalid;
+}
+static void ss_autosave_done(int ok, void*)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        fprintf(stderr, "[ios] background save %s\n", ok ? "done" : "FAILED");
+        ss_autosave_end();
+    });
+}
+static void ss_autosave(void)
+{
+    const char* e = getenv("SS_AUTOSAVE");
+    if (!port_ss_available() || (e && *e == '0') || s_ss_bg != UIBackgroundTaskInvalid) return;
+    s_ss_bg = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"save state" expirationHandler:^{
+        fprintf(stderr, "[ios] background save: out of time\n");
+        ss_autosave_end();
+    }];
+    NSString* docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (port_ss_save_async([docs stringByAppendingPathComponent:@"auto.ss"].fileSystemRepresentation, ss_autosave_done, NULL))
+        fprintf(stderr, "[ios] background: saving state to auto.ss\n");
+    else {
+        fprintf(stderr, "[ios] background: no save (a save is already running)\n");
+        ss_autosave_end();
+    }
+}
+
 /* Runs on the main thread, inside the UIKit callback, before it returns:
  * iOS gives the app only a moment once it has left the screen. */
 static bool SDLCALL app_events(void*, SDL_Event* e)
@@ -608,6 +680,7 @@ static bool SDLCALL app_events(void*, SDL_Event* e)
         const size_t relief = (bt && *bt == '0') ? 0 : malloc_zone_pressure_relief(NULL, 0);
         fprintf(stderr, "[ios-mem] background: footprint %zu -> %zu MB (malloc gave back %zu MB), "
                 "available %zu MB\n", fp0, footprint_mb(), relief >> 20, os_proc_available_memory() >> 20);
+        ss_autosave();
         break;
     }
     case SDL_EVENT_DID_ENTER_FOREGROUND:
