@@ -178,6 +178,16 @@ Still to do after the chains (most of the work):
 - Revised time: chains and resume about 3–5 h; the rest of the state
   about 10–20 h more.
 
+## Re-entry test (11-13, done)
+
+`SS_REENTER=1|2` with `SS_PROBE` on `build-mac-ss`: live threads jump
+back to their start and rebuild their stack from the chain. 1,947
+re-entries per 240 s run, none skipped, registers the same at every
+re-run call entry (1,947/1,947), no crash. Fixed on the way: cold parts
+(`func_X.cold.N`) folded into their function; HLE entry points with two
+HLE host frames. The load side works on live threads; the save file only
+has to add host state.
+
 ## Save and load design (11-13, after the chain test)
 
 Where threads are when the save stops them (100 checks, 36 threads):

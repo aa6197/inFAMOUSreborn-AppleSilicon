@@ -28,6 +28,8 @@
 #include "ppu_recomp.h"   /* ppu_context, vm_base */
 #if defined(PORT_SAVE_STATES)
 #include "ppu_ss_resume.h"   /* phase 1: exact chains from the site tables */
+#include <setjmp.h>
+#include <stddef.h>
 #endif
 
 #include <dlfcn.h>
@@ -74,6 +76,10 @@ static ss_slot s_ss[SS_MAX];
 static volatile int s_ss_stop = 0;
 static ss_rec s_rec[SS_MAX];
 static double s_t0;
+#if defined(PORT_SAVE_STATES)
+static int s_reenter;   /* SS_REENTER=1 (any safe point) or 2 (entries only): re-entry test, see ss_re_point */
+static void ss_re_point(ppu_context* ctx, ss_slot* s, unsigned t, int where);
+#endif
 
 static double ss_now(void)
 {
@@ -154,6 +160,9 @@ extern "C" void ppu_ss_point(ppu_context* ctx, int where, uint32_t num)
         while (__atomic_load_n(&s_ss_stop, __ATOMIC_ACQUIRE)) usleep(200);
         __atomic_store_n(&s->parked, 0, __ATOMIC_RELEASE);
     }
+#if defined(PORT_SAVE_STATES)
+    if (__builtin_expect(s_reenter, 0)) ss_re_point(ctx, s, t, where);
+#endif
     if (where == 1) { s->sc_num = num; __atomic_fetch_add(&s->dsc, 1, __ATOMIC_RELEASE); }
     else if (where == 3) { s->hle_nid = num; __atomic_fetch_add(&s->dhle, 1, __ATOMIC_RELEASE); }
 }
@@ -208,7 +217,7 @@ static const char* ss_sym(uintptr_t a, char* buf, size_t n)
     const char* nm = di.dli_sname;
     const char* f = strstr(nm, "func_");
     if (f && strstr(nm, "spu_func_")) { snprintf(buf, n, "S"); return buf; }
-    if (f && strlen(f) >= 13) { snprintf(buf, n, "F:%.8s", f + 5); return buf; }
+    if (f && strlen(f) >= 13) { snprintf(buf, n, strstr(f, ".cold") ? "C:%.8s" : "F:%.8s", f + 5); return buf; }
     if (!strcmp(nm, "lv2_syscall")) { snprintf(buf, n, "SC"); return buf; }
     if (!strncmp(nm, "ps3_hle_call", 12)) { snprintf(buf, n, "HLE"); return buf; }
     if (!strncmp(nm, "ps3_indirect_call", 17)) { snprintf(buf, n, "IC"); return buf; }
@@ -248,32 +257,46 @@ static void ss_mem(int probe);
 #define SS_WIN_T    (1u << 20)
 static uint8_t s_win[SS_WIN_MAX];
 
-static void ss_copy_stack(ss_rec* r, size_t* fill)
+/* The guest stack window of a thread: [sp, end of its back chain + 0x100), at most SS_WIN_T. */
+static void ss_win_range(const ss_rec* r, uint32_t* lo_, uint32_t* hi_)
 {
-    r->wlo = r->whi = 0; r->woff = *fill;
     uint32_t lo = r->sp & ~7u, hi = r->gtop + 0x100u;
     if (hi < lo || hi - lo > SS_WIN_T) hi = lo + SS_WIN_T;
     while (hi > lo && !ss_gok(lo, hi - lo)) hi -= 8;
-    if (hi <= lo || *fill + (hi - lo) > SS_WIN_MAX) return;
-    /* Guest stacks have guard pages (no access) between them: copy page by page
-     * through the kernel, which fails instead of faulting, and stop at the first
-     * page that cannot be read. */
+    *lo_ = lo; *hi_ = hi;
+}
+
+/* Copy guest [lo, hi) to dst. Guest stacks have guard pages (no access) between them: copy
+ * page by page through the kernel, which fails instead of faulting, and stop at the first page
+ * that cannot be read. Returns the end of what was copied. */
+static uint32_t ss_copy_guest(uint32_t lo, uint32_t hi, uint8_t* dst)
+{
     uint32_t a = lo;
     while (a < hi) {
         const uint32_t end = ((a & ~0x3FFFu) + 0x4000u) < hi ? ((a & ~0x3FFFu) + 0x4000u) : hi;
         vm_size_t got = 0;
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)(vm_base + a), end - a,
-                                   (vm_address_t)(uintptr_t)(s_win + *fill + (a - lo)), &got) != KERN_SUCCESS ||
+                                   (vm_address_t)(uintptr_t)(dst + (a - lo)), &got) != KERN_SUCCESS ||
             got != end - a)
             break;
         a = end;
     }
-    hi = a;
+    return a;
+}
+
+static void ss_copy_stack(ss_rec* r, size_t* fill)
+{
+    r->wlo = r->whi = 0; r->woff = *fill;
+    uint32_t lo, hi;
+    ss_win_range(r, &lo, &hi);
+    if (hi <= lo || *fill + (hi - lo) > SS_WIN_MAX) return;
+    hi = ss_copy_guest(lo, hi, s_win + *fill);
     if (hi <= lo) return;
     r->wlo = lo; r->whi = hi;
     *fill += hi - lo;
 }
 
+#define SS_H_COLD 7   /* a func_X.cold.N part; only between ss_classify and ss_fold_cold */
 static void ss_classify(uintptr_t a, ss_hframe* o)
 {
     o->cls = SS_H_OTHER; o->fn = 0;
@@ -286,13 +309,25 @@ static void ss_classify(uintptr_t a, ss_hframe* o)
         if (strlen(f) < 13) return;
         memcpy(hex, f + 5, 8); hex[8] = 0;
         const unsigned long v = strtoul(hex, &end, 16);
-        if (end == hex + 8) { o->cls = SS_H_FUNC; o->fn = (uint32_t)v; }
+        if (end == hex + 8) { o->cls = strstr(f, ".cold") ? SS_H_COLD : SS_H_FUNC; o->fn = (uint32_t)v; }
         return;
     }
     if (!strcmp(nm, "lv2_syscall")) o->cls = SS_H_SC;
     else if (!strncmp(nm, "ps3_hle_call", 12)) o->cls = SS_H_HLE;
     else if (!strncmp(nm, "ps3_indirect_call", 17)) o->cls = SS_H_IC;
     else if (!strncmp(nm, "OUTLINED_FUNCTION", 17)) o->cls = SS_H_OUTLINED;
+}
+
+/* Hot/cold splitting moves unlikely code of a lifted function, such as its resume block, into
+ * func_X.cold.N. A call made from there leaves two host frames for one guest frame: the cold
+ * part, then func_X that called it. Fold them into one SS_H_FUNC frame. */
+static void ss_fold_cold(ss_hframe* h, int nh)
+{
+    for (int i = 0; i < nh; i++) {
+        if (h[i].cls != SS_H_COLD) continue;
+        h[i].cls = SS_H_FUNC;
+        if (i + 1 < nh && h[i + 1].cls == SS_H_FUNC && h[i + 1].fn == h[i].fn) h[i + 1].cls = SS_H_OUTLINED;
+    }
 }
 
 static void ss_exact(int idx, int nrec)
@@ -309,6 +344,7 @@ static void ss_exact(int idx, int nrec)
             if (k == 1 && r->nh > 2 && r->h[1] == r->h[2]) continue;   /* LR register = first saved LR */
             ss_classify(r->h[k], &hf[nh++]);
         }
+        ss_fold_cold(hf, nh);
         const ss_gwin g = { r->wlo, r->whi, s_win + r->woff };
         ss_chain_info info;
         const int n = ss_chain_build(hf, nh, r->sp, r->lr, r->cia, r->parked ? r->where : 0, &g, out, 128, &info);
@@ -324,6 +360,155 @@ static void ss_exact(int idx, int nrec)
         }
     }
     fprintf(stderr, "[ss] exact probe %d: %d of %d threads ok\n", idx, ok, tried);
+}
+
+/* --- in-process re-entry test (SS_REENTER=1, with SS_PROBE) ----------------------------
+ * After each probe every thread is asked to re-enter at its next safe point (SS_REENTER=2: its
+ * next syscall or HLE entry, so the register check below runs every time). There it builds
+ * its own exact chain, unwinds its host stack back to ss_run (longjmp) and calls its outermost
+ * function in resume mode; the resume blocks rebuild the host stack from the chain. Nothing is
+ * saved or restored (guest memory and kernel objects stay as they are), so this tests only the
+ * resume code in the lifted functions. At a syscall or HLE entry the thread then meets the same
+ * point again at once, and its registers must be bit for bit the same ("same" / "diff"). */
+typedef void (*ss_ppu_fn)(ppu_context*);
+extern "C" void (*g_ss_run_hook)(ppu_context*, ss_ppu_fn);   /* ppu_loader.cpp */
+extern "C" ss_ppu_fn ppu_ss_lookup(uint32_t a);              /* ppu_loader.cpp */
+extern "C" void ppu_ss_icall_reset(void);                    /* ppu_loader.cpp */
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);  /* ppu_loader.cpp */
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;       /* ppu_loader.cpp */
+extern "C" void ss_resume_begin(const ss_rframe* f, int n);  /* ppu_ss_resume.cpp */
+
+#define SS_RE_SNAP offsetof(ppu_context, thread_id)   /* gpr .. cia */
+struct ss_re {
+    jmp_buf jb;
+    ppu_context* ctx;   /* while ss_run runs on this thread */
+    int n, check;       /* chain length; point (1 or 3) to compare at next, 0 none */
+    ss_rframe chain[128];
+    uint8_t snap[SS_RE_SNAP];
+};
+static thread_local ss_re tl_re;
+static int s_re_req[SS_MAX];
+static unsigned s_re_n[5], s_re_skip, s_re_same, s_re_diff, s_re_log;
+
+/* g_ss_run_hook: the thread entry trampoline and ppu_run call this instead of fn(ctx). */
+static void ss_run(ppu_context* ctx, ss_ppu_fn fn)
+{
+    ss_re* r = &tl_re;
+    volatile ss_ppu_fn f = fn;
+    const int outer = r->ctx == NULL;
+    if (outer) {
+        if (_setjmp(r->jb)) {
+            /* back from ss_re_point: no host frames above this one any more */
+            ppu_ss_icall_reset();
+            f = ppu_ss_lookup(r->chain[0].fn);
+            if (!f) { fprintf(stderr, "[ss] re: func_%08X not registered\n", r->chain[0].fn); abort(); }
+            ss_resume_begin(r->chain, r->n);
+            g_active_ctx = ctx;
+        }
+        r->ctx = ctx;
+    }
+    f(ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
+    if (outer) r->ctx = NULL;
+}
+
+__attribute__((used)) static int s_re_init =
+    (s_reenter = g_ss_on ? ss_env_int("SS_REENTER", 0) : 0, s_reenter > 0 ? (g_ss_run_hook = ss_run) : 0, 0);
+
+static const char* ss_ctx_field(size_t off)
+{
+    static thread_local char b[24];
+    if (off < offsetof(ppu_context, fpr)) snprintf(b, sizeof b, "r%zu", off / 8);
+    else if (off < offsetof(ppu_context, vr)) snprintf(b, sizeof b, "f%zu", (off - offsetof(ppu_context, fpr)) / 8);
+    else if (off < offsetof(ppu_context, cr)) snprintf(b, sizeof b, "v%zu", (off - offsetof(ppu_context, vr)) / 16);
+    else if (off < offsetof(ppu_context, lr)) return "cr";
+    else if (off < offsetof(ppu_context, ctr)) return "lr";
+    else if (off < offsetof(ppu_context, xer)) return "ctr";
+    else if (off < offsetof(ppu_context, fpscr)) return "xer";
+    else if (off < offsetof(ppu_context, cia)) return "fpscr/vscr";
+    else return "cia";
+    return b;
+}
+
+static void ss_re_skip(unsigned t, int where, const char* why, uint32_t fn)
+{
+    __atomic_add_fetch(&s_re_skip, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&s_re_log, 1, __ATOMIC_RELAXED) <= 60)
+        fprintf(stderr, "[ss] re t=%u where=%d skipped: %s (func_%08X)\n", t, where, why, fn);
+}
+
+static void ss_re_point(ppu_context* ctx, ss_slot* s, unsigned t, int where)
+{
+    ss_re* r = &tl_re;
+    if (r->check) {
+        const int w = r->check;
+        r->check = 0;
+        if (w == where && !memcmp(r->snap, ctx, SS_RE_SNAP)) __atomic_add_fetch(&s_re_same, 1, __ATOMIC_RELAXED);
+        else {
+            __atomic_add_fetch(&s_re_diff, 1, __ATOMIC_RELAXED);
+            size_t off = 0;
+            while (off < SS_RE_SNAP && r->snap[off] == ((const uint8_t*)ctx)[off]) off++;
+            fprintf(stderr, "[ss] re t=%u DIFF: expected point %d, got %d; first difference %s\n", t, w, where,
+                    off < SS_RE_SNAP ? ss_ctx_field(off) : "none");
+        }
+    }
+    if (!__atomic_load_n(&s_re_req[t], __ATOMIC_ACQUIRE)) return;
+    if (s_reenter == 2 && (where == 2 || where == 4)) return;   /* SS_REENTER=2: at call entries only */
+    __atomic_store_n(&s_re_req[t], 0, __ATOMIC_RELEASE);
+    if (r->ctx != ctx) { ss_re_skip(t, where, r->ctx ? "other context (guest callback)" : "not started through ss_run", 0); return; }
+
+    /* own host frames, innermost first (return addresses) */
+    const uintptr_t M = 0x00007FFFFFFFFFFFull;
+    ss_hframe hf[SS_HF];
+    int nh = 0;
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    while (nh < SS_HF && fp >= s->stk_lo && fp + 16 <= s->stk_hi && !(fp & 7)) {
+        const uintptr_t nfp = ((const uintptr_t*)fp)[0] & M;
+        ss_classify(((const uintptr_t*)fp)[1] & M, &hf[nh++]);
+        if (nfp <= fp) break;
+        fp = nfp;
+    }
+    ss_fold_cold(hf, nh);
+    /* the call this point is in must sit right under the innermost lifted frame
+     * (ps3_hle_call and ps3_hle_call_impl can both have a frame there) */
+    int i0 = -1;
+    for (int i = 0; i < nh; i++) if (hf[i].cls == SS_H_FUNC) { i0 = i; break; }
+    if (i0 < 1) { ss_re_skip(t, where, "no lifted frame", 0); return; }
+    const uint32_t want = where <= 2 ? SS_H_SC : SS_H_HLE;
+    int j = i0 - 1;
+    while (j >= 0 && hf[j].cls == want) j--;
+    for (int i = 0; i <= j; i++)
+        if (hf[i].cls == SS_H_SC || hf[i].cls == SS_H_HLE) { ss_re_skip(t, where, "syscall inside an HLE call", hf[i0].fn); return; }
+    if (j == i0 - 1) { ss_re_skip(t, where, "point not in a lifted call", hf[i0].fn); return; }
+
+    /* own guest stack */
+    ss_rec* gr = (ss_rec*)malloc(sizeof(ss_rec));
+    if (!gr) return;
+    ss_walk_guest(gr, ctx);
+    uint32_t lo, hi;
+    ss_win_range(gr, &lo, &hi);
+    uint8_t* buf = hi > lo ? (uint8_t*)malloc(hi - lo) : NULL;
+    if (buf) hi = ss_copy_guest(lo, hi, buf);
+    const ss_gwin g = { lo, buf ? hi : lo, buf };
+    ss_chain_info info;
+    const int n = ss_chain_build(hf, nh, gr->sp, gr->lr, (uint32_t)ctx->cia, where, &g, r->chain, 128, &info);
+    free(buf);
+    free(gr);
+    if (n <= 0) { ss_re_skip(t, where, info.why, info.fail_fn); return; }
+    r->n = n;
+    if (where == 1 || where == 3) { memcpy(r->snap, ctx, SS_RE_SNAP); r->check = where; }
+    __atomic_add_fetch(&s_re_n[where], 1, __ATOMIC_RELAXED);
+    _longjmp(r->jb, 1);
+}
+
+static void ss_re_mark(int idx)
+{
+    for (int t = 0; t < SS_MAX; t++)
+        if (__atomic_load_n(&s_ss[t].alive, __ATOMIC_ACQUIRE)) __atomic_store_n(&s_re_req[t], 1, __ATOMIC_RELEASE);
+    fprintf(stderr, "[ss] re (probe %d): re-entered %u (sc in %u, sc out %u, hle in %u, hle out %u), skipped %u; "
+                    "registers same %u, diff %u\n", idx,
+            s_re_n[1] + s_re_n[2] + s_re_n[3] + s_re_n[4], s_re_n[1], s_re_n[2], s_re_n[3], s_re_n[4], s_re_skip,
+            s_re_same, s_re_diff);
 }
 #endif
 
@@ -411,6 +596,7 @@ static void ss_probe(int idx, int wait_ms)
     }
 #if defined(PORT_SAVE_STATES)
     ss_exact(idx, nrec);
+    if (s_reenter) ss_re_mark(idx);
 #endif
     if (s_mem_every > 0 && (idx - 1) % s_mem_every == 0) ss_mem(idx);
     fflush(stderr);

@@ -2475,6 +2475,9 @@ extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
 #if defined(__APPLE__)
 /* Save states (ppu_ss_resume.cpp, PORT_SAVE_STATES): registry lookup for rebuilding a saved call chain. */
 extern "C" ppu_fn ppu_ss_lookup(uint32_t a) { return ppu_lookup(a); }
+/* Save-state test (ppu_ss_probe.cpp, SS_REENTER): when set, runs a thread's first guest function
+ * (and drains its trampoline) so a stopped thread can be unwound and re-entered. NULL otherwise. */
+extern "C" { void (*g_ss_run_hook)(ppu_context*, ppu_fn) = NULL; }
 #endif
 
 /* Correct native memmove override for the game's hand-optimized memmove at
@@ -3029,6 +3032,11 @@ static void itl_probe_274630(ppu_context* ctx)
  * their env switches, which turn this path off). Target 0, unregistered targets and the
  * depth cap still go through the impl. PS3_ICALL_FAST=0 or PS3_AB phase 2 -> old path. */
 static PPU_THREAD_LOCAL int s_icall_depth = 0;
+#if defined(__APPLE__)
+/* Save-state test (ppu_ss_probe.cpp, SS_REENTER): a thread unwound and re-entered through its
+ * saved chain has no indirect calls open on its host stack any more. */
+extern "C" void ppu_ss_icall_reset(void) { s_icall_depth = 0; g_vcall_sp = 0; }
+#endif
 extern "C" volatile int g_ab_mask;
 static int s_icall_fast = -1;
 static int s_icall_ab = 99;   /* v102: PS3_ICALL_FAST_AB=<phase> = A/B phase with the old path (default none; was phase 2) */
@@ -5363,6 +5371,9 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
         return;
     }
     g_active_ctx = ctx;
+#if defined(__APPLE__)
+    if (g_ss_run_hook) { g_ss_run_hook(ctx, fn); return; }
+#endif
     fn(ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
 }
@@ -5637,6 +5648,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
+#if defined(__APPLE__)
+    if (g_ss_run_hook) { g_ss_run_hook(&ctx, fn); return 0; }
+#endif
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;

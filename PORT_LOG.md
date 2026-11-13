@@ -52,8 +52,10 @@ Read this first every session. Newest entry on top.
   at a safe point in ≤1.3 ms; save ~233 MB (LZ4). Call chains are
   complete in 100/100 checks once bctrl sets the guest LR (now 0/100).
   Phase 1 (Mac, test build `PORT_SAVE_STATES`, default OFF): resume
-  chains work, 3600/3600 threads in 100 checks. Next: save file and
-  load. See entry "Save states phase 1: resume chains".
+  chains work, 3600/3600 threads in 100 checks. Re-entry test (live
+  threads thrown back and rebuilt from their chains): 1,947/1,947,
+  registers the same each time. Next: save file and load. See entries
+  "Save states: re-entry test" and "Save states phase 1: resume chains".
 - **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
   texture pool, stage ring and geometry memo in the background. iPhone:
   ~520 MB less in the background (1051 vs 1574 MB), clean resume.
@@ -134,6 +136,46 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-13 (evening) — Save states: re-entry test (Mac)
+
+### Re-entry test (Mac, test build only)
+
+- New test `SS_REENTER` (with `SS_PROBE`, `build-mac-ss` only). After
+  each check, every thread stops at its next safe point and builds its
+  chain. Then it jumps back (longjmp) to its start and rebuilds its
+  stack from the chain through the resume blocks. The game goes on.
+  This runs the load side on live threads, with no save file.
+  - `SS_REENTER=1`: at any safe point (before or after a system call or
+    HLE call).
+  - `SS_REENTER=2`: at call entries only. The call runs again, and the
+    registers at the second entry are compared with the first.
+- How: thread starts (`ppu_thread_entry_trampoline`, `ppu_run`) call a
+  hook (`g_ss_run_hook`, Apple only, NULL unless the test is on) that
+  sets the jump point. `ppu_ss_icall_reset` clears the indirect-call
+  depth counters the jump skips.
+- Two fixes found:
+  - Clang moves unlikely code, the resume block too, into
+    `func_X.cold.N` (18,267 functions in the ss build, 60 in the normal
+    build). After a re-entry the cold part has its own host frame, so
+    the main thread showed `func_00010230` twice and failed every later
+    check (35/36). The frame reader now folds a cold part into its
+    function.
+  - Every HLE entry point was skipped: `ps3_hle_call` and
+    `ps3_hle_call_impl` both have a frame there, and the check took the
+    second one for a nested call.
+- Result, 240 s each, 60 checks
+  (`$WORK_DIR/runs/20261113-154729-ss2-re3m1`, `...-155142-ss2-re3m2`):
+  - Mode 1: 1,947 re-entries (sc in 4, sc out 362, HLE in 29, HLE out
+    1,552), 0 skipped; registers the same 33/33.
+  - Mode 2: 1,947 re-entries (sc in 152, HLE in 1,795), 0 skipped;
+    **registers the same 1,947/1,947**.
+  - Both: every check 36/36 threads, the game ran to the end, no crash.
+- So chains and resume blocks rebuild live threads correctly. Left for
+  save and load: host state outside game memory (kernel objects, files,
+  SPU, RSX, audio).
 
 ---
 
