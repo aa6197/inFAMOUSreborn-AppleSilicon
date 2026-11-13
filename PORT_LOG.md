@@ -56,9 +56,11 @@ Read this first every session. Newest entry on top.
   threads thrown back and rebuilt from their chains): 1,947/1,947,
   registers the same each time. Save file writer works (236 MB, 36/36
   threads, frozen ~0.6 s, the game runs on). Load, PPU core: works
-  (memory, kernel, files, 36/36 threads back in 130 ms, no crash); the
-  game then waits, as graphics, audio and SPU work are not restored yet.
-  Next: those modules. See entries "Save states: load, PPU core",
+  (memory, kernel, files, 36/36 threads back in 130 ms, no crash).
+  Graphics (GCM / RSX) restore works: the walker runs on from the saved
+  FIFO spot and a flip goes through. The game then waits on SPU work.
+  Next: SPURS, the SPU task, audio. See entries "Save states: graphics",
+  "Save states: load, PPU core",
   "Save states: save file writer", "Save states: re-entry test" and
   "Save states phase 1: resume chains".
 - **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
@@ -141,6 +143,30 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-13 (evening) — Save states: graphics (Mac)
+
+### Graphics restore (Mac, test build only)
+
+- Save and load now carry the GCM / RSX state as "mod:" blobs
+  (`cellGcm_ss_blobs`, `rsx_draw_engine_ss_blobs`): display buffers,
+  IO map tables, handlers, labels, reports, the FIFO walker position and
+  its RSX state, the draw engine's register file.
+- Both hold the graphics still (`cellGcm_ss_hold`): the frame clock
+  parks at the top of its loop (`main.cpp`, Apple only) and the walker
+  lock is taken. On load this also waits for the backend to be up.
+- The load does not run `cellGcmInit` again (it zeroes the control
+  register). Host handler pointers, the SPU put hook and the engine's
+  display buffers are set again; the context goes live last.
+- Results: save (`runs/20261113-171205-ss-gsave1`, at 30 s): graphics
+  held after 1.2 ms; save check 1 page differs (was 3). Load
+  (`runs/20261113-171245-ss-gload1`): "graphics back (2 display
+  buffers)"; the walker runs and one flip goes through, then the game
+  waits on SPU jobs (SPURS not restored yet).
+- Normal Mac build still builds (the walker's state moved to file scope,
+  same behaviour; Windows code unchanged otherwise).
 
 ---
 

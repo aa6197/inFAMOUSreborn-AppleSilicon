@@ -1728,6 +1728,10 @@ static inline int gcm_state_word(rsx_state* st, u32 m, u32 d)
 }
 #endif
 
+/* The walker's own RSX state (file scope so a save state can carry it). */
+static rsx_state s_state;
+static int  s_inited = 0;
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1742,8 +1746,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
               _n = 0; _t0 = now;
           }
       } }
-    static rsx_state s_state;
-    static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
 
     /* A statically-linked libgcm (PS3 firmware modules -- ps1_netemu) never calls
@@ -4310,3 +4312,152 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
     s_fifo_getoff  = get;
     s_fifo_calloff = 0;
 }
+
+#if defined(__APPLE__)
+/* ---------------------------------------------------------------------------
+ * Save states (Apple). Only a PORT_SAVE_STATES build calls these
+ * (runtime/ppu/ppu_ss_probe.cpp: the save; runtime/ppu/ppu_ss_load.cpp: the load).
+ * The load does not run cellGcmInit again: it would zero the control register
+ * the guest already has back in its memory.
+ * -----------------------------------------------------------------------*/
+volatile int g_gcm_ss_park = 0;          /* the frame clock stops at the top of its loop */
+static volatile int s_ss_parked = 0;
+static u32 s_ss_ctx_ea = 0;              /* s_gcm_context_ea as saved: made live last */
+static u32 s_ss_user_command = 0;
+static u64 s_ss_user_pending = 0;
+
+/* Frame clock (infamous-recomp/main.cpp), top of its loop: wait while held.
+ * Returns 1 if it waited (the caller then restarts its vblank clock). */
+int cellGcm_ss_park_wait(void)
+{
+    if (!__atomic_load_n(&g_gcm_ss_park, __ATOMIC_ACQUIRE)) return 0;
+    __atomic_store_n(&s_ss_parked, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_gcm_ss_park, __ATOMIC_ACQUIRE)) Sleep(1);
+    __atomic_store_n(&s_ss_parked, 0, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* on = 1: park the frame clock (no vblank, flip, present or drain) and take the
+ * walker lock, so only the guest changes GCM / RSX state. It also waits for the
+ * backend: the frame clock starts it before its loop. Returns 0 if the clock did
+ * not park within 10 s. on = 0: let both go. */
+int cellGcm_ss_hold(int on)
+{
+    if (!on) {
+        ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+        __atomic_store_n(&g_gcm_ss_park, 0, __ATOMIC_RELEASE);
+        return 1;
+    }
+    __atomic_store_n(&g_gcm_ss_park, 1, __ATOMIC_RELEASE);
+    int ok = 0;
+    for (int i = 0; i < 10000 && !(ok = __atomic_load_n(&s_ss_parked, __ATOMIC_ACQUIRE)); i++) Sleep(1);
+    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    s_ss_ctx_ea = s_gcm_context_ea;
+    s_ss_user_command = (u32)atomic_load(&s_user_command);
+    s_ss_user_pending = (u64)atomic_load(&s_user_pending);
+    return ok;
+}
+
+void cellGcm_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+#define GCM_SS(name, v) add("gcm." name, (void*)&(v), sizeof(v))
+    extern u32 g_rsx_last_reference, g_rsx_aa_control;
+    GCM_SS("ctx_ea", s_ss_ctx_ea);
+    GCM_SS("init", s_gcm_initialized);
+    GCM_SS("flip_mode", s_flip_mode);
+    GCM_SS("flip_status", s_flip_status);
+    GCM_SS("flip_req", s_flip_request_count);
+    GCM_SS("debug", s_debug_level);
+    GCM_SS("dbuf", s_display_buffers);
+    GCM_SS("dbuf_set", s_display_buffer_set);
+    GCM_SS("dbuf_cur", s_current_display_buffer_id);
+    GCM_SS("flip_pending", s_flip_pending);
+    GCM_SS("fifo_flip_off", g_gcm_fifo_flip_off);
+    GCM_SS("config", s_config);
+    GCM_SS("local_pages", s_local_offset_page);
+    GCM_SS("control", s_control);
+    GCM_SS("io_table", s_io_address_table);
+    GCM_SS("ea_table", s_ea_address_table);
+    GCM_SS("local_alloc", s_local_mem_allocated);
+    GCM_SS("io_maps", s_io_mappings);
+    GCM_SS("io_map_n", s_io_mapping_count);
+    GCM_SS("drv_info", g_gcm_driver_info_ea);
+    GCM_SS("h_flip", s_flip_handler_opd);
+    GCM_SS("h_vblank", s_vblank_handler_opd);
+    GCM_SS("h_user", s_user_handler_opd);
+    GCM_SS("h_second_v", s_second_v_handler_opd);
+    GCM_SS("h_flip_code", s_flip_handler_code);
+    GCM_SS("h_vblank_code", s_vblank_handler_code);
+    GCM_SS("vblank_n", s_vblank_count);
+    GCM_SS("io_reserved", s_io_map_reserved);
+    GCM_SS("fifo_mode", s_default_fifo_mode);
+    GCM_SS("second_v_freq", s_second_v_frequency);
+    GCM_SS("vblank_freq", s_vblank_frequency);
+    GCM_SS("user_cmd", s_ss_user_command);
+    GCM_SS("user_pending", s_ss_user_pending);
+    GCM_SS("tiles", s_tiles);
+    GCM_SS("zcull", s_zcull);
+    GCM_SS("reports", s_report_data);
+    GCM_SS("labels", s_labels);
+    GCM_SS("drained_ea", g_gcm_fifo_drained_ea);
+    GCM_SS("ctx_out", s_gcm_ctx_out_ea);
+    GCM_SS("syscall_mode", s_gcm_syscall_mode);
+    GCM_SS("sema_off", s_sema_offset);
+    GCM_SS("getoff", s_fifo_getoff);
+    GCM_SS("ring_off", s_last_ring_off);
+    GCM_SS("calloff", s_fifo_calloff);
+    GCM_SS("ref_q", s_ref_q);
+    GCM_SS("ref_qhead", s_ref_qhead);
+    GCM_SS("ref_qtail", s_ref_qtail);
+    GCM_SS("spu_blk", s_spu_blk);
+    GCM_SS("spu_blk_w", s_spu_blk_w);
+    GCM_SS("walk_state", s_state);
+    GCM_SS("walk_inited", s_inited);
+    GCM_SS("last_flip_off", g_gcm_last_flip_off);
+    GCM_SS("flip_note_ctx", s_flip_note_ctx);
+    GCM_SS("io_alloc_next", s_io_alloc_next);
+    GCM_SS("notify", s_notify_data);
+    GCM_SS("fifo_size", s_default_fifo_size);
+    GCM_SS("uploads", s_uploads);
+    GCM_SS("upload_n", s_upload_n);
+    GCM_SS("rsx_ref", g_rsx_last_reference);
+    GCM_SS("rsx_aa", g_rsx_aa_control);
+#undef GCM_SS
+}
+
+/* After the blobs are back, with the hold taken: what the blobs cannot carry
+ * (host pointers, the engine's display buffers, the clock), then the context
+ * last, so the walker starts on a complete state. Returns the display buffers. */
+int cellGcm_ss_restore(void)
+{
+    s_flip_handler     = (CellGcmFlipHandler)(uintptr_t)s_flip_handler_opd;
+    s_vblank_handler   = (CellGcmVBlankHandler)(uintptr_t)s_vblank_handler_opd;
+    s_user_handler     = (CellGcmUserHandler)(uintptr_t)s_user_handler_opd;
+    s_second_v_handler = (CellGcmSecondVHandler)(uintptr_t)s_second_v_handler_opd;
+    gcm_update_handler_mask();
+    GCM_USER_STORE(s_ss_user_command);
+    GCM_USER_PENDING_STORE(s_ss_user_pending);
+    s_last_flip_time = get_timestamp_ns();
+    if (s_gcm_initialized) {
+        extern void (*g_spu_put_hook)(u32 ea, u32 size);
+        void gcm_note_spu_put(u32 ea, u32 size);
+        g_spu_put_hook = gcm_note_spu_put;
+    }
+    int nbuf = 0;
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++) {
+        if (!s_display_buffer_set[i]) continue;
+        nbuf++;
+        const CellGcmDisplayInfo* d = &s_display_buffers[i];
+        if (rsx_draw_engine_enabled())
+            rsx_draw_engine_set_display_buffer(i, 0, d->offset, d->pitch, d->width, d->height);
+    }
+    /* the backend starts with nothing bound: send everything again */
+    s_state.surface_dirty = s_state.viewport_dirty = s_state.blend_dirty = 1;
+    s_state.depth_dirty = s_state.stencil_dirty = s_state.texture_dirty = 1;
+    s_state.vertex_dirty = s_state.shader_dirty = s_state.vp_dirty = 1;
+    s_state.color_mask_dirty = s_state.alpha_dirty = 1;
+    { extern volatile u32 g_rsx_vp_gen; g_rsx_vp_gen++; }
+    __atomic_store_n(&s_gcm_context_ea, s_ss_ctx_ea, __ATOMIC_RELEASE);
+    return nbuf;
+}
+#endif

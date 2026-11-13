@@ -217,6 +217,11 @@ static int bg_trim_on(void)
     return on;
 }
 #endif
+#if defined(__APPLE__)
+/* Save states (PORT_SAVE_STATES builds): a save or load holds the clock here (cellGcmSys.c). */
+extern "C" volatile int g_gcm_ss_park;
+extern "C" int cellGcm_ss_park_wait(void);
+#endif
 static DWORD WINAPI frame_clock(LPVOID)
 {
 #if defined(PORT_IOS)
@@ -265,6 +270,9 @@ static DWORD WINAPI frame_clock(LPVOID)
     static int s_flat = -1;
     if (s_flat < 0) { const char* e = getenv("RSX_IDLE_SLEEP"); s_flat = (e && *e == '1') ? 1 : 0; }
     for (;;) {
+#if defined(__APPLE__)
+        if (g_gcm_ss_park && cellGcm_ss_park_wait()) next_tick = GetTickCount64();
+#endif
 #if defined(PORT_IOS)
         if (const int why = s_app_paused.load(std::memory_order_acquire)) {
             fprintf(stderr, "[ios] frame clock parked (%s)\n", why == 2 ? "in-game menu" : "app in background");

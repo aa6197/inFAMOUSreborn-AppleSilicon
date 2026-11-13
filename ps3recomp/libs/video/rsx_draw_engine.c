@@ -18,6 +18,7 @@
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5302,3 +5303,19 @@ u32 rsx_draw_engine_readback_center(void)
     return ((u32)px[3] << 24) | ((u32)px[0] << 16) |
            ((u32)px[1] << 8)  |  (u32)px[2];
 }
+
+#if defined(__APPLE__)
+/* Save states (Apple; runtime/ppu/ppu_ss_load.cpp, only a PORT_SAVE_STATES build
+ * calls these): the dispatcher's register file and program, around its host
+ * sink pointers. Surfaces, textures and pipelines are made again on use. */
+void rsx_draw_engine_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("eng.rsx_a", (void*)&g.rsx, offsetof(rsx_dispatch, sink));
+    add("eng.rsx_b", (void*)&g.rsx.in_begin_end, sizeof(rsx_dispatch) - offsetof(rsx_dispatch, in_begin_end));
+    add("eng.flip_buf", (void*)&g.last_flip_buffer, sizeof g.last_flip_buffer);
+}
+void rsx_draw_engine_ss_restore(void)
+{
+    g.rsx.constants_gen++;   /* nothing the backend holds matches it */
+}
+#endif
