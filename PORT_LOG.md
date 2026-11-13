@@ -29,8 +29,8 @@ Read this first every session. Newest entry on top.
   (start: ~14), ~31 cool. Goal: high 30s. The hot phone is CPU-bound:
   GPU-only cuts no longer raise fps. Two short freezes came back in
   rounds 7–8 (open). See entries "iPhone: in-run A/B, profile, ..." and
-  "iPhone: lane workers at higher priority". 11-13 in-run test: ~37–43
-  at default; 360p +28%, near-only shadows +6%.
+  "iPhone: lane workers at higher priority". 11-13: full run 32.2 /
+  28.6 hot, no freezes; 360p +28%, shadows off +7%, near-only +6%.
 - **11-12 evening (iPad only):** shadows cost ~10% on the iPad; new
   Shadows setting (On / Near only / Off, default On). Three exact RSX
   thread trims (plan memo, program reuse, dead-method skip), each small.
@@ -170,16 +170,18 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 - Resolution 720p → 360p: 37.3 → 47.6 flips/s (+27.7%), thermal fair.
 - Shadows All → Near only: 43.2 → 45.8 (+6.0%), thermal serious.
-- Shadows Off and the flash check: no data (Control Center was open on
-  the phone). Re-run when the phone is free and charged.
+- Shadows All → Off: 31.3 → 33.5 (+7.1%), thermal serious (re-run at
+  11:37; the first try had no data, the app was in the background).
+- Flash check on that run (`ZS_SUB_WATCH=1`): 0 bad reads at
+  0x01AB8000, 122 kept as colour. Clean on the iPhone too.
 
 ### Speed now (11-13)
 
 - Mac static scene 99.2 / 100.7 flips/s (was ~92).
 - iPad 53.8 / 53.0 (11-11: 55.6 / 51.9, same within noise).
-- iPhone ~37–43 at default in the in-run test (a 300 s window, so not
-  the same test as the 11-12 ~23 hot / ~31 cool). A full-run baseline
-  is still to do.
+- iPhone full 330 s run, default settings, thermal serious: **32.2 /
+  28.6** steady, no freezes (11-12 hot: ~23). Runs
+  `20261113-114657-iphone-base1113a` and `-115309-iphone-base1113b`.
 
 ## 2026-11-13 — Yellow/blue flash fix always on
 
