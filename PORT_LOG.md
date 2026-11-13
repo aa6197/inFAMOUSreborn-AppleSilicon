@@ -67,8 +67,9 @@ Read this first every session. Newest entry on top.
   and a save on the way to the background work (save ~0.55 s, load
   ~0.3–0.55 s, gameplay after a load). **iPhone (11-13):** the same
   works (save ~0.8 s, load ~0.5 s). Movies after a load work again
-  (the Bink decoder thread is saved and started again). Next: a save
-  in the middle of the iPhone intro movie, then Mac. See entries
+  (the Bink decoder thread is saved and started again), also a save
+  made in the middle of a movie. iOS save states done; next: Mac.
+  See entries
   "Save states: movies after a load", "Save states on iPad",
   "Save states: clocks", "Save states: audio",
   "Save states: SPURS taskset task",
@@ -194,8 +195,14 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | Load of it | ok: load 289 ms, decoder back, gameplay runs on |
 | Normal iOS build | compiles |
 
-- Not tested yet: a save in the middle of a full-screen movie. The iPad
-  skips 01_intro.bik (it goes to gameplay), so this needs the iPhone.
+
+iPhone 16 Pro, after the fix (the iPad skips 01_intro.bik, the iPhone
+plays it at boot):
+
+| Test | Result |
+|---|---|
+| Save at 60 s, during 01_intro.bik (run 201824) | ok: SPU threads 1 held, frozen 666 ms, total 738 ms |
+| Load of it (run 201947) | ok: SPU threads back (1 started), load 266 ms; the movie plays on, then the in-engine intro, then the tutorial (gameplay at 102 s and 149 s) |
 
 ### iPhone 16 Pro results (save-state build, before the fix)
 
@@ -205,7 +212,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | Background save (same run) | ok: 0.88–1.2 s |
 | Menu "Load state" ×2, next start (runs 194338, 194426) | ok: load ~0.47 s, gameplay runs on |
 | Menu fits the iPhone screen | ok (rows shrink to fit) |
-| Save during the intro movie (runs 193429, 193710) | hung after the load: fixed above, re-test on the iPhone |
+| Save during the intro movie (runs 193429, 193710) | hung after the load: fixed above (run 201947) |
 
 ## 2026-11-13 (evening) — Save states on iPad: menu Save / Load, background save
 
