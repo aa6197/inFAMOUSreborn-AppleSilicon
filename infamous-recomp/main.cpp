@@ -279,7 +279,12 @@ static DWORD WINAPI frame_clock(LPVOID)
             const int trim = why == 1 && bg_trim_on();
             if (trim) rsx_metal_backend_bg_trim();
             s_rsx_parked.store(1, std::memory_order_release);
-            while (s_app_paused.load(std::memory_order_acquire)) usleep(10000);
+            /* a save from the in-game menu or on the way to the background (save-state
+             * builds) parks the clock here too: answer it, or the save waits forever */
+            while (s_app_paused.load(std::memory_order_acquire)) {
+                if (g_gcm_ss_park) ss_gcm_park_wait();
+                else usleep(10000);
+            }
             if (trim) rsx_metal_backend_bg_restore();
             s_rsx_parked.store(0, std::memory_order_release);
             next_tick = GetTickCount64();   /* resume on time: no burst of missed vblanks */
