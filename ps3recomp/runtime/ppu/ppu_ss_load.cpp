@@ -19,7 +19,9 @@
  *
  * Graphics: the GCM / RSX state comes back with the frame clock parked
  * (ss_gcm_hold); the walker then carries on from the saved FIFO position.
- * Not yet: audio, SPURS and SPU tasks (the next steps).
+ * SPURS: the workload tables and the persistent policy-module contexts come back,
+ * then the kernel threads start again (they were parked between passes at the save).
+ * Not yet: audio, SPURS taskset tasks and the HLE libraries (the next steps).
  */
 #if defined(__APPLE__)
 
@@ -56,6 +58,9 @@ extern "C" int  ss_gcm_hold(int on);
 extern "C" int  ss_gcm_restore(void);
 extern "C" void rsx_draw_engine_ss_blobs(ss_add_fn add);      /* libs/video/rsx_draw_engine.c */
 extern "C" void rsx_draw_engine_ss_restore(void);
+extern "C" void ss_spurs_blobs(ss_add_fn add);            /* libs/spurs/cellSpurs.c */
+extern "C" int  ss_spurs_restore(void);
+extern "C" int  spurs_pm_ss_load(const uint8_t* p, uint64_t n);   /* runtime/spu/spurs_policy.c */
 extern "C" int  ss_site_has(uint32_t fn, uint64_t key);       /* ppu_ss_resume.cpp */
 
 #define SS_NID_LWCOND_WAIT 0x2A6D9D51u
@@ -72,6 +77,7 @@ static void ss_mods_do(void)
     sys_vm_ss_blobs(ss_file_mod_add);
     ss_gcm_blobs(ss_file_mod_add);
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
+    ss_spurs_blobs(ss_file_mod_add);
 }
 extern "C" void ss_mods_init(void)
 {
@@ -264,6 +270,10 @@ static int ss_load_all(const char* path)
         abort();
     }
     const double t_mem = ss_lnow() - s_t0;
+    uint64_t pm_n = 0;
+    const uint8_t* pm = ss_file_sec(in, "spurs.pm", &pm_n);
+    const int npm = pm ? spurs_pm_ss_load(pm, pm_n) : 0;
+    if (npm < 0) { fprintf(stderr, "[ss] load FAILED: SPURS policy contexts do not fit this build\n"); abort(); }
     ss_file_in_free(in);
 
     rsx_draw_engine_ss_restore();
@@ -276,6 +286,9 @@ static int ss_load_all(const char* path)
     const int nf = ppu_fs_ss_restore(&flost);
     fprintf(stderr, "[ss] load: memory %u ranges, %.0f MB in %.0f ms; %d lwmutexes; %d files reopened, %d lost\n",
             ms.ranges, ms.nonzero / 1048576.0, t_mem * 1000.0, nlwm, nf, flost);
+
+    const int nsi = ss_spurs_restore();
+    fprintf(stderr, "[ss] load: SPURS back (%d instances, %d policy contexts)\n", nsi, npm);
 
     const int ns = ss_start_threads();
     if (ns < 0) { fprintf(stderr, "[ss] load FAILED: threads\n"); abort(); }

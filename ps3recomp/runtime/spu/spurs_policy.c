@@ -205,6 +205,60 @@ void spurs_pm_force_fresh(uint32_t wid)
 
 static spu_context* volatile s_pm_ctx_pub[16][6];   /* v31h: mirror of s_pm_ctx for the hang dump */
 static volatile uint64_t s_pm_data_pub[16][6];
+/* The persistent context of each (workload, virtual SPU) and the workload data it last
+ * ran with (spu_run_policy_module). File scope so a save state can carry them. */
+static spu_context* s_pm_ctx[16][6];
+static uint64_t s_pm_data[16][6];
+
+#if defined(__APPLE__)
+/* Save states (Apple): the persistent PM contexts. The save runs while every SPURS
+ * kernel thread is parked between passes (cellSpurs.c), so no context is in use.
+ * Section: u32 count, then per context one record and the whole spu_context. */
+typedef struct { uint32_t wid, lane; uint64_t data; uint32_t fresh, size; } spurs_pm_ss_rec;
+void spurs_pm_ss_save(void (*put)(void*, const void*, size_t), void* o)
+{
+    uint32_t n = 0;
+    for (uint32_t w = 0; w < 16; w++) for (uint32_t l = 0; l < 6; l++) if (s_pm_ctx[w][l]) n++;
+    put(o, &n, 4);
+    for (uint32_t w = 0; w < 16; w++) for (uint32_t l = 0; l < 6; l++) {
+        const spu_context* c = s_pm_ctx[w][l];
+        if (!c) continue;
+        const spurs_pm_ss_rec r = { w, l, s_pm_data[w][l], s_pm_force_fresh[w][l], (uint32_t)sizeof(spu_context) };
+        put(o, &r, sizeof r);
+        put(o, c, sizeof *c);
+    }
+}
+/* Before the kernel threads start again. Returns the contexts loaded, -1 if the
+ * section does not fit this build. */
+int spurs_pm_ss_load(const uint8_t* p, uint64_t n)
+{
+    uint32_t cnt;
+    if (n < 4) return -1;
+    memcpy(&cnt, p, 4); p += 4; n -= 4;
+    int done = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        spurs_pm_ss_rec r;
+        if (n < sizeof r) return -1;
+        memcpy(&r, p, sizeof r); p += sizeof r; n -= sizeof r;
+        if (r.size != sizeof(spu_context) || n < r.size || r.wid >= 16 || r.lane >= 6) return -1;
+        spu_context* c = s_pm_ctx[r.wid][r.lane];
+        if (!c && !(c = (spu_context*)malloc(sizeof *c))) return -1;
+        memcpy(c, p, sizeof *c); p += r.size; n -= r.size;
+        c->ls = c->ls_store;                        /* a PM context runs in its own LS */
+        c->ch_wait_cv = NULL; c->ch_wait_lock = NULL;   /* host objects, made again on first use */
+        c->irq_frame = NULL;                        /* between runs: no host frame */
+        c->ch_out_mbox.lock = 0; c->ch_in_mbox.lock = 0; c->ch_out_intr_mbox.lock = 0;
+        c->ch_sig_notify[0].lock = 0; c->ch_sig_notify[1].lock = 0;
+        if (c->resv_valid) { c->resv_valid = 0; c->event_status |= 0x400u; }   /* SPU_EVENT_LR: reservation lost (always legal) */
+        s_pm_ctx[r.wid][r.lane] = c;
+        s_pm_data[r.wid][r.lane] = r.data;
+        s_pm_force_fresh[r.wid][r.lane] = (unsigned char)r.fresh;
+        s_pm_ctx_pub[r.wid][r.lane] = c; s_pm_data_pub[r.wid][r.lane] = r.data;
+        done++;
+    }
+    return done;
+}
+#endif
 /* v31h: hang-dump view of every lane's persistent PM context of one workload. */
 void spurs_pm_dump_lanes(uint32_t wid)
 {
@@ -271,8 +325,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
-    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
+    enum { SPURS_PM_MAX_WKL = 16 };   /* s_pm_ctx / s_pm_data: file scope, above */
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
     int first = 0;
@@ -294,7 +347,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * masks 0x1270/0x1280, records) into queue B made the PM see stale
      * state and claim nothing (observed: LBP's second loading queue sat at
      * lanes {0,...} while the first drained fine). */
-    static uint64_t s_pm_data[SPURS_PM_MAX_WKL][6];
     if (!ctx) {
         ctx = (spu_context*)malloc(sizeof(spu_context));
         if (!ctx) return -1;

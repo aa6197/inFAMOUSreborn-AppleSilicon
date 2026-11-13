@@ -495,6 +495,20 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 
 struct SpursKArg { struct SpursInst* si; u32 part; u32 nparts; };
 
+#if defined(__APPLE__)
+/* Save states (Apple): a save parks every kernel thread at the top of its loop,
+ * between passes. No policy module runs there: lane workers are joined inside
+ * the pass. */
+volatile int g_spurs_ss_park = 0;
+static volatile long s_ss_kthreads = 0, s_ss_kparked = 0;
+static void spurs_ss_park_point(void)
+{
+    __atomic_add_fetch(&s_ss_kparked, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&g_spurs_ss_park, __ATOMIC_ACQUIRE)) usleep(200);
+    __atomic_sub_fetch(&s_ss_kparked, 1, __ATOMIC_SEQ_CST);
+}
+#endif
+
 /* v29 SPURS_WKL_SOLO (default "0"; empty or "-" = off): comma-separated wids that each
  * get a DEDICATED kernel thread (threads 0..nsolo-1) on multi-SPU instances; the
  * other wids are spread over the remaining threads by wid % n. [pm-time] (with the
@@ -828,6 +842,37 @@ static u32 spurs_wkl_part(u32 wid, u32 nparts, int solo)
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 static void spurs_freeze_dump(const char* why);   /* v103B: F8 dump of every workload + lane */
 
+static void spurs_kernel_start(struct SpursInst* si)
+{
+    si->kernel_live = 1;
+    /* SPURS_WKL_THREADS (2026-10-04, default = nSpus, max 6): several
+     * kernel threads per instance, each owning a FIXED subset of workloads
+     * (wid % n == part). A workload only ever runs on its own thread and
+     * still visits its lanes in order every pass (SEQ_LANES), so per-workload
+     * behaviour is unchanged; different workloads run concurrently, as on
+     * real SPUs. One thread ran all of inFamous' 9 workloads x 5 lanes in
+     * turn and the main thread waited on it every frame. =1 -> old model. */
+    /* v30: default 7 for a multi-SPU instance (was nSpus = 5), cap 12. Each
+     * workload still runs on exactly ONE host thread with its lanes in order;
+     * more threads only means fewer unrelated workloads queue behind each
+     * other (v29: t2 = w1+w6+w11 and t5 = w4+w9 ran at ~90%). Host SPUs are
+     * slower than real ones, so more host threads than SPUs is fine (28-thread CPU). */
+    u32 nparts = si->nspus > 1 ? 7u : 1u;
+    { const char* e = getenv("SPURS_WKL_THREADS"); if (e) nparts = (u32)atoi(e); }
+    if (nparts < 1) nparts = 1;
+    if (nparts > 12) nparts = 12;
+    /* v29: + one dedicated thread per SPURS_WKL_SOLO wid (multi-SPU instances). */
+    spurs_wkl_map_init();
+    if (si->nspus > 1 && nparts > 1 && s_nsolo) { si->solo = 1; nparts += s_nsolo; }
+    for (u32 t = 0; t < nparts; t++) {
+        struct SpursKArg* ka = (struct SpursKArg*)malloc(sizeof *ka);
+        ka->si = si; ka->part = t; ka->nparts = nparts;
+        CreateThread(NULL, 1u << 20, spurs_kernel_thread, ka, 0, NULL);
+    }
+    fprintf(stderr, "[spurs-kern] \"%s\" %u kernel thread(s) (SPURS_WKL_THREADS, %u solo)\n",
+            si->prefix, nparts, si->solo ? s_nsolo : 0u);
+}
+
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
     { extern void (*volatile g_ps3_fz_spurs_dump)(const char*); g_ps3_fz_spurs_dump = spurs_freeze_dump; }   /* sys_ppu_thread.c */
@@ -850,35 +895,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
-    if (!si->kernel_live) {
-        si->kernel_live = 1;
-        /* SPURS_WKL_THREADS (2026-10-04, default = nSpus, max 6): several
-         * kernel threads per instance, each owning a FIXED subset of workloads
-         * (wid % n == part). A workload only ever runs on its own thread and
-         * still visits its lanes in order every pass (SEQ_LANES), so per-workload
-         * behaviour is unchanged; different workloads run concurrently, as on
-         * real SPUs. One thread ran all of inFamous' 9 workloads x 5 lanes in
-         * turn and the main thread waited on it every frame. =1 -> old model. */
-        /* v30: default 7 for a multi-SPU instance (was nSpus = 5), cap 12. Each
-         * workload still runs on exactly ONE host thread with its lanes in order;
-         * more threads only means fewer unrelated workloads queue behind each
-         * other (v29: t2 = w1+w6+w11 and t5 = w4+w9 ran at ~90%). Host SPUs are
-         * slower than real ones, so more host threads than SPUs is fine (28-thread CPU). */
-        u32 nparts = si->nspus > 1 ? 7u : 1u;
-        { const char* e = getenv("SPURS_WKL_THREADS"); if (e) nparts = (u32)atoi(e); }
-        if (nparts < 1) nparts = 1;
-        if (nparts > 12) nparts = 12;
-        /* v29: + one dedicated thread per SPURS_WKL_SOLO wid (multi-SPU instances). */
-        spurs_wkl_map_init();
-        if (si->nspus > 1 && nparts > 1 && s_nsolo) { si->solo = 1; nparts += s_nsolo; }
-        for (u32 t = 0; t < nparts; t++) {
-            struct SpursKArg* ka = (struct SpursKArg*)malloc(sizeof *ka);
-            ka->si = si; ka->part = t; ka->nparts = nparts;
-            CreateThread(NULL, 1u << 20, spurs_kernel_thread, ka, 0, NULL);
-        }
-        fprintf(stderr, "[spurs-kern] \"%s\" %u kernel thread(s) (SPURS_WKL_THREADS, %u solo)\n",
-                si->prefix, nparts, si->solo ? s_nsolo : 0u);
-    }
+    if (!si->kernel_live) spurs_kernel_start(si);
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
     return CELL_OK;
@@ -4131,6 +4148,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 #endif
     struct SpursInst* si = ka->si;
     const u32 k_part = ka->part, k_nparts = ka->nparts;
+#if defined(__APPLE__)
+    __atomic_add_fetch(&s_ss_kthreads, 1, __ATOMIC_SEQ_CST);   /* save states: threads to park */
+#endif
 #ifdef _WIN32
     /* Instance 0 / part 0 owns inFamous' main CTaskMgr workload (wid 0).
      * Match its lane helpers' policy without forcing the other kernel threads
@@ -4209,6 +4229,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     { const char* e = getenv("PS3_SPURS_PCORE"); if ((int)(si - s_inst) == 0 && k_part == 0 && e && *e && *e != '0') k_w0_pin = 1; }
 #endif
     for (;;) {
+#if defined(__APPLE__)
+        if (g_spurs_ss_park) spurs_ss_park_point();   /* save states: between passes */
+#endif
         /* v221A: publish the wids the pass that just ended dispatched (ps3_spurs_kick_wid's owner map) */
         if (kick_slot >= 0 && k_owned_new && s_kick_own[kick_slot] != k_owned_new)
             s_kick_own[kick_slot] = k_owned_new;
@@ -6461,3 +6484,70 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
     if ((_n < 8 && _n++ < 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* ---------------------------------------------------------------------------
+ * Save states (Apple; runtime/ppu/ppu_ss_probe.cpp saves, ppu_ss_load.cpp loads).
+ * The tables below are saved as raw bytes; the persistent policy-module contexts
+ * go in their own section (spurs_policy.c). Host-only state (event flag side
+ * table, lane pools, kick events, PM image lookup) is made again on first use.
+ * -----------------------------------------------------------------------*/
+/* on = 1: park every kernel thread between passes (waits up to ~5 s). No stdio
+ * here: the save calls it while the PPU threads are suspended. */
+int ss_spurs_hold(int on, long* threads, long* parked)
+{
+    if (!on) { __atomic_store_n(&g_spurs_ss_park, 0, __ATOMIC_RELEASE); return 1; }
+    __atomic_store_n(&g_spurs_ss_park, 1, __ATOMIC_SEQ_CST);
+    long n = 0, p = 0;
+    for (int i = 0; i < 5000; i++) {
+        n = __atomic_load_n(&s_ss_kthreads, __ATOMIC_ACQUIRE);
+        p = __atomic_load_n(&s_ss_kparked, __ATOMIC_ACQUIRE);
+        if (p >= n) break;
+        usleep(1000);
+    }
+    if (threads) *threads = n;
+    if (parked) *parked = p;
+    return p >= n;
+}
+
+void ss_spurs_blobs(void (*add)(const char*, void*, size_t))
+{
+#define SPURS_SS(nm, v) add("spurs." nm, (void*)&(v), sizeof(v))
+    SPURS_SS("inst", s_inst);
+    SPURS_SS("wkl", s_workloads);
+    SPURS_SS("wkl_gen", s_wkl_gen);
+    SPURS_SS("tasks", s_tasks);
+    SPURS_SS("next_task", s_next_task_id);
+    SPURS_SS("evq", s_spurs_event_queue);
+    SPURS_SS("evq_owner", s_spurs_event_queue_owner);
+    SPURS_SS("evq_n", s_spurs_event_queue_n);
+    SPURS_SS("port_q", s_spurs_port_queue);
+    SPURS_SS("jobchains", s_jobchains);
+    SPURS_SS("real_ts", g_ydkj_real_taskset_ea);
+    SPURS_SS("real_task", g_ydkj_real_taskid);
+    SPURS_SS("real_spurs", g_ydkj_real_spurs_ea);
+#undef SPURS_SS
+}
+
+/* After the tables are back: start the kernel threads of every instance again.
+ * Returns the number of instances. */
+int ss_spurs_restore(void)
+{
+    { extern void (*volatile g_ps3_fz_spurs_dump)(const char*); g_ps3_fz_spurs_dump = spurs_freeze_dump; }
+    for (int i = 0; i < MAX_JOBCHAINS; i++)
+        if (s_jobchains[i].running) {
+            fprintf(stderr, "[ss] spurs: job chain 0x%08X was running at the save (not resumed)\n", s_jobchains[i].jc_ea);
+            s_jobchains[i].running = 0;
+        }
+    int n = 0;
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        si->kernel_live = 0;
+        if (!si->ea) continue;
+        si->solo = 0;   /* spurs_kernel_start sets it again */
+        spurs_kernel_start(si);
+        n++;
+    }
+    return n;
+}
+#endif

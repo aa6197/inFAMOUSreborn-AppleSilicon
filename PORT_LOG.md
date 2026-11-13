@@ -58,8 +58,9 @@ Read this first every session. Newest entry on top.
   threads, frozen ~0.6 s, the game runs on). Load, PPU core: works
   (memory, kernel, files, 36/36 threads back in 130 ms, no crash).
   Graphics (GCM / RSX) restore works: the walker runs on from the saved
-  FIFO spot and a flip goes through. The game then waits on SPU work.
-  Next: SPURS, the SPU task, audio. See entries "Save states: graphics",
+  FIFO spot and a flip goes through. SPURS restore works: the title
+  runs on after a load. Next: the SPURS taskset task, audio. See entries
+  "Save states: SPURS", "Save states: graphics",
   "Save states: load, PPU core",
   "Save states: save file writer", "Save states: re-entry test" and
   "Save states phase 1: resume chains".
@@ -145,6 +146,30 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: SPURS (Mac)
+
+### SPURS restore (Mac, test build only)
+
+- The save parks every SPURS kernel thread at the top of its pass loop
+  (`ss_spurs_hold`), after the PPU threads are suspended. Lane workers
+  are joined inside a pass, so no policy module is running there.
+- Saved: instance and workload tables, tasks, event queues, job chains
+  (`mod:spurs.*` blobs), and every persistent policy-module context
+  (section `spurs.pm`: 51 contexts, ~265 KB each, LS included).
+- Load: the contexts come back (host lock and wait pointers cleared, a
+  held reservation is reported as lost), then each instance starts its
+  kernel threads again. `spurs_kernel_start` was moved out of
+  `spurs_initialize_common` unchanged, so Windows runs the same code.
+  `s_pm_ctx` / `s_pm_data` moved to file scope (same behaviour).
+- Results: save (`runs/20261113-172230-ss-spsave1`, at 30 s): 12 of 12
+  kernel threads parked after 1.2 ms; save check 1 page differs. Load
+  (`runs/20261113-172411-ss-spload1`): "SPURS back (2 instances, 51
+  policy contexts)". The title screen runs on (~117 flips/s headless;
+  a normal run ~89), Cole walks across it.
+- Still to do: the SPURS taskset task (runs on its own thread, not
+  saved yet), audio, clocks.
+- Normal Mac build builds and boots to the title.
 
 ## 2026-11-13 (evening) — Save states: graphics (Mac)
 
