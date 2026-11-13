@@ -804,6 +804,21 @@ int64_t sys_timer_stop(ppu_context* ctx)
  * or fixed syscall numbers should be assigned.
  * For now, we register the timer-specific syscalls that don't collide.
  * -----------------------------------------------------------------------*/
+#if defined(__APPLE__)
+void sys_timer_ss_restart(void)
+{
+    for (int i = 0; i < SYS_TIMER_MAX; i++) {
+        sys_timer_info* t = &g_sys_timers[i];
+        if (!t->active) continue;
+        pthread_mutex_init(&t->mtx, NULL);
+        pthread_cond_init(&t->cv, NULL);
+        t->stop_flag = 0;
+        t->thread = 0;
+        if (t->running && pthread_create(&t->thread, NULL, timer_thread_proc, t) != 0) t->running = 0;
+    }
+}
+#endif
+
 void sys_timer_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_timers, 0, sizeof(g_sys_timers));

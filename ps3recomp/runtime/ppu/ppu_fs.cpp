@@ -170,6 +170,22 @@ static int fs_is_story_cutscene(const char* gpath)
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
+#if defined(__APPLE__)
+/* Save states (ppu_fs_ss_blobs / ppu_fs_ss_restore): how each fd was opened and its file
+ * position, kept up to date by every call that moves it, so a load can reopen it.
+ * Kind 1 cellFsOpen (g_fd_flags = its CELL_FS_O_* flags), 2 SdataOpen of a plain file,
+ * 3 SdataOpen served from a tmpfile (cannot be reopened). */
+static int64_t  g_fd_off[FS_MAX];
+static uint32_t g_fd_flags[FS_MAX];
+static uint8_t  g_fd_kind[FS_MAX];
+#define FS_SS_SET(fd, kind, flags) (g_fd_kind[fd] = (uint8_t)(kind), g_fd_flags[fd] = (flags), g_fd_off[fd] = 0)
+#define FS_SS_OFF(fd, v) (g_fd_off[fd] = (int64_t)(v))
+#define FS_SS_ADD(fd, n) (g_fd_off[fd] += (int64_t)(n))
+#else
+#define FS_SS_SET(fd, kind, flags) ((void)0)
+#define FS_SS_OFF(fd, v) ((void)0)
+#define FS_SS_ADD(fd, n) ((void)0)
+#endif
 
 static int fd_alloc_file(FILE* f)
 {
@@ -239,6 +255,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FS_SS_SET(fd, 1, flags);
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     g_fd_cut[fd] = (uint8_t)fs_is_story_cutscene(gpath);
@@ -339,6 +356,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         rewind(tf);
         int fd = fd_alloc_file(tf);
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        FS_SS_SET(fd, 3, 0);
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
                 gpath, fd, dec_sz,
@@ -349,6 +367,10 @@ static void cellFsSdataOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FS_SS_SET(fd, 2, 0);
+#if defined(__APPLE__)
+    snprintf(g_fd_path[fd], sizeof g_fd_path[fd], "%s", gpath);   /* save states reopen it by path */
+#endif
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
@@ -403,6 +425,7 @@ static void cellFsRead(ppu_context* ctx)
     fs_prefault(buf, nbytes);
     const unsigned long long _hz0 = hz_tsc();   /* v225A */
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    FS_SS_ADD(fd, n);
     { const long long _hzd = (long long)(hz_tsc() - _hz0); hz_add(HZ_FS_TSC, _hzd); hz_add(HZ_FS_N, 1); hz_add(HZ_FS_BYTES, (long long)n);
       if (ps3_hz_is_main()) { hz_add(HZ_FS_MAIN_TSC, _hzd); hz_add(HZ_FS_MAIN_N, 1); } }
     /* v114 FS_READ_DELAY_MS=<ms> (default 0 = off): CAUSAL TEST, not a fix. Sleep after every exactly-64 KB
@@ -479,6 +502,7 @@ static void cellFsWrite(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    FS_SS_OFF(fd, ftello(g_files[fd]));   /* append mode writes at the end */
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -562,6 +586,7 @@ static void cellFsLseek(ppu_context* ctx)
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
     fseek(g_files[fd], (long)off, worigin);
     long p = ftell(g_files[fd]);
+    FS_SS_OFF(fd, p);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -788,8 +813,10 @@ static void cellFsAioRead(ppu_context* ctx)
         /* AIO reads are absolute -- they do not disturb the fd's own file
          * position, and the guest interleaves them freely across threads. */
         const unsigned long long _hz0 = hz_tsc();   /* v225A */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
+        if (HOST_FSEEK64(g_files[fd], offset) == 0) {
             n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+            FS_SS_OFF(fd, offset + n);
+        }
         { const long long _hzd = (long long)(hz_tsc() - _hz0); hz_add(HZ_FS_TSC, _hzd); hz_add(HZ_FS_N, 1); hz_add(HZ_FS_BYTES, (long long)n);
           if (ps3_hz_is_main()) { hz_add(HZ_FS_MAIN_TSC, _hzd); hz_add(HZ_FS_MAIN_N, 1); } }
         err = CELL_OK;
@@ -834,3 +861,69 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
     ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
 }
+
+#if defined(__APPLE__)
+/* --- save states (Apple, PORT_SAVE_STATES builds call these) ------------------------- */
+/* The fd tables as raw bytes. g_files / g_dirs hold host pointers: a load only uses
+ * "open or not" from them, and ppu_fs_ss_restore puts real handles back. */
+extern "C" void ppu_fs_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("fs.files", (void*)g_files, sizeof g_files);
+    add("fs.dirs", (void*)g_dirs, sizeof g_dirs);
+    add("fs.path", (void*)g_fd_path, sizeof g_fd_path);
+    add("fs.dir_path", (void*)g_dir_path, sizeof g_dir_path);
+    add("fs.usm", (void*)g_fd_usm, sizeof g_fd_usm);
+    add("fs.cut", (void*)g_fd_cut, sizeof g_fd_cut);
+    add("fs.cut_open", (void*)&g_fs_cutscene_open, sizeof g_fs_cutscene_open);
+    add("fs.off", (void*)g_fd_off, sizeof g_fd_off);
+    add("fs.flags", (void*)g_fd_flags, sizeof g_fd_flags);
+    add("fs.kind", (void*)g_fd_kind, sizeof g_fd_kind);
+}
+
+/* After a load copied the blobs back: reopen every file the save had open, at its
+ * saved position (no O_CREAT / O_TRUNC: the file is there and keeps its bytes).
+ * Directories reopen at their start. Returns the handles reopened; *lost counts
+ * the ones that could not be (their fd then reads as closed: CELL_FS_EIO). */
+extern "C" int ppu_fs_ss_restore(int* lost)
+{
+    int ok = 0, bad = 0;
+    for (int fd = 0; fd < FS_MAX; fd++) {
+        if (g_files[fd]) {
+            FILE* f = NULL;
+            const uint8_t k = g_fd_kind[fd];
+            const size_t pl = strnlen(g_fd_path[fd], sizeof g_fd_path[fd]);
+            if ((k == 1 || k == 2) && pl > 0 && pl < sizeof g_fd_path[fd] - 1) {
+                char hpath[1100], dec[1200];
+                host_path(hpath, sizeof hpath, g_fd_path[fd]);
+                const char* use = edat_resolve(hpath, dec, sizeof dec);
+                if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use);
+                const uint32_t fl = k == 1 ? g_fd_flags[fd] : 0;
+                const uint32_t acc = fl & 0x3;
+                int of = (acc == CELL_FS_O_RDWR) ? O_RDWR : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
+                if (fl & CELL_FS_O_APPEND) of |= O_APPEND;
+                const char* fm = (acc == CELL_FS_O_RDWR) ? ((fl & CELL_FS_O_APPEND) ? "ab+" : "rb+")
+                               : (acc == CELL_FS_O_WRONLY) ? ((fl & CELL_FS_O_APPEND) ? "ab" : "wb") : "rb";
+                const int h = open(hpath, of);
+                f = h >= 0 ? fdopen(h, fm) : NULL;
+                if (!f && h >= 0) close(h);
+                if (f && fseeko(f, (off_t)g_fd_off[fd], SEEK_SET) != 0) { fclose(f); f = NULL; }
+            }
+            g_files[fd] = f;
+            if (f) ok++;
+            else {
+                bad++;
+                fprintf(stderr, "[ss] load: fd %d not reopened (kind %u, '%s')\n", fd, k, g_fd_path[fd]);
+                if (g_fd_cut[fd]) { g_fd_cut[fd] = 0; if (g_fs_cutscene_open > 0) g_fs_cutscene_open--; }
+            }
+        }
+        if (g_dirs[fd]) {
+            DIR* d = g_dir_path[fd][0] ? opendir(g_dir_path[fd]) : NULL;
+            g_dirs[fd] = d;
+            if (d) { ok++; fprintf(stderr, "[ss] load: dir fd %d reopened at its start ('%s')\n", fd, g_dir_path[fd]); }
+            else { bad++; fprintf(stderr, "[ss] load: dir fd %d not reopened ('%s')\n", fd, g_dir_path[fd]); }
+        }
+    }
+    if (lost) *lost = bad;
+    return ok;
+}
+#endif

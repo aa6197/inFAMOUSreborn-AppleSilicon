@@ -4747,6 +4747,9 @@ extern "C" int g_ss_on;
 extern "C" void ppu_ss_point(ppu_context* ctx, int where, uint32_t num);
 #endif
 
+/* lv2 330 / 337 address bumps (file scope so a save state can keep them). */
+static uint32_t s_sc330_next_va = 0x11000000u;   /* just past the loaded image */
+static uint32_t s_sc337_map_next = 0;
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
 #if defined(__APPLE__)
@@ -4824,14 +4827,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
-        static uint32_t s_next_va = 0x11000000u;   /* just past the loaded image */
         uint32_t size  = (uint32_t)ctx->gpr[3];
         uint32_t align = (uint32_t)ctx->gpr[5];
         uint32_t out   = (uint32_t)ctx->gpr[6];
         if (align < 0x100000u) align = 0x100000u;   /* 1 MB min */
-        s_next_va = (s_next_va + align - 1) & ~(align - 1);
-        uint32_t va = s_next_va;
-        s_next_va += (size + 0xFFFFFu) & ~0xFFFFFu;
+        s_sc330_next_va = (s_sc330_next_va + align - 1) & ~(align - 1);
+        uint32_t va = s_sc330_next_va;
+        s_sc330_next_va += (size + 0xFFFFFu) & ~0xFFFFFu;
         if (out) vm_write32(out, va);
         ctx->gpr[3] = 0;
         return;
@@ -4846,12 +4848,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t start  = (uint32_t)ctx->gpr[3];
         uint32_t mem_id = (uint32_t)ctx->gpr[4];
         uint32_t outp   = (uint32_t)ctx->gpr[6];
-        static uint32_t s_map_next = 0;
-        if (!s_map_next) s_map_next = start ? start : 0x11000000u;
+        if (!s_sc337_map_next) s_sc337_map_next = start ? start : 0x11000000u;
         uint32_t size = ps3_mmapper_block_size(mem_id);
         if (!size) size = 0x100000u;
-        uint32_t va = s_map_next;
-        s_map_next = (s_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
+        uint32_t va = s_sc337_map_next;
+        s_sc337_map_next = (s_sc337_map_next + size + 0xFFFFFu) & ~0xFFFFFu;
         /* MAP the block, don't just name it. This handed back an address into
          * MEM_RESERVE, so the page only ever came into existence if the PPU
          * happened to touch it first (the boot harness commits on fault; a
@@ -5340,6 +5341,7 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * ponytail: bump allocator, never freed. A thread's block is dead once it
  * exits, but the window holds dozens and titles create their threads at boot
  * and keep them. Reuse a free list if a title ever churns threads. */
+static uint32_t s_tls_bump = 0;   /* file scope so a save state can keep it */
 static uint32_t ppu_tls_new_block(void)
 {
     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
@@ -5347,8 +5349,7 @@ static uint32_t ppu_tls_new_block(void)
     uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
     if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
     /* Threads are created concurrently, so hand out offsets atomically. */
-    static uint32_t s_bump = 0;
-    uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
+    uint32_t off  = __atomic_fetch_add(&s_tls_bump, total, __ATOMIC_RELAXED);
     uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
     if (base + total > lim) return 0;           /* out of room: share, as before */
     if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
@@ -5747,3 +5748,13 @@ extern "C" void ppu_guest_callstack(const char* tag)
 #endif
 }
 
+
+#if defined(__APPLE__)
+/* Save states (ppu_ss_load.cpp; only a PORT_SAVE_STATES build calls this). */
+extern "C" void ppu_loader_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("loader.sc330_va", &s_sc330_next_va, sizeof s_sc330_next_va);
+    add("loader.sc337_va", &s_sc337_map_next, sizeof s_sc337_map_next);
+    add("loader.tls_bump", &s_tls_bump, sizeof s_tls_bump);
+}
+#endif

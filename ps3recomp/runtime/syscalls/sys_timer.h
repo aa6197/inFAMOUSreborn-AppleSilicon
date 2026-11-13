@@ -83,6 +83,13 @@ int64_t sys_timer_disconnect_event_queue(ppu_context* ctx);
 /* Registration */
 void sys_timer_init(lv2_syscall_table* tbl);
 
+#if defined(__APPLE__)
+/* Save states (PORT_SAVE_STATES, ppu_ss_load.cpp): after g_sys_timers was
+ * restored from a save file, make each active timer's host lock new and
+ * start the host thread of each running one. */
+void sys_timer_ss_restart(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

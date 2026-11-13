@@ -55,7 +55,10 @@ Read this first every session. Newest entry on top.
   chains work, 3600/3600 threads in 100 checks. Re-entry test (live
   threads thrown back and rebuilt from their chains): 1,947/1,947,
   registers the same each time. Save file writer works (236 MB, 36/36
-  threads, frozen ~0.6 s, the game runs on). Next: load. See entries
+  threads, frozen ~0.6 s, the game runs on). Load, PPU core: works
+  (memory, kernel, files, 36/36 threads back in 130 ms, no crash); the
+  game then waits, as graphics, audio and SPU work are not restored yet.
+  Next: those modules. See entries "Save states: load, PPU core",
   "Save states: save file writer", "Save states: re-entry test" and
   "Save states phase 1: resume chains".
 - **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
@@ -138,6 +141,39 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-13 (evening) — Save states: load, PPU core (Mac)
+
+### Load, PPU core (Mac, test build only)
+
+- New test: `SS_LOAD=<file>` (`build-mac-ss` only; `ppu_ss_load.cpp`).
+  The main thread loads before the guest entry:
+  - game memory, the lv2 tables, and new "mod:" blobs (module statics:
+    lwmutex table, bump pointers, fd tables, ...);
+  - every host lock in the tables is made again (mutex, cond, rwlock,
+    semaphore, event queue / flag, timers restarted);
+  - lwmutex host semaphores rebuilt from the guest owner word;
+  - open files reopened at their saved position (each fd now keeps its
+    flags and position; Apple only);
+  - one host thread per saved PPU thread.
+- Each thread takes its registers and chain, relocks the sys_mutexes it
+  owned, waits for all others, then fixes up the call it was blocked in:
+  `sys_lwcond_wait` and `sys_cond_wait` relock and return OK (a spurious
+  wake-up); every other wait runs again from its start.
+- Save files only load into the build that made them (old saves in
+  `$WORK_DIR/saves` are from older builds).
+- Result (`$WORK_DIR/runs/20261113-165515-ss-load1`, save at 30 s):
+  - 5 mutexes, 7 event queues, 1 timer, 106 lwmutexes, 6 files.
+  - All 36 threads ready after 126 ms, all resumed after 130 ms. No
+    crash, no broken chain.
+  - Then the game waits: GCM/RSX, audio, SPURS and the SPU task are not
+    restored yet (main thread loops on a short sleep).
+- Next: restore those modules (GCM first). SPU plan from a code survey:
+  rebuild the one parked SPU task (FIOS) from its LS + registers and
+  resume it in the interpreter at its link register; needs a small fix
+  so the interpreter handles a standalone task's syscall at LS 0xA70.
 
 ---
 

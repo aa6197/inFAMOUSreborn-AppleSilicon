@@ -899,15 +899,16 @@ extern "C" unsigned int cellGcmSetupContext(unsigned int ctx_out_addr,
     unsigned int cmdSize, unsigned int ioSize, unsigned int ioAddress,
     CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32);
 
+/* Bump from a small scratch region below the main stack (0x0FF00000) and
+ * above the TLS image -- a few control structs, never freed. (File scope so a
+ * save state can keep it.) */
+static unsigned int s_gcm_bump = 0x0F800000u;
 static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
 {
-    /* Bump from a small scratch region below the main stack (0x0FF00000) and
-     * above the TLS image -- a few control structs, never freed. */
-    static unsigned int bump = 0x0F800000u;
     if (align < 16) align = 16;
-    bump = (bump + align - 1) & ~(align - 1);
-    unsigned int a = bump;
-    bump += (size + 15u) & ~15u;
+    s_gcm_bump = (s_gcm_bump + align - 1) & ~(align - 1);
+    unsigned int a = s_gcm_bump;
+    s_gcm_bump += (size + 15u) & ~15u;
     return a;
 }
 static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
@@ -1339,3 +1340,55 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   crt_ok);
     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    crt_ok);
 }
+
+#if defined(__APPLE__)
+/* Save states (ppu_ss_load.cpp; only a PORT_SAVE_STATES build calls these). */
+extern "C" void ppu_sysprx_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("sysprx.tls_next", &s_tls_next, sizeof s_tls_next);
+    add("sysprx.lwm", (void*)g_lwm, sizeof g_lwm);
+    add("sysprx.mm_sizes", s_mm_sizes, sizeof s_mm_sizes);
+    add("sysprx.mm_next", &s_mmapper_next_id, sizeof s_mmapper_next_id);
+    add("sysprx.gcm_bump", &s_gcm_bump, sizeof s_gcm_bump);
+    add("sysprx.net_errno", &g_net_errno_ea, sizeof g_net_errno_ea);
+    add("sysprx.spu_img_src", s_spu_img_src, sizeof s_spu_img_src);
+    add("sysprx.spu_img_ea", &g_spu_image_src_ea, sizeof g_spu_image_src_ea);
+    add("sysprx.spu_img_ls", &g_spu_image_ls_start, sizeof g_spu_image_ls_start);
+    add("sysprx.spu_img_span", &g_spu_image_span, sizeof g_spu_image_span);
+}
+
+/* After the blobs are back: a new host lock for every lwmutex slot, held when
+ * the guest lwmutex has an owner. Waiters re-run their lock call. */
+extern "C" int ppu_sysprx_ss_restore(void)
+{
+    int n = 0;
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        struct LwmSlot* sl = &g_lwm[i];
+        sl->waiters = 0;
+        sl->holder = 0;
+        if (!sl->addr) { sl->sem = nullptr; sl->state = 0; continue; }
+        const bool held = vm_read32((uint32_t)sl->addr + LWM_OWNER) != 0;
+        sl->sem = CreateSemaphoreA(NULL, held ? 0 : 1, 1, NULL);
+        sl->state = held ? 1 : 0;
+        n++;
+    }
+    return n;
+}
+
+/* A thread saved inside sys_lwcond_wait goes on as if woken: take the lwmutex
+ * again (after every thread runs), owner = self, r3 = 0. */
+extern "C" void ppu_sysprx_ss_lwcond_relock(ppu_context* ctx)
+{
+    const uint32_t lwmutex = vm_read32((uint32_t)ctx->gpr[3] + 0x00);
+    struct LwmSlot* sl = lwm_slot(lwmutex);
+    HANDLE s = sl ? sl->sem : nullptr;
+    if (s) {
+        InterlockedIncrement(&sl->waiters);
+        if (lwm_fast()) lwm_word_lock(sl, INFINITE); else WaitForSingleObject(s, INFINITE);
+        InterlockedDecrement(&sl->waiters);
+    }
+    vm_write32(lwmutex + LWM_OWNER, LWM_SELF(ctx));
+    vm_write32(lwmutex + LWM_RECUR, 1);
+    ctx->gpr[3] = 0;
+}
+#endif

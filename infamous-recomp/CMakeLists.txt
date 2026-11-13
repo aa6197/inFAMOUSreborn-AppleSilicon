@@ -406,6 +406,8 @@ if(APPLE)
         list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_resume.cpp")
         # Save file writer (SS_SAVE_AT / SS_SAVE, ppu_ss_file.h).
         list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_file.cpp")
+        # Load (SS_LOAD=<file>).
+        list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_load.cpp")
         set_source_files_properties("${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_probe.cpp" PROPERTIES COMPILE_DEFINITIONS PORT_SAVE_STATES=1)
     endif()
 endif()

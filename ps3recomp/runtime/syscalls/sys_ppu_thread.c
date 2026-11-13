@@ -531,6 +531,23 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     return CELL_OK;
 }
 
+#if defined(__APPLE__)
+int sys_ppu_thread_ss_start(int slot)
+{
+    if (slot < 0 || slot >= PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[slot];
+    pthread_mutex_init(&t->finish_mutex, NULL);
+    pthread_cond_init(&t->finish_cond, NULL);
+    t->finished = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES);
+    const int rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
+    pthread_attr_destroy(&attr);
+    return rc == 0;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * sys_ppu_thread_exit
  *

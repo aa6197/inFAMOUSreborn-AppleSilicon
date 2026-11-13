@@ -27,6 +27,7 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach/mach.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -278,6 +279,18 @@ static const ss_blob s_blobs[] = {
 #undef B
 enum { SS_NBLOBS = sizeof s_blobs / sizeof s_blobs[0] };
 
+/* Module host state: static blobs each module names through ss_file_mod_add
+ * (ppu_ss_load.cpp collects them once, before the first save or load). Stored as
+ * sections "mod:<name>", raw bytes like the tables. */
+enum { SS_MOD_MAX = 128 };
+static ss_blob s_mods[SS_MOD_MAX];
+static int s_nmods;
+extern "C" void ss_file_mod_add(const char* name, void* p, size_t n)
+{
+    if (s_nmods < SS_MOD_MAX) s_mods[s_nmods++] = ss_blob{ name, p, n };
+    else fprintf(stderr, "[ss] too many module blobs (%s dropped)\n", name);
+}
+
 static void ss_tab_name(char* out, size_t n, const char* v)
 {
     strlcpy(out, "tab:", n);
@@ -294,6 +307,15 @@ extern "C" int ss_file_tables(ss_out* o, uint64_t* bytes)
         ss_file_put(o, b.p, b.n);
         ss_file_sec_end(o);
         total += b.n;
+    }
+    for (int i = 0; i < s_nmods; i++) {
+        char name[96];
+        strlcpy(name, "mod:", sizeof name);
+        strlcat(name, s_mods[i].name, sizeof name);
+        ss_file_sec_begin(o, name);
+        ss_file_put(o, s_mods[i].p, s_mods[i].n);
+        ss_file_sec_end(o);
+        total += s_mods[i].n;
     }
     if (bytes) *bytes = total;
     return !o->err;
@@ -507,6 +529,27 @@ extern "C" int ss_file_tables_load(ss_in* in, int apply, uint32_t* differ)
         const uint8_t* p = ss_file_sec(in, name, &n);
         if (!p) return ss_fail(in, "a table is missing");
         if (n != b.n) return ss_fail(in, "a table has another size");
+        if (apply) memcpy(b.p, p, b.n);
+        else if (memcmp(b.p, p, b.n) != 0) {
+            if (!in->dtab) {
+                const uint8_t* live = (const uint8_t*)b.p;
+                uint32_t k = 0;
+                while (k < b.n && live[k] == p[k]) k++;
+                in->dtab = b.name;
+                in->doff = k;
+            }
+            (*differ)++;
+        }
+    }
+    for (int i = 0; i < s_nmods; i++) {
+        const ss_blob& b = s_mods[i];
+        char name[96];
+        strlcpy(name, "mod:", sizeof name);
+        strlcat(name, b.name, sizeof name);
+        uint64_t n;
+        const uint8_t* p = ss_file_sec(in, name, &n);
+        if (!p) return ss_fail(in, "a module blob is missing");
+        if (n != b.n) return ss_fail(in, "a module blob has another size");
         if (apply) memcpy(b.p, p, b.n);
         else if (memcmp(b.p, p, b.n) != 0) {
             if (!in->dtab) {

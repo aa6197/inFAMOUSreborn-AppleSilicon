@@ -192,3 +192,11 @@ void sys_vm_init(lv2_syscall_table* tbl)
      * default handler (loud ENOSYS log) until their out-struct layouts are
      * verified from a primary source. */
 }
+
+#if defined(__APPLE__)
+/* Save states (ppu_ss_load.cpp; only a PORT_SAVE_STATES build calls this). */
+void sys_vm_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("sys_vm.bump", &s_vm_bump_ptr, sizeof s_vm_bump_ptr);
+}
+#endif

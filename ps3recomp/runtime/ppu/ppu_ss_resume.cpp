@@ -261,6 +261,13 @@ extern "C" void ss_resume_call(ppu_context* ctx, const ss_rframe* f)
     fn(ctx);
 }
 
+/* Load side (ppu_ss_load.cpp): 1 if fn has a resume point for key. */
+extern "C" int ss_site_has(uint32_t fn, uint64_t key)
+{
+    pthread_once(&s_idx_once, ss_index_build);
+    return ss_find(fn, (uint32_t)(key >> 32), (uint32_t)key) != NULL;
+}
+
 extern "C" void ss_resume_fail(ppu_context* ctx, const ss_rframe* f)
 {
     fprintf(stderr, "[ss] load failed: thread %u, func_%08X has no resume point for key %016llX\n",

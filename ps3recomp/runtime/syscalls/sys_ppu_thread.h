@@ -102,6 +102,13 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx);
 /* Registration */
 void sys_ppu_thread_init(lv2_syscall_table* tbl);
 
+#if defined(__APPLE__)
+/* Save states (PORT_SAVE_STATES, ppu_ss_load.cpp): start the host thread of
+ * a slot restored from a save file. The slot (state, ctx, name, stack) comes
+ * from the file; ctx.cia must hold the entry descriptor. Returns 1 on success. */
+int sys_ppu_thread_ss_start(int slot);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

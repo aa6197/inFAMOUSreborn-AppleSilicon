@@ -44,7 +44,11 @@ void    ss_file_sec_begin(ss_out* o, const char* name);
 void    ss_file_put(ss_out* o, const void* p, size_t n);
 void    ss_file_sec_end(ss_out* o);
 int     ss_file_mem(ss_out* o, ss_mem_stats* st);   /* section "mem": ranges + non-zero pages (LZ4) */
-int     ss_file_tables(ss_out* o, uint64_t* bytes); /* one section "tab:<name>" per kernel table */
+int     ss_file_tables(ss_out* o, uint64_t* bytes); /* one section "tab:<name>" per kernel table,
+                                                       then "mod:<name>" per module blob */
+/* Module host state: name a static blob to save and load as raw bytes. Call before
+ * the first save (ppu_ss_load.cpp, ss_mods_init); name must stay valid. */
+void    ss_file_mod_add(const char* name, void* p, size_t n);
 int     ss_file_sync(ss_out* o);    /* write out the buffer (no locks); 1 when every write worked */
 int     ss_file_close(ss_out* o);   /* 1 when every write worked; frees */
 uint64_t ss_file_size(const ss_out* o);
@@ -60,7 +64,7 @@ const uint8_t* ss_file_sec(const ss_in* in, const char* name, uint64_t* size);  
  * apply = 1: write it into guest memory (ranges made read/write, saved pages
  * copied, other touched pages zeroed, saved protection set back). */
 int     ss_file_mem_load(ss_in* in, int apply, ss_mem_stats* st, uint64_t* differ);
-/* Compare (apply = 0) or copy (apply = 1) every "tab:" section with its table.
+/* Compare (apply = 0) or copy (apply = 1) every "tab:" and "mod:" section with its table.
  * differ = tables whose bytes differ. */
 int     ss_file_tables_load(ss_in* in, int apply, uint32_t* differ);
 /* After a check: up to max of the first pages that differed (guest addresses),

@@ -513,3 +513,11 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
     lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
 }
+
+#if defined(__APPLE__)
+/* Save states (ppu_ss_load.cpp; only a PORT_SAVE_STATES build calls this). */
+void sys_memory_ss_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("sys_memory.total", &s_total_allocated, sizeof s_total_allocated);
+}
+#endif

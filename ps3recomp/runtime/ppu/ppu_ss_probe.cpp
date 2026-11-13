@@ -95,10 +95,13 @@ static int ss_env_int(const char* n, int d)
     return (e && *e) ? atoi(e) : d;
 }
 
-/* Read once at load: the environment is complete before main(). SS_PROBE (probe) or
- * SS_SAVE_AT (one save, PORT_SAVE_STATES builds) turns the hooks on. */
+/* Read once at load: the environment is complete before main(). SS_PROBE (probe),
+ * SS_SAVE_AT (one save) or SS_LOAD (load a save; both PORT_SAVE_STATES builds) turns
+ * the hooks on. */
 static double ss_env_f(const char* n) { const char* e = getenv(n); return e ? atof(e) : 0.0; }
-__attribute__((used)) static int s_ss_init = (g_ss_on = (ss_env_f("SS_PROBE") > 0.0 || ss_env_f("SS_SAVE_AT") > 0.0) ? 1 : 0, 0);
+static int ss_env_set(const char* n) { const char* e = getenv(n); return e && *e; }
+__attribute__((used)) static int s_ss_init =
+    (g_ss_on = (ss_env_f("SS_PROBE") > 0.0 || ss_env_f("SS_SAVE_AT") > 0.0 || ss_env_set("SS_LOAD")) ? 1 : 0, 0);
 
 static inline int ss_gok(uint32_t a, uint32_t n)
 {
@@ -386,6 +389,9 @@ extern "C" void ppu_ss_icall_reset(void);                    /* ppu_loader.cpp *
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);  /* ppu_loader.cpp */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;       /* ppu_loader.cpp */
 extern "C" void ss_resume_begin(const ss_rframe* f, int n);  /* ppu_ss_resume.cpp */
+extern "C" const ss_rframe* ss_load_take(ppu_context* ctx, int* n);   /* ppu_ss_load.cpp */
+extern "C" void ss_mods_init(void);                                  /* ppu_ss_load.cpp */
+static int s_load;   /* SS_LOAD=<file> */
 
 #define SS_RE_SNAP offsetof(ppu_context, thread_id)   /* gpr .. cia */
 struct ss_re {
@@ -415,6 +421,17 @@ static void ss_run(ppu_context* ctx, ss_ppu_fn fn)
             g_active_ctx = ctx;
         }
         r->ctx = ctx;
+        if (s_load) {   /* a thread of a loaded save: its registers and chain */
+            int n = 0;
+            const ss_rframe* ch = ss_load_take(ctx, &n);
+            if (ch) {
+                ppu_ss_icall_reset();
+                f = ppu_ss_lookup(ch[0].fn);
+                if (!f) { fprintf(stderr, "[ss] load: func_%08X not registered\n", ch[0].fn); abort(); }
+                ss_resume_begin(ch, n);
+                g_active_ctx = ctx;
+            }
+        }
     }
     f(ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(ctx); }
@@ -422,7 +439,8 @@ static void ss_run(ppu_context* ctx, ss_ppu_fn fn)
 }
 
 __attribute__((used)) static int s_re_init =
-    (s_reenter = g_ss_on ? ss_env_int("SS_REENTER", 0) : 0, s_reenter > 0 ? (g_ss_run_hook = ss_run) : 0, 0);
+    (s_reenter = g_ss_on ? ss_env_int("SS_REENTER", 0) : 0, s_load = ss_env_set("SS_LOAD"),
+     (s_reenter > 0 || s_load) ? (g_ss_run_hook = ss_run) : 0, 0);
 
 static const char* ss_ctx_field(size_t off)
 {
@@ -647,6 +665,7 @@ static ppu_context s_save_ctx[SS_MAX];
 
 static int ss_save(const char* path, int wait_ms)
 {
+    ss_mods_init();   /* module blobs: before anything is suspended */
     const double t0 = ss_now();
     ss_out* o = ss_file_create(path);
     if (!o) { fprintf(stderr, "[ss] save: cannot create %s\n", path); return 0; }
@@ -814,6 +833,7 @@ static void* ss_thread(void*)
     if (mean <= 0.0) {   /* SS_SAVE_AT: one save */
         const double at = ss_env_f("SS_SAVE_AT");
         const char* path = getenv("SS_SAVE");
+        if (at <= 0.0) return NULL;   /* SS_LOAD alone */
 #if defined(PORT_SAVE_STATES)
         if (!path || !*path) { fprintf(stderr, "[ss] SS_SAVE_AT needs SS_SAVE=<file>\n"); return NULL; }
         fprintf(stderr, "[ss] save at %.1f s to %s\n", at, path);
