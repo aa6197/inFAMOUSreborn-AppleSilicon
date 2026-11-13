@@ -188,6 +188,46 @@ re-run call entry (1,947/1,947), no crash. Fixed on the way: cold parts
 HLE host frames. The load side works on live threads; the save file only
 has to add host state.
 
+## Save file: how it is built (11-13; writer done, loader next)
+
+Host state found outside game memory (full list by subsystem: sync
+tables, memory metadata, files, PPU threads, SPU/SPURS, RSX/GCM, audio,
+pad, sysutil):
+
+- Each lv2 type has its own table; ID = slot + 1 (fd = slot + 3). IDs
+  are kept in game memory, so tables are restored **by slot**, not by
+  replaying the creates.
+- Lock owners live inside pthread objects (sys_mutex, rwlock). The
+  owner thread re-locks on load (`lock_count` times) before any guest
+  code runs.
+- Waiters live on host stacks (sys_cond nodes, lwcond buckets): not
+  saved; each waiter re-runs its wait.
+- SPU local store is host memory (~260 KB per SPU context); SPURS
+  policy contexts ~25 MB.
+- RSX: put/get/ref and labels are in game memory; the method register
+  file, rsx_state, FIFO walker offsets and render targets (Metal only)
+  are host only. The report area is a host pointer the game keeps.
+- No clock offset exists: every clock is raw monotonic. Load must add
+  one (timebase, system time, GCM timestamps, audio anchor).
+
+Plan:
+
+1. Writer (done, `ppu_ss_file.{h,cpp}`; result in PORT_LOG "Save
+   states: save file writer") (`SS_SAVE_AT=<secs> SS_SAVE=<file>`): stop every thread with
+   the probe stop, build each chain, write sections: header (build id),
+   game memory (non-zero pages, LZ4), PPU threads (ctx + chain + how to
+   re-enter), then one section per module (raw table bytes; same build
+   only, so the layout matches).
+2. Loader (`SS_LOAD=<file>`, hook at `ppu_run`, before game code):
+   memory, then module tables by slot with host objects made new
+   (pthread locks, FILE* reopened by path and offset), then module
+   inits that make host resources (GCM/Metal, SPURS, audio, pad)
+   replayed with the saved arguments, then memory again (those inits
+   write game memory), then one host thread per saved PPU thread; each
+   re-locks what it owned and rebuilds its chain. A barrier holds guest
+   code until all are ready.
+3. Test ladder below. Each failure names the next missing piece.
+
 ## Save and load design (11-13, after the chain test)
 
 Where threads are when the save stops them (100 checks, 36 threads):

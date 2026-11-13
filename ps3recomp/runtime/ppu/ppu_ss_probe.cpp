@@ -28,6 +28,7 @@
 #include "ppu_recomp.h"   /* ppu_context, vm_base */
 #if defined(PORT_SAVE_STATES)
 #include "ppu_ss_resume.h"   /* phase 1: exact chains from the site tables */
+#include "ppu_ss_file.h"     /* save file writer */
 #include <setjmp.h>
 #include <stddef.h>
 #endif
@@ -94,8 +95,10 @@ static int ss_env_int(const char* n, int d)
     return (e && *e) ? atoi(e) : d;
 }
 
-/* Read once at load: the environment is complete before main(). */
-__attribute__((used)) static int s_ss_init = (g_ss_on = (getenv("SS_PROBE") && atof(getenv("SS_PROBE")) > 0.0) ? 1 : 0, 0);
+/* Read once at load: the environment is complete before main(). SS_PROBE (probe) or
+ * SS_SAVE_AT (one save, PORT_SAVE_STATES builds) turns the hooks on. */
+static double ss_env_f(const char* n) { const char* e = getenv(n); return e ? atof(e) : 0.0; }
+__attribute__((used)) static int s_ss_init = (g_ss_on = (ss_env_f("SS_PROBE") > 0.0 || ss_env_f("SS_SAVE_AT") > 0.0) ? 1 : 0, 0);
 
 static inline int ss_gok(uint32_t a, uint32_t n)
 {
@@ -330,24 +333,30 @@ static void ss_fold_cold(ss_hframe* h, int nh)
     }
 }
 
+/* The exact chain of one recorded thread (after the threads run again: dladdr may lock). */
+static int ss_rec_chain(const ss_rec* r, ss_rframe* out, int max, ss_chain_info* info)
+{
+    ss_hframe hf[SS_HF];
+    int nh = 0;
+    for (int k = 0; k < r->nh; k++) {
+        if (k == 1 && r->nh > 2 && r->h[1] == r->h[2]) continue;   /* LR register = first saved LR */
+        ss_classify(r->h[k], &hf[nh++]);
+    }
+    ss_fold_cold(hf, nh);
+    const ss_gwin g = { r->wlo, r->whi, s_win + r->woff };
+    return ss_chain_build(hf, nh, r->sp, r->lr, r->cia, r->parked ? r->where : 0, &g, out, max, info);
+}
+
 static void ss_exact(int idx, int nrec)
 {
     static ss_rframe out[128];
-    ss_hframe hf[SS_HF];
     int ok = 0, tried = 0;
     for (int i = 0; i < nrec; i++) {
         const ss_rec* r = &s_rec[i];
         if (!r->susp) continue;
         tried++;
-        int nh = 0;
-        for (int k = 0; k < r->nh; k++) {
-            if (k == 1 && r->nh > 2 && r->h[1] == r->h[2]) continue;   /* LR register = first saved LR */
-            ss_classify(r->h[k], &hf[nh++]);
-        }
-        ss_fold_cold(hf, nh);
-        const ss_gwin g = { r->wlo, r->whi, s_win + r->woff };
         ss_chain_info info;
-        const int n = ss_chain_build(hf, nh, r->sp, r->lr, r->cia, r->parked ? r->where : 0, &g, out, 128, &info);
+        const int n = ss_rec_chain(r, out, 128, &info);
         if (n > 0) {
             ok++;
             fprintf(stderr, "[ss]  x t=%d ok n=%d amb=%d top=%d\n", r->t, n, info.amb, info.top);
@@ -512,14 +521,13 @@ static void ss_re_mark(int idx)
 }
 #endif
 
-static void ss_probe(int idx, int wait_ms)
+/* Set the stop flag and wait up to wait_ms for every registered thread to be safe.
+ * Returns the time it took in seconds, or -1 when some thread was not safe in time. */
+static double ss_stop_all(double t0, int wait_ms, int* alive_, int* safe_)
 {
-    const double t0 = ss_now();
     __atomic_store_n(&s_ss_stop, 1, __ATOMIC_RELEASE);
-    int alive = 0, safe = 0;
-    double t_safe = -1.0;
     for (;;) {
-        alive = safe = 0;
+        int alive = 0, safe = 0;
         for (int t = 0; t < SS_MAX; t++) {
             ss_slot* s = &s_ss[t];
             if (!__atomic_load_n(&s->alive, __ATOMIC_ACQUIRE)) continue;
@@ -527,15 +535,17 @@ static void ss_probe(int idx, int wait_ms)
             if (__atomic_load_n(&s->parked, __ATOMIC_ACQUIRE) || __atomic_load_n(&s->dsc, __ATOMIC_ACQUIRE) > 0 ||
                 __atomic_load_n(&s->dhle, __ATOMIC_ACQUIRE) > 0) safe++;
         }
-        if (safe == alive) { t_safe = ss_now() - t0; break; }
-        if ((ss_now() - t0) * 1000.0 >= wait_ms) break;
+        *alive_ = alive; *safe_ = safe;
+        if (safe == alive) return ss_now() - t0;
+        if ((ss_now() - t0) * 1000.0 >= wait_ms) return -1.0;
         usleep(500);
     }
+}
 
-    /* Suspend everyone first, then read: one consistent snapshot. */
+/* Suspend every registered thread (one consistent snapshot), returns the record count. */
+static int ss_suspend_all(void)
+{
     int nrec = 0;
-    size_t wfill = 0;
-    (void)wfill;
     for (int t = 0; t < SS_MAX && nrec < SS_MAX; t++) {
         ss_slot* s = &s_ss[t];
         if (!__atomic_load_n(&s->alive, __ATOMIC_ACQUIRE)) continue;
@@ -543,7 +553,14 @@ static void ss_probe(int idx, int wait_ms)
         r->t = t;
         r->susp = thread_suspend(s->port) == KERN_SUCCESS;
     }
-    const double t_susp = ss_now() - t0;
+    return nrec;
+}
+
+/* Read every suspended thread: host and guest chains (and, for phase 1, its guest stack). */
+static void ss_read_all(int nrec)
+{
+    size_t wfill = 0;
+    (void)wfill;
     for (int i = 0; i < nrec; i++) {
         ss_rec* r = &s_rec[i];
         ss_slot* s = &s_ss[r->t];
@@ -562,10 +579,27 @@ static void ss_probe(int idx, int wait_ms)
         ss_copy_stack(r, &wfill);
 #endif
     }
-    const double t_read = ss_now() - t0;
+}
+
+static void ss_resume_all(int nrec)
+{
     for (int i = 0; i < nrec; i++)
         if (s_rec[i].susp) thread_resume(s_ss[s_rec[i].t].port);
     __atomic_store_n(&s_ss_stop, 0, __ATOMIC_RELEASE);
+}
+
+static void ss_probe(int idx, int wait_ms)
+{
+    const double t0 = ss_now();
+    int alive = 0, safe = 0;
+    const double t_safe = ss_stop_all(t0, wait_ms, &alive, &safe);
+
+    /* Suspend everyone first, then read: one consistent snapshot. */
+    const int nrec = ss_suspend_all();
+    const double t_susp = ss_now() - t0;
+    ss_read_all(nrec);
+    const double t_read = ss_now() - t0;
+    ss_resume_all(nrec);
     const double t_all = ss_now() - t0;
 
     fprintf(stderr, "[ss] probe %d at %.1f s: %d threads, %d safe, %s %.2f ms; suspended %.2f, read %.2f, released %.2f ms\n",
@@ -601,6 +635,108 @@ static void ss_probe(int idx, int wait_ms)
     if (s_mem_every > 0 && (idx - 1) % s_mem_every == 0) ss_mem(idx);
     fflush(stderr);
 }
+
+#if defined(PORT_SAVE_STATES)
+/* --- one save (SS_SAVE_AT=<secs> SS_SAVE=<file>) ----------------------------------------
+ * Stop and suspend every PPU thread as a probe does, write guest memory and the kernel
+ * tables while they are suspended (ppu_ss_file.cpp takes no locks), let them run, then
+ * build each thread's exact chain from what was read and write the "ppu" section. Any
+ * thread that is not safe in time or has no chain cancels the save (the file is removed).
+ * SPU, RSX and audio threads keep running meanwhile (v1). */
+static ppu_context s_save_ctx[SS_MAX];
+
+static int ss_save(const char* path, int wait_ms)
+{
+    const double t0 = ss_now();
+    ss_out* o = ss_file_create(path);
+    if (!o) { fprintf(stderr, "[ss] save: cannot create %s\n", path); return 0; }
+    /* SS_SAVE_CHECK=1 (test): read the file back while the threads are still suspended and
+     * compare it with live memory and tables. Pages SPU / RSX threads wrote meanwhile differ. */
+    ss_in* chk = ss_env_int("SS_SAVE_CHECK", 0) ? ss_file_in_new() : NULL;
+    int alive = 0, safe = 0;
+    const double t_safe = ss_stop_all(t0, wait_ms, &alive, &safe);
+    if (t_safe < 0) {
+        __atomic_store_n(&s_ss_stop, 0, __ATOMIC_RELEASE);
+        ss_file_close(o);
+        ss_file_in_free(chk);
+        unlink(path);
+        fprintf(stderr, "[ss] save FAILED: %d of %d threads safe after %d ms\n", safe, alive, wait_ms);
+        return 0;
+    }
+    const int nrec = ss_suspend_all();
+    ss_read_all(nrec);
+    int nsusp = 0;
+    for (int i = 0; i < nrec; i++) {
+        if (!s_rec[i].susp) continue;
+        nsusp++;
+        memcpy(&s_save_ctx[i], s_ss[s_rec[i].t].ctx, sizeof(ppu_context));
+    }
+    ss_mem_stats ms;
+    uint64_t tab = 0;
+    int ok = nsusp == nrec;
+    ok = ss_file_mem(o, &ms) && ok;
+    ok = ss_file_tables(o, &tab) && ok;
+    ss_mem_stats cms;
+    uint64_t c_mem = 0;
+    uint32_t c_tab = 0;
+    int c_ok = 0;
+    double t_chk = ss_now();
+    if (chk) {
+        ok = ss_file_sync(o) && ok;
+        c_ok = ss_file_in_map(chk, path) && ss_file_mem_load(chk, 0, &cms, &c_mem) && ss_file_tables_load(chk, 0, &c_tab);
+    }
+    t_chk = ss_now() - t_chk;
+    ss_resume_all(nrec);
+    const double t_frozen = ss_now() - t0;
+    if (chk) {
+        if (c_ok) {
+            fprintf(stderr, "[ss] save check: %.0f MB of pages read back, %llu pages differ; %u tables differ; %.0f ms\n",
+                    cms.nonzero / 1048576.0, (unsigned long long)c_mem, c_tab, t_chk * 1000.0);
+            uint32_t dp[8];
+            const uint32_t ndp = ss_file_diff_pages(chk, dp, 8);
+            for (uint32_t i = 0; i < ndp; i++) fprintf(stderr, "[ss]  page differs: 0x%08x\n", dp[i]);
+            uint32_t doff = 0;
+            const char* dt = ss_file_diff_table(chk, &doff);
+            if (dt) fprintf(stderr, "[ss]  table differs: %s at byte %u\n", dt, doff);
+        } else
+            fprintf(stderr, "[ss] save check FAILED: %s\n", ss_file_why(chk));
+        ss_file_in_free(chk);
+    }
+
+    static ss_rframe out[128];
+    const uint32_t cnt = (uint32_t)nrec;
+    ss_file_sec_begin(o, "ppu");
+    ss_file_put(o, &cnt, 4);
+    int bad = 0;
+    for (int i = 0; i < nrec; i++) {
+        const ss_rec* r = &s_rec[i];
+        ss_chain_info info;
+        const int n = r->susp ? ss_rec_chain(r, out, 128, &info) : -1;
+        if (n <= 0) {
+            bad++;
+            fprintf(stderr, "[ss] save: t=%d no chain (k=%d fn=%08X %s)\n", r->t, r->susp ? info.fail_k : -1,
+                    r->susp ? info.fail_fn : 0, r->susp ? info.why : "not suspended");
+            continue;
+        }
+        const ss_ppu_rec pr = { (uint32_t)r->t, (uint32_t)r->parked, (uint32_t)r->where, r->dsc, r->dhle,
+                                r->sc, r->hle, r->park_num, (uint32_t)sizeof(ppu_context), (uint32_t)n };
+        ss_file_put(o, &pr, sizeof pr);
+        ss_file_put(o, &s_save_ctx[i], sizeof(ppu_context));
+        ss_file_put(o, out, (size_t)n * sizeof(ss_rframe));
+    }
+    ss_file_sec_end(o);
+    const uint64_t size = ss_file_size(o);
+    ok = ss_file_close(o) && ok && !bad;
+    const double MB = 1048576.0;
+    if (!ok) unlink(path);
+    fprintf(stderr, "[ss] save %s: %s, %d threads (%d without chain), all safe after %.1f ms, frozen %.0f ms, "
+                    "total %.0f ms; memory %u ranges, %.0f MB mapped, %.0f MB non-zero, %.0f MB packed; tables %.1f MB; "
+                    "file %.0f MB\n",
+            ok ? "ok" : "FAILED", path, nrec, bad, t_safe * 1000.0, t_frozen * 1000.0, (ss_now() - t0) * 1000.0,
+            ms.ranges, ms.mapped / MB, ms.nonzero / MB, ms.packed / MB, tab / MB, size / MB);
+    return ok;
+}
+#endif
 
 /* --- save size estimate ---------------------------------------------------- */
 
@@ -674,7 +810,23 @@ static void ss_mem(int probe)
 static void* ss_thread(void*)
 {
     pthread_setname_np("ss-probe");
-    const double mean = atof(getenv("SS_PROBE"));
+    const double mean = ss_env_f("SS_PROBE");
+    if (mean <= 0.0) {   /* SS_SAVE_AT: one save */
+        const double at = ss_env_f("SS_SAVE_AT");
+        const char* path = getenv("SS_SAVE");
+#if defined(PORT_SAVE_STATES)
+        if (!path || !*path) { fprintf(stderr, "[ss] SS_SAVE_AT needs SS_SAVE=<file>\n"); return NULL; }
+        fprintf(stderr, "[ss] save at %.1f s to %s\n", at, path);
+        usleep((useconds_t)(at * 1e6));
+        const int ok = ss_save(path, ss_env_int("SS_PROBE_WAIT_MS", 5000));
+        fflush(stderr);
+        if (ss_env_int("SS_SAVE_EXIT", 0)) _exit(ok ? 0 : 3);
+#else
+        (void)at; (void)path;
+        fprintf(stderr, "[ss] SS_SAVE_AT needs a PORT_SAVE_STATES build\n");
+#endif
+        return NULL;
+    }
     const int start = ss_env_int("SS_PROBE_START", 60);
     const int n = ss_env_int("SS_PROBE_N", 100);
     const int wait_ms = ss_env_int("SS_PROBE_WAIT_MS", 1000);

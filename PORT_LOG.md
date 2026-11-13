@@ -54,8 +54,10 @@ Read this first every session. Newest entry on top.
   Phase 1 (Mac, test build `PORT_SAVE_STATES`, default OFF): resume
   chains work, 3600/3600 threads in 100 checks. Re-entry test (live
   threads thrown back and rebuilt from their chains): 1,947/1,947,
-  registers the same each time. Next: save file and load. See entries
-  "Save states: re-entry test" and "Save states phase 1: resume chains".
+  registers the same each time. Save file writer works (236 MB, 36/36
+  threads, frozen ~0.6 s, the game runs on). Next: load. See entries
+  "Save states: save file writer", "Save states: re-entry test" and
+  "Save states phase 1: resume chains".
 - **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
   texture pool, stage ring and geometry memo in the background. iPhone:
   ~520 MB less in the background (1051 vs 1574 MB), clean resume.
@@ -136,6 +138,40 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 23 | 11-11 | Round 10: MetalFX upscaling off (option) | 53.8 / 52.2 | 54.9 / 54.8 | +3.5% | GPU busy 101% -> 82%. Costs the sharper upscale. Audio and job-wait tests: no gain. |
 | 24 | 11-11 | Round 11: clear the shared depth (as D3D12) | 51.9 / 49.5 | 52.2 / 51.7 | +2.5% | Noisy: pairs +0.6% and +4.4%. Only ~2% of passes. Kept to match Windows. |
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
+
+---
+
+## 2026-11-13 (evening) — Save states: save file writer (Mac)
+
+### Save file writer (Mac, test build only)
+
+- New test: `SS_SAVE_AT=<secs> SS_SAVE=<file>` (`build-mac-ss` only).
+  Stops every thread like the probe, then writes one save file.
+  `SS_SAVE_CHECK=1` reads the file back while the threads are still
+  stopped and compares it with live memory. `SS_SAVE_EXIT=1` quits
+  after the save.
+- File (`ppu_ss_file.{h,cpp}`): header with the build id (the exe's
+  UUID: a file only loads into the build that made it), game memory
+  (non-zero pages only, LZ4), the lv2 kernel tables as raw bytes, then
+  each PPU thread (registers + chain).
+- While the threads are stopped the writer takes no locks (a stopped
+  thread may hold the malloc or stdio lock): only system calls and
+  buffers made before the stop. Logging waits until the threads run.
+- Speed (Mac A/B, both -O2, 140 s windows): normal build 94.7 (cold
+  first run) and 104.5 flips/s, save-state build 103.3 and 105.2. **The
+  save-state build costs nothing measurable.**
+- Result (`$WORK_DIR/runs/20261113-162812-ss-save2`, save at 90 s):
+  - 36 threads, all with a chain. All safe after 0.2 ms, frozen
+    573 ms, total 615 ms.
+  - Memory: 69 ranges, 4095 MB mapped, 354 MB non-zero, 233 MB packed.
+    Tables 2.9 MB. File 236 MB (in `$WORK_DIR/saves`, device only).
+  - Read-back check: 1 page differs (0x58100000, the audio ring: the
+    audio thread does not stop) and 1 table (`g_sys_timers`, a timer
+    thread's host lock). Both are expected. The loader remakes host
+    locks.
+  - The game ran on after the save (flips 18,340 at 92 s → 24,640 at
+    152 s).
+- Open: LZ4 packs only 354 → 233 MB. Next: the loader.
 
 ---
 
