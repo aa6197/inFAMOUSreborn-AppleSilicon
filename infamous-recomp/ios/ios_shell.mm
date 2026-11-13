@@ -33,6 +33,7 @@
 
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <malloc/malloc.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #include <os/proc.h>
@@ -572,22 +573,40 @@ static void start_game_thread(void)
     pthread_attr_destroy(&attr);
 }
 
+/* What iOS counts against the app's memory limit (Xcode's memory gauge). */
+static size_t footprint_mb(void)
+{
+    task_vm_info_data_t vi;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) return 0;
+    return (size_t)(vi.phys_footprint >> 20);
+}
+
 /* Runs on the main thread, inside the UIKit callback, before it returns:
  * iOS gives the app only a moment once it has left the screen. */
 static bool SDLCALL app_events(void*, SDL_Event* e)
 {
     switch (e->type) {
     case SDL_EVENT_WILL_ENTER_BACKGROUND: {
+        const size_t fp0 = footprint_mb();
         port_app_set_paused(1);
         int waited = 0;
         while (!port_app_rsx_parked() && waited < 2000) { usleep(5000); waited += 5; }
         rsx_metal_backend_wait_idle();
         fprintf(stderr, "[ios] background: frame clock %s after %d ms, GPU idle\n",
                 port_app_rsx_parked() ? "parked" : "NOT parked", waited);
+        /* BG_TRIM=1: the RSX thread let go of GPU memory as it parked (main.cpp);
+         * hand freed malloc pages back too. */
+        const char* bt = getenv("BG_TRIM");
+        const size_t relief = (bt && *bt == '1') ? malloc_zone_pressure_relief(NULL, 0) : 0;
+        fprintf(stderr, "[ios-mem] background: footprint %zu -> %zu MB (malloc gave back %zu MB), "
+                "available %zu MB\n", fp0, footprint_mb(), relief >> 20, os_proc_available_memory() >> 20);
         break;
     }
     case SDL_EVENT_DID_ENTER_FOREGROUND:
         port_gfx_apply_live();   /* a Graphics choice made in the Settings app meanwhile */
+        fprintf(stderr, "[ios-mem] foreground: footprint %zu MB, available %zu MB\n",
+                footprint_mb(), os_proc_available_memory() >> 20);
         port_app_set_paused(0);
         fprintf(stderr, "[ios] foreground: resumed\n");
         break;

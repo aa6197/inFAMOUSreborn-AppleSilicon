@@ -49,6 +49,13 @@ void rsx_metal_backend_set_layer(void* ca_metal_layer);
  * submitting: iOS stops an app that runs GPU work in the background. */
 void rsx_metal_backend_wait_idle(void);
 
+/* Background memory trim (iOS, BG_TRIM=1). bg_trim: on the RSX thread as it
+ * parks for the background; waits for the GPU, then lets go of memory that is
+ * refilled on use (texture pool, stage ring, geometry memo). bg_restore: on
+ * the RSX thread before it resumes. */
+void rsx_metal_backend_bg_trim(void);
+void rsx_metal_backend_bg_restore(void);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the

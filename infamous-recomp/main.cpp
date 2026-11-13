@@ -200,6 +200,20 @@ static std::atomic<int> s_app_paused{0};
 static std::atomic<int> s_rsx_parked{1};
 extern "C" void port_app_set_paused(int paused) { s_app_paused.store(paused ? 1 : 0, std::memory_order_release); }
 extern "C" int  port_app_rsx_parked(void)       { return s_rsx_parked.load(std::memory_order_acquire); }
+/* BG_TRIM=1 (opt-in): while parked, let go of GPU memory that is refilled on
+ * use (rsx_metal_backend_bg_trim), so iOS is less likely to close the app. */
+extern "C" void rsx_metal_backend_bg_trim(void);
+extern "C" void rsx_metal_backend_bg_restore(void);
+static int bg_trim_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("BG_TRIM");
+        on = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr, "[ios-mem] background trim: %s (BG_TRIM)\n", on ? "on" : "off");
+    }
+    return on;
+}
 #endif
 static DWORD WINAPI frame_clock(LPVOID)
 {
@@ -252,8 +266,11 @@ static DWORD WINAPI frame_clock(LPVOID)
 #if defined(PORT_IOS)
         if (s_app_paused.load(std::memory_order_acquire)) {
             fprintf(stderr, "[ios] frame clock parked (app in background)\n");
+            const int trim = bg_trim_on();
+            if (trim) rsx_metal_backend_bg_trim();
             s_rsx_parked.store(1, std::memory_order_release);
             while (s_app_paused.load(std::memory_order_acquire)) usleep(10000);
+            if (trim) rsx_metal_backend_bg_restore();
             s_rsx_parked.store(0, std::memory_order_release);
             next_tick = GetTickCount64();   /* resume on time: no burst of missed vblanks */
             fprintf(stderr, "[ios] frame clock resumed\n");

@@ -5161,6 +5161,77 @@ void rsx_metal_backend_wait_idle(void)
     }
 }
 
+/* Background memory trim (iOS, BG_TRIM=1, opt-in). A smaller app is less
+ * likely to be closed by iOS while in the background. Runs on the RSX thread
+ * as it parks, so nothing encodes meanwhile. With the GPU idle it lets go of
+ * memory that is refilled on use:
+ *   - the texture pool (dropped textures kept for reuse): released;
+ *   - the stage ring (upload buffers written fresh for every draw): pages
+ *     emptied (purgeable), the buffers stay mapped;
+ *   - the geometry memo arena: pages emptied, and the engine forgets every
+ *     entry so nothing reads the old bytes.
+ * Render targets and cached guest textures stay: they hold the picture.
+ * bg_restore makes the buffers non-volatile again before the clock resumes. */
+extern void rsx_draw_engine_geo_forget(void);
+static int s_bg_trimmed;
+static void* s_bg_arena_ptr;
+static void* s_bg_ring_ptr[ENG_STAGE_RING];
+
+void rsx_metal_backend_bg_trim(void)
+{
+    if (!s_queue || s_bg_trimmed) return;
+    rsx_metal_backend_wait_idle();
+    @autoreleasepool {
+        u64 pool = 0, ring = 0, arena = 0, kept = 0;
+        for (u32 i = 0; i < ENG_MAX_OBJECTS; i++)
+            if (s_eng_obj[i]) kept += (u64)s_eng_obj[i].allocatedSize;
+        for (u32 k = 0; k < s_pool_n; k++) {
+            if (s_pool_tex[k]) pool += (u64)s_pool_tex[k].allocatedSize;
+            s_pool_tex[k] = nil;
+        }
+        s_pool_n = 0;
+        s_pool_bytes = 0;
+        for (u32 i = 0; i < ENG_STAGE_RING; i++) {
+            s_bg_ring_ptr[i] = NULL;
+            if (!s_eng_ring[i].buf) continue;
+            ring += (u64)s_eng_ring[i].buf.allocatedSize;
+            s_bg_ring_ptr[i] = [s_eng_ring[i].buf contents];
+            [s_eng_ring[i].buf setPurgeableState:MTLPurgeableStateEmpty];
+        }
+        if (s_eng_arena) {
+            rsx_draw_engine_geo_forget();
+            arena = (u64)s_eng_arena.allocatedSize;
+            s_bg_arena_ptr = [s_eng_arena contents];
+            [s_eng_arena setPurgeableState:MTLPurgeableStateEmpty];
+        }
+        s_bg_trimmed = 1;
+        fprintf(stderr, "[ios-mem] trim: texture pool %llu MB, stage ring %llu MB, geometry memo "
+                "%llu MB let go; kept: textures and targets %llu MB; Metal total now %llu MB\n",
+                (unsigned long long)(pool >> 20), (unsigned long long)(ring >> 20),
+                (unsigned long long)(arena >> 20), (unsigned long long)(kept >> 20),
+                (unsigned long long)([s_dev currentAllocatedSize] >> 20));
+    }
+}
+
+void rsx_metal_backend_bg_restore(void)
+{
+    if (!s_bg_trimmed) return;
+    s_bg_trimmed = 0;
+    int moved = 0;
+    for (u32 i = 0; i < ENG_STAGE_RING; i++) {
+        if (!s_eng_ring[i].buf) continue;
+        [s_eng_ring[i].buf setPurgeableState:MTLPurgeableStateNonVolatile];
+        if ([s_eng_ring[i].buf contents] != s_bg_ring_ptr[i]) moved = 1;
+    }
+    if (s_eng_ring[s_eng_ring_cur].buf) s_eng_stage = (u8*)[s_eng_ring[s_eng_ring_cur].buf contents];
+    if (s_eng_arena) {
+        [s_eng_arena setPurgeableState:MTLPurgeableStateNonVolatile];
+        if ([s_eng_arena contents] != s_bg_arena_ptr) moved = 1;
+    }
+    fprintf(stderr, "[ios-mem] trim undone%s\n",
+            moved ? ": a buffer MOVED (geometry memo now unsafe)" : ", buffers in place");
+}
+
 void rsx_metal_backend_shutdown(void)
 {
     @autoreleasepool {
