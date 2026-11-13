@@ -42,6 +42,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
 
 #define SS_MAX 64          /* guest thread ids tracked (same bound as g_sc_inflight) */
 #define SS_HF  64          /* host frames kept per thread */
@@ -100,8 +101,50 @@ static int ss_env_int(const char* n, int d)
  * the hooks on. */
 static double ss_env_f(const char* n) { const char* e = getenv(n); return e ? atof(e) : 0.0; }
 static int ss_env_set(const char* n) { const char* e = getenv(n); return e && *e; }
+
+/* iOS / iPadOS, PORT_SAVE_STATES builds only (SS_MENU=0 turns it off): the hooks are on
+ * from the start so the in-game menu can save (port_ss_save_async) and the app can save
+ * on its way to the background. A load only works at process start, so "load" leaves a
+ * marker file in Documents (port_ss_load_next) and the app closes; the next start reads
+ * the marker once (it is deleted first: a load that crashes does not come back) and loads
+ * that save as if SS_LOAD named it. Other builds: no change. */
+#if defined(PORT_SAVE_STATES) && TARGET_OS_IOS
+#define SS_MENU_BUILD 1
+#else
+#define SS_MENU_BUILD 0
+#endif
+#define SS_NEXT_MARK "ss_load_next"
+static int s_ss_menu;               /* 1: menu saves on */
+static char s_ss_marked[256];       /* save named by the marker at this start, for the log */
+static int ss_menu_boot(void)
+{
+#if SS_MENU_BUILD
+    const char* e = getenv("SS_MENU");
+    if (e && *e == '0') return 0;
+    s_ss_menu = 1;
+    const char* home = getenv("HOME");
+    if (home && *home && !ss_env_set("SS_LOAD")) {
+        char mk[1024], name[256] = { 0 };
+        snprintf(mk, sizeof mk, "%s/Documents/" SS_NEXT_MARK, home);
+        if (FILE* f = fopen(mk, "r")) {
+            if (fgets(name, sizeof name, f)) name[strcspn(name, "\r\n")] = 0;
+            fclose(f);
+            unlink(mk);
+            if (name[0] && !strchr(name, '/')) {
+                char p[1024];
+                snprintf(p, sizeof p, "%s/Documents/%s", home, name);
+                setenv("SS_LOAD", p, 1);
+                snprintf(s_ss_marked, sizeof s_ss_marked, "%s", name);
+            }
+        }
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
 __attribute__((used)) static int s_ss_init =
-    (g_ss_on = (ss_env_f("SS_PROBE") > 0.0 || ss_env_f("SS_SAVE_AT") > 0.0 || ss_env_set("SS_LOAD")) ? 1 : 0, 0);
+    (g_ss_on = (ss_menu_boot() || ss_env_f("SS_PROBE") > 0.0 || ss_env_f("SS_SAVE_AT") > 0.0 || ss_env_set("SS_LOAD")) ? 1 : 0, 0);
 
 static inline int ss_gok(uint32_t a, uint32_t n)
 {
@@ -802,7 +845,76 @@ static int ss_save(const char* path, int wait_ms)
             ms.ranges, ms.mapped / MB, ms.nonzero / MB, ms.packed / MB, tab / MB, size / MB);
     return ok;
 }
+
+/* Menu / background save: on a thread of its own, into <path>.part, renamed over <path>
+ * only when it worked (a failed save keeps the old one). */
+typedef void (*port_ss_done_fn)(int ok, void* user);
+struct ss_async { char path[1024]; port_ss_done_fn done; void* user; };
+static volatile int s_ss_busy;
+static void* ss_async_thread(void* p)
+{
+    pthread_setname_np("ss-save");
+    ss_async* a = (ss_async*)p;
+    char tmp[1040];
+    snprintf(tmp, sizeof tmp, "%s.part", a->path);
+    int ok = ss_save(tmp, ss_env_int("SS_PROBE_WAIT_MS", 5000));
+    if (ok && rename(tmp, a->path) != 0) { ok = 0; unlink(tmp); }
+    fprintf(stderr, "[ss] menu save %s: %s\n", ok ? "ok" : "FAILED", a->path);
+    fflush(stderr);
+    __atomic_store_n(&s_ss_busy, 0, __ATOMIC_RELEASE);
+    if (a->done) a->done(ok, a->user);
+    free(a);
+    return NULL;
+}
 #endif
+
+/* Shell interface (all Apple builds; 0 = not a save-state build, or SS_MENU=0). */
+extern "C" int port_ss_available(void) { return s_ss_menu; }
+
+/* Starts a save; done(ok, user) runs on the save thread when it ends. Returns 0 when it
+ * did not start (no save states, a save already running). */
+extern "C" int port_ss_save_async(const char* path, void (*done)(int ok, void* user), void* user)
+{
+#if defined(PORT_SAVE_STATES)
+    if (!s_ss_menu || !path || !*path || strlen(path) >= 1000) return 0;
+    if (__atomic_exchange_n(&s_ss_busy, 1, __ATOMIC_ACQ_REL)) return 0;
+    ss_async* a = (ss_async*)calloc(1, sizeof(ss_async));
+    pthread_t th;
+    if (a) {
+        snprintf(a->path, sizeof a->path, "%s", path);
+        a->done = done;
+        a->user = user;
+        if (pthread_create(&th, NULL, ss_async_thread, a) == 0) { pthread_detach(th); return 1; }
+        free(a);
+    }
+    __atomic_store_n(&s_ss_busy, 0, __ATOMIC_RELEASE);
+#else
+    (void)path; (void)done; (void)user;
+#endif
+    return 0;
+}
+
+extern "C" int port_ss_save_busy(void)
+{
+#if defined(PORT_SAVE_STATES)
+    return __atomic_load_n(&s_ss_busy, __ATOMIC_ACQUIRE);
+#else
+    return 0;
+#endif
+}
+
+/* Leaves the marker that makes the next start load Documents/<name>. Returns 1 if written. */
+extern "C" int port_ss_load_next(const char* name)
+{
+    const char* home = getenv("HOME");
+    if (!s_ss_menu || !home || !name || !*name || strchr(name, '/')) return 0;
+    char mk[1024];
+    snprintf(mk, sizeof mk, "%s/Documents/" SS_NEXT_MARK, home);
+    FILE* f = fopen(mk, "w");
+    if (!f) return 0;
+    const int ok = fprintf(f, "%s\n", name) > 0;
+    return (fclose(f) == 0) && ok;
+}
 
 /* --- save size estimate ---------------------------------------------------- */
 
@@ -876,6 +988,8 @@ static void ss_mem(int probe)
 static void* ss_thread(void*)
 {
     pthread_setname_np("ss-probe");
+    if (s_ss_menu)
+        fprintf(stderr, "[ss] menu saves on (SS_MENU)%s%s\n", s_ss_marked[0] ? "; this start loads " : "", s_ss_marked);
     const double mean = ss_env_f("SS_PROBE");
     if (mean <= 0.0) {   /* SS_SAVE_AT: one save */
         const double at = ss_env_f("SS_SAVE_AT");
