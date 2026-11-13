@@ -95,7 +95,7 @@
   Teleport is not mapped yet.
 - Only works in free roam. Missions and cutscenes restart at the game's
   checkpoint. Enemies and the world reset.
-- About 3–5 days. Game-specific and fragile.
+- About 3–5 hours. Game-specific and fragile.
 
 ### D. Quick wins for switching apps
 
@@ -104,19 +104,25 @@
   (`rsx_draw_engine.c:3401-3411`).
 - Smaller apps are less likely to be closed by iOS. This helps, but does
   not guarantee anything.
-- About 1–2 days, with before/after memory numbers.
+- About 1–2 hours, with before/after memory numbers.
 
 ## Order and time
 
+Times are hands-on working time (code, builds, test runs), not
+people-days. Builds and test runs take most of it: a full rebuild of the
+lifted code is about 15 CPU-minutes (5–10 min on the Mac), an iPad
+build-and-run cycle about 15–20 min.
+
 | Step | What | Time | Result |
 |---|---|---|---|
-| 1 | D: free memory in the background (iPad/iPhone) | 1–2 days | Fewer lost sessions |
-| 2 | A phase 0 on the Mac: safe-point stop + call-chain check at 100 random moments in a 30-min run, no loading yet | 2–3 days | Go / no-go, save size, stop time |
-| 3 | A phase 1 on the Mac: lifter resume mode, save and load, GPU readback | 1–2 weeks | Save, quit, load works on the Mac |
-| 4 | A phase 2: iPad and iPhone, Save/Load in the pause overlay, auto-save on background | 1–2 weeks | Full feature |
+| 1 | D: free memory in the background (iPad/iPhone) | 1–2 h | Fewer lost sessions |
+| 2 | A phase 0 on the Mac: safe-point stop + call-chain check at 100 random moments in a 30-min run, no loading yet | 2–3 h | Go / no-go, save size, stop time |
+| 3 | A phase 1 on the Mac: lifter resume mode, save and load, GPU readback | 6–12 h | Save, quit, load works on the Mac |
+| 4 | A phase 2: iPad and iPhone, Save/Load in the pause overlay, auto-save on background | 2–3 h | Full feature |
 
-- Option A in total: about 3–5 weeks. The estimate is uncertain until
-  phase 0 is done.
+- Option A in total: about 10–20 hours. Step 3 is the uncertain one:
+  each lifter change means a regenerate and rebuild, and load bugs
+  take test cycles. Phase 0 makes the estimate firmer.
 - C is only worth it if A fails in phase 0.
 
 ## Risks
