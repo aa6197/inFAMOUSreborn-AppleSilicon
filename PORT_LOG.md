@@ -59,10 +59,11 @@ Read this first every session. Newest entry on top.
   (memory, kernel, files, 36/36 threads back in 130 ms, no crash).
   Graphics (GCM / RSX) restore works: the walker runs on from the saved
   FIFO spot and a flip goes through. SPURS restore works: the title
-  runs on after a load. HLE library state works: START plays the
-  opening cutscene after a load, then black. The SPURS taskset (FIOS)
-  task is saved and restored, but it was not the cause. Next: audio,
-  clocks. See entries "Save states: SPURS taskset task",
+  runs on after a load. HLE library state works. The SPURS taskset
+  (FIOS) task is saved and restored. Audio restore works, and with it
+  **a load from the title reaches gameplay** (START, cutscene,
+  tutorial; 2 of 2 runs). Next: clocks. See entries "Save states:
+  audio", "Save states: SPURS taskset task",
   "Save states: HLE libraries", "Save states: SPURS",
   "Save states: graphics",
   "Save states: load, PPU core",
@@ -150,6 +151,33 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: audio (Mac) — load reaches gameplay
+
+### Audio restore (Mac, test build only)
+
+- Cause of the black screen after a load: the cellAudio mixing thread
+  did not exist in the new process. The game's audio loop waits on the
+  audio event queue, so it never woke and the game stalled after the
+  cutscene.
+- Save: `ss_audio_hold` parks the mixing thread at the top of its loop
+  (paced and plain loops). It writes guest read indexes and sends
+  events, so it must not run while memory is saved.
+- Saved as `mod:` blobs: init flag, ports (buffers and read indexes are
+  guest memory), notify queues.
+- Load (`ss_audio_restore`): each open port points at its guest buffer
+  again, the host device opens again, the mixing thread starts.
+- Results: save (`runs/20261113-180546-ss-asave1`, at 30 s): "audio
+  held", frozen 736 ms, file 241 MB. Save check: **0 pages differ**
+  (page 0x58100000 used to differ: that was the mixer). Only the timer
+  table differs (clocks, next step).
+- Load (`runs/20261113-180624-ss-aload1` and `-180852-ss-aload2`):
+  "audio back (1 ports, mixing thread started)", 18 `[audio-rate]`
+  lines (was 0). START at 8 s: cutscene, then **gameplay** (the
+  tutorial with the "look up at the chopper" hint). Same in both runs.
+- Normal Mac build builds, boots and plays audio
+  (`runs/20261113-181027-mac-auchk`).
+- Next: clocks (timer table), then longer play after a load.
 
 ## 2026-11-13 (evening) — Save states: SPURS taskset task (Mac)
 

@@ -178,6 +178,20 @@ static mutex_t       s_audio_mutex;
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
+#if defined(__APPLE__)
+/* Save states (Apple; see the block at the end of this file): while a save runs
+ * the mixing thread waits here (it writes guest read indexes and pushes events). */
+static volatile int s_audio_ss_hold, s_audio_ss_parked;
+static int audio_ss_park(void)
+{
+    if (!s_audio_ss_hold) return 0;
+    __atomic_store_n(&s_audio_ss_parked, 1, __ATOMIC_SEQ_CST);
+    while (s_audio_ss_hold && s_mix_thread_running) usleep(500);
+    __atomic_store_n(&s_audio_ss_parked, 0, __ATOMIC_SEQ_CST);
+    return 1;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
@@ -1363,6 +1377,9 @@ static void audio_mix_loop_paced(void)
             audio_stretch_on() ? "ON" : "off", audio_stretch_max(), st_lo, st_mn, ahead_blocks, ST_HS + ST_OV);
     unsigned long long n_eager = 0;
     while (s_mix_thread_running) {
+#if defined(__APPLE__)
+        if (audio_ss_park()) { next = audio_now_ns(); continue; }   /* save states: no catch-up burst after */
+#endif
         uint64_t now = audio_now_ns();
         int eager = 0;
         if (now < next) {
@@ -1536,6 +1553,9 @@ static void* audio_mix_thread_func(void* arg)
     if (audio_pace_enabled()) { audio_mix_loop_paced(); return NULL; }
 
     while (s_mix_thread_running) {
+#if defined(__APPLE__)
+        if (audio_ss_park()) continue;
+#endif
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
@@ -2044,3 +2064,49 @@ s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
     printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
     return CELL_OK;
 }
+
+#if defined(__APPLE__)
+/* ---------------------------------------------------------------------------
+ * Save states (Apple; runtime/ppu/ppu_ss_probe.cpp saves, ppu_ss_load.cpp loads).
+ * The ports (their buffers and read indexes are guest memory) and the notify
+ * queues are saved as raw bytes; the load opens the host device again, points
+ * each port at its guest buffer and starts the mixing thread.
+ * -----------------------------------------------------------------------*/
+/* on = 1: park the mixing thread (waits up to ~1 s). No stdio: the save calls
+ * this while the PPU threads are suspended. */
+int ss_audio_hold(int on)
+{
+    if (!on) { __atomic_store_n(&s_audio_ss_hold, 0, __ATOMIC_SEQ_CST); return 1; }
+    __atomic_store_n(&s_audio_ss_hold, 1, __ATOMIC_SEQ_CST);
+    if (!s_mix_thread_running) return 1;
+    for (int k = 0; k < 2000; k++) {
+        if (__atomic_load_n(&s_audio_ss_parked, __ATOMIC_SEQ_CST)) return 1;
+        usleep(500);
+    }
+    return 0;
+}
+void ss_audio_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("audio.init", (void*)&s_audio_initialized, sizeof s_audio_initialized);
+    add("audio.ports", (void*)s_ports, sizeof s_ports);
+    add("audio.notify", (void*)s_notify_queues, sizeof s_notify_queues);
+}
+/* After the blobs are back. Returns the number of open ports, -1 if audio was not on. */
+int ss_audio_restore(void)
+{
+    if (!s_audio_initialized) return -1;
+    int n = 0;
+    for (int i = 0; i < CELL_AUDIO_PORT_MAX; i++) {
+        s_ports[i].buffer = s_ports[i].in_use ? (float*)(vm_base + (u32)s_ports[i].port_addr) : NULL;
+        if (s_ports[i].in_use) n++;
+    }
+    mutex_init(&s_audio_mutex);
+    if (audio_backend_init() < 0)
+        fprintf(stderr, "[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }   /* clocks: later step */
+    if (audio_start_mix_thread() < 0)
+        fprintf(stderr, "[cellAudio] WARNING: Could not start mixing thread\n");
+    return n;
+}
+#endif

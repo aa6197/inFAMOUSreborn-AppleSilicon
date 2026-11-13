@@ -26,7 +26,9 @@
  * SPURS taskset tasks on their own threads (inFamous: the FIOS streaming task) were
  * held in their WAIT_SIGNAL wait at the save; each gets a new thread that waits
  * again and carries on from its saved SPU context (spu_workload.c).
- * Not yet: audio, clocks (the next steps).
+ * Audio: the ports and notify queues come back as blobs; the host device opens
+ * again and the mixing thread starts (ss_audio_restore).
+ * Not yet: clocks (the next step).
  */
 #if defined(__APPLE__)
 
@@ -69,6 +71,8 @@ extern "C" int  spurs_pm_ss_load(const uint8_t* p, uint64_t n);   /* runtime/spu
 extern "C" void ss_spu_blobs(ss_add_fn add);                       /* runtime/spu/spu_workload.c */
 extern "C" int  ss_spu_tasks_load(const uint8_t* p, uint64_t n);
 extern "C" int  ss_spu_tasks_start(void);
+extern "C" void ss_audio_blobs(ss_add_fn add);                     /* libs/audio/cellAudio.c */
+extern "C" int  ss_audio_restore(void);
 extern "C" void ss_pad_blobs(ss_add_fn add);                  /* libs/input/cellPad.c */
 extern "C" int  ss_pad_restore(void);
 extern "C" void ss_kb_blobs(ss_add_fn add);                   /* libs/input/cellKb.c */
@@ -100,6 +104,7 @@ static void ss_mods_do(void)
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
     ss_spurs_blobs(ss_file_mod_add);
     ss_spu_blobs(ss_file_mod_add);
+    ss_audio_blobs(ss_file_mod_add);
     /* HLE libraries with host-side state (init flags, callbacks, open dialog) */
     ss_pad_blobs(ss_file_mod_add);
     ss_kb_blobs(ss_file_mod_add);
@@ -333,6 +338,9 @@ static int ss_load_all(const char* path)
     const int dlg = ss_msgdialog_restore();
     fprintf(stderr, "[ss] load: libraries back (pad %s, %d sysutil completions, dialog %s)\n",
             pad ? "open" : "closed", ncomp, dlg ? "open" : "none");
+    const int nau = ss_audio_restore();
+    if (nau < 0) fprintf(stderr, "[ss] load: audio was not on\n");
+    else fprintf(stderr, "[ss] load: audio back (%d ports, mixing thread started)\n", nau);
 
     const int ns = ss_start_threads();
     if (ns < 0) { fprintf(stderr, "[ss] load FAILED: threads\n"); abort(); }
