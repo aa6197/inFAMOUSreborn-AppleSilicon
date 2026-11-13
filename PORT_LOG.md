@@ -29,8 +29,11 @@ Read this first every session. Newest entry on top.
   (start: ~14), ~31 cool. Goal: high 30s. The hot phone is CPU-bound:
   GPU-only cuts no longer raise fps. Two short freezes came back in
   rounds 7–8 (open). See entries "iPhone: in-run A/B, profile, ..." and
-  "iPhone: lane workers at higher priority". 11-13: full run 32.2 /
-  28.6 hot, no freezes; 360p +28%, shadows off +7%, near-only +6%.
+  "iPhone: lane workers at higher priority". 11-13: full run at 720p
+  **28.3 / 27.8** hot, no freezes (~+20%); 360p +28%; at 450p shadows
+  off +7%, near-only +6%. The phone's Settings app has Resolution saved
+  at 450p (the user's setting, leave it); tests force 720p with
+  `RENDER_SCALE=100`.
 - **11-12 evening (iPad only):** shadows cost ~10% on the iPad; new
   Shadows setting (On / Near only / Off, default On). Three exact RSX
   thread trims (plan memo, program reuse, dead-method skip), each small.
@@ -48,9 +51,9 @@ Read this first every session. Newest entry on top.
   Next: phase 1, an opt-in lifter flag for that. See entry "Save states
   phase 0, background trim, iPhone round 9".
 - **BG_TRIM=1 (11-13, iOS, opt-in):** lets go of the texture pool,
-  stage ring and geometry memo in the background. Built; not yet
-  tested on a device (iPad was offline). Ask the user about the default
-  after the test.
+  stage ring and geometry memo in the background. iPhone: ~520 MB less
+  in the background (1051 vs 1574 MB), clean resume. Default still off;
+  waiting on the user's call.
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -162,16 +165,32 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
   geometry memo (refilled on use), and ask malloc to give memory back.
   Logs `[ios-mem] background: footprint A -> B MB` and the foreground
   number. Default off.
-- Builds for the Mac and iOS. Not yet tested on a device: the iPad was
-  offline. Next: one run with and one without, then ask the user about
-  the default.
+- Builds for the Mac and iOS. iPhone test (450p, one run each, Settings
+  app opened at 140 s, game back at ~180 s):
+  - With trim (`20261113-121918-iphone-bgtrim1`): freed texture pool
+    8 MB, stage ring 256 MB, geometry memo 256 MB; kept 197 MB of
+    textures and targets. Footprint 1688 MB going to the background,
+    **1051 MB** at the foreground line (before restore). Available
+    memory 5092 MB.
+  - Without (`20261113-122406-iphone-bgctl1`): 1703 → **1574 MB**,
+    available 4569 MB.
+  - About 520 MB less while in the background. Resume was clean in
+    both (screenshot: textures right; ~36 flips/s after).
+  - The `background: A -> B` line is taken before the RSX thread has
+    parked, so the drop shows only at the foreground line. The event
+    handler logs twice (old, harmless).
+- Not tested on the iPad yet (offline). Default stays off until the
+  user decides.
 
 ### iPhone round 9 (in-run A/B, 300 s window, 18 pairs each)
 
 - Resolution 720p → 360p: 37.3 → 47.6 flips/s (+27.7%), thermal fair.
-- Shadows All → Near only: 43.2 → 45.8 (+6.0%), thermal serious.
-- Shadows All → Off: 31.3 → 33.5 (+7.1%), thermal serious (re-run at
-  11:37; the first try had no data, the app was in the background).
+- Shadows All → Near only (450p): 43.2 → 45.8 (+6.0%), thermal serious.
+- Shadows All → Off (450p): 31.3 → 33.5 (+7.1%), thermal serious (re-run
+  at 11:37; the first try had no data, the app was in the background).
+- Both shadow tests ran at 450p: the Settings app had Resolution saved
+  at 450p (set while the user had the phone). Env `RENDER_SCALE` wins
+  over the saved value.
 - Flash check on that run (`ZS_SUB_WATCH=1`): 0 bad reads at
   0x01AB8000, 122 kept as colour. Clean on the iPhone too.
 
@@ -179,9 +198,12 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 - Mac static scene 99.2 / 100.7 flips/s (was ~92).
 - iPad 53.8 / 53.0 (11-11: 55.6 / 51.9, same within noise).
-- iPhone full 330 s run, default settings, thermal serious: **32.2 /
-  28.6** steady, no freezes (11-12 hot: ~23). Runs
-  `20261113-114657-iphone-base1113a` and `-115309-iphone-base1113b`.
+- iPhone full 330 s run at 720p (`RENDER_SCALE=100`), thermal serious:
+  **28.3 / 27.8** steady, no freezes (11-12 hot: ~23, so ~+20%). Runs
+  `20261113-122927-iphone-base720a` and `-123540-iphone-base720b`.
+- iPhone at the saved 450p: 32.2 / 28.6 (`-114657-iphone-base1113a`,
+  `-115309-iphone-base1113b`). Only a little faster than 720p on a hot
+  phone: the CPU is the limit.
 
 ## 2026-11-13 — Yellow/blue flash fix always on
 
