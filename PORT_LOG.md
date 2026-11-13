@@ -65,8 +65,11 @@ Read this first every session. Newest entry on top.
   tutorial; 4 of 4 runs). Clocks: the guest clock goes on from the
   save. **iPad (11-13):** in-game menu "Save state" / "Load state"
   and a save on the way to the background work (save ~0.55 s, load
-  ~0.3–0.55 s, gameplay after a load). Next: the same on the iPhone,
-  save from gameplay, then Mac. See entries "Save states on iPad",
+  ~0.3–0.55 s, gameplay after a load). **iPhone (11-13):** the same
+  works (save ~0.8 s, load ~0.5 s). Movies after a load work again
+  (the Bink decoder thread is saved and started again). Next: a save
+  in the middle of the iPhone intro movie, then Mac. See entries
+  "Save states: movies after a load", "Save states on iPad",
   "Save states: clocks", "Save states: audio",
   "Save states: SPURS taskset task",
   "Save states: HLE libraries", "Save states: SPURS",
@@ -156,6 +159,53 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: movies after a load (Bink SPU worker), iPhone results
+
+### Problem
+
+- iPhone: a menu save made during the intro movie (01_intro.bik, the
+  iPhone plays it at boot) hung after the load (run 193710).
+- iPad: after a load of a title save the billboard TV stood still.
+- Cause: the Bink movie decoder is an SPU thread group ("RADG5", one
+  thread, tid 0x2000) running lifted SPU code on its own host thread.
+  Save / load did not include the SPU group and thread tables, so after
+  a load there was no decoder and any movie waited forever.
+
+### Fix (Apple only, lv2_register.c + ppu_ss_probe.cpp + ppu_ss_load.cpp)
+
+- Save: `ss_sputhr_hold` holds each lifted receive worker between
+  requests (a worker that is decoding finishes and sends its completion
+  first). It counts as held once it is idle and took no request for
+  5 ms. The "[ss] save:" line now says "SPU threads N held".
+- The SPU group and thread tables are saved as raw bytes.
+- Load: `ss_sputhr_restore` starts every thread that was running again
+  from its entry point (as group_start does: image deployed again, same
+  four args). Host pointers from the old process are cleared.
+  Log: "[ss] load: SPU threads back (1 started, 0 not)".
+
+### Results (iPad Pro 11 M4, save-state build)
+
+| Test | Result |
+|---|---|
+| Title save at 30 s (run 195704, `SS_SAVE_CHECK=1`) | ok: SPU threads 1 held, frozen 714 ms, total 760 ms, 0 pages differ |
+| Load of it (run 195757) | ok: SPU threads back (1 started), load 284 ms, decoder takes requests, billboard TV moves |
+| Gameplay save at 55 s (run 200122 pair) | ok: frozen 578 ms, total 607 ms |
+| Load of it | ok: load 289 ms, decoder back, gameplay runs on |
+| Normal iOS build | compiles |
+
+- Not tested yet: a save in the middle of a full-screen movie. The iPad
+  skips 01_intro.bik (it goes to gameplay), so this needs the iPhone.
+
+### iPhone 16 Pro results (save-state build, before the fix)
+
+| Test | Result |
+|---|---|
+| Menu "Save state" from gameplay (run 194026) | ok: ~0.81 s |
+| Background save (same run) | ok: 0.88–1.2 s |
+| Menu "Load state" ×2, next start (runs 194338, 194426) | ok: load ~0.47 s, gameplay runs on |
+| Menu fits the iPhone screen | ok (rows shrink to fit) |
+| Save during the intro movie (runs 193429, 193710) | hung after the load: fixed above, re-test on the iPhone |
 
 ## 2026-11-13 (evening) — Save states on iPad: menu Save / Load, background save
 
