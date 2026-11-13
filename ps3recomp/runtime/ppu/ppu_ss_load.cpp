@@ -73,6 +73,8 @@ extern "C" int  spurs_pm_ss_load(const uint8_t* p, uint64_t n);   /* runtime/spu
 extern "C" void ss_spu_blobs(ss_add_fn add);                       /* runtime/spu/spu_workload.c */
 extern "C" int  ss_spu_tasks_load(const uint8_t* p, uint64_t n);
 extern "C" int  ss_spu_tasks_start(void);
+extern "C" void ss_sputhr_blobs(ss_add_fn add);                    /* syscalls/lv2_register.c */
+extern "C" int  ss_sputhr_restore(int* lost);
 extern "C" void ss_audio_blobs(ss_add_fn add);                     /* libs/audio/cellAudio.c */
 extern "C" int  ss_audio_restore(void);
 extern "C" void ss_clock_blobs(ss_add_fn add);                     /* syscalls/sys_timer.c */
@@ -109,6 +111,7 @@ static void ss_mods_do(void)
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
     ss_spurs_blobs(ss_file_mod_add);
     ss_spu_blobs(ss_file_mod_add);
+    ss_sputhr_blobs(ss_file_mod_add);
     ss_audio_blobs(ss_file_mod_add);
     ss_clock_blobs(ss_file_mod_add);
     /* HLE libraries with host-side state (init flags, callbacks, open dialog) */
@@ -344,6 +347,9 @@ static int ss_load_all(const char* path)
     const int nsts = ss_spu_tasks_start();
     fprintf(stderr, "[ss] load: SPURS back (%d instances, %d policy contexts, %d of %d SPU tasks started)\n",
             nsi, npm, nsts, nst);
+    int sp_lost = 0;
+    const int nsp = ss_sputhr_restore(&sp_lost);
+    fprintf(stderr, "[ss] load: SPU threads back (%d started, %d not)\n", nsp, sp_lost);
     const int pad = ss_pad_restore();
     const int ncomp = ss_sysutil_restore();
     const int dlg = ss_msgdialog_restore();

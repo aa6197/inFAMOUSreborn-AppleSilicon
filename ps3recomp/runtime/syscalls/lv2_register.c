@@ -870,6 +870,15 @@ static void spu_lifted_recv_fake_completion(spu_thread_t* t, uint32_t work_ea)
                 obj, slot, port, t->connected_queue, erc);
 }
 
+#if defined(__APPLE__)
+/* Save states (ss_sputhr_hold below): a save holds every lifted receive worker
+ * between requests, so the snapshot never catches a decode half done.
+ * s_sputhr_idle[i] = 1 while thread i waits for a request (or is held before
+ * its receive); s_sputhr_reqs[i] counts requests taken. */
+static volatile int      s_sputhr_hold;
+static volatile int      s_sputhr_idle[MAX_SPU_THREADS];
+static volatile uint32_t s_sputhr_reqs[MAX_SPU_THREADS];
+#endif
 static LARGE_INTEGER s_recv_t0;   /* when the current request was received */
 static int spu_lifted_recv_hook(spu_context* sc, uint32_t key, uint32_t out[4])
 {
@@ -914,6 +923,11 @@ static int spu_lifted_recv_hook(spu_context* sc, uint32_t key, uint32_t out[4])
             spu_lifted_recv_fake_completion(t, t->recv_inflight);
         t->recv_inflight = 0;
     }
+#if defined(__APPLE__)
+    const int ss_ti = (int)(t - s_spu_threads);
+    __atomic_store_n(&s_sputhr_idle[ss_ti], 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&s_sputhr_hold, __ATOMIC_SEQ_CST)) usleep(500);   /* a save is running */
+#endif
     extern int sys_event_queue_receive_host(uint32_t, sys_event_t*, uint32_t);
     sys_event_t ev;
     for (;;) {
@@ -924,6 +938,10 @@ static int spu_lifted_recv_hook(spu_context* sc, uint32_t key, uint32_t out[4])
             for (;;) Sleep(1000);
         }
     }
+#if defined(__APPLE__)
+    __atomic_store_n(&s_sputhr_idle[ss_ti], 0, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&s_sputhr_reqs[ss_ti], 1, __ATOMIC_SEQ_CST);
+#endif
     out[0] = 0;                         /* CELL_OK */
     out[1] = (uint32_t)ev.data1;
     out[2] = (uint32_t)ev.data2;
@@ -2849,3 +2867,105 @@ int lv2_try_syscall(ppu_context* ctx)
                       num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
     return 1;
 }
+
+#if defined(__APPLE__)
+/* ---------------------------------------------------------------------------
+ * Save states (Apple; runtime/ppu/ppu_ss_probe.cpp saves, ppu_ss_load.cpp loads).
+ * SPU thread groups started with sys_spu_thread_group_start (inFamous: the Bink
+ * movie decoder, group "RADG5") run their lifted image on host threads that a
+ * load does not have. The tables are saved as raw bytes; the load starts every
+ * thread that was running again from its entry point, as group_start did. That
+ * is right for a worker held between requests (its local store holds nothing
+ * the next request needs; the image and its data are deployed again).
+ * -----------------------------------------------------------------------*/
+static int ss_sputhr_running(int i)
+{
+    const spu_thread_t* t = &s_spu_threads[i];
+    return t->in_use && t->running && t->sctx && t->lifted_recv;
+}
+/* on = 1: hold the lifted receive workers between requests (waits up to ~1 s).
+ * Returns 1 when every one is held, 0 if one stayed busy. No stdio: the save
+ * calls this while the PPU threads are suspended. *threads = workers seen. */
+int ss_sputhr_hold(int on, int* threads)
+{
+    if (threads) *threads = 0;
+    if (!on) { __atomic_store_n(&s_sputhr_hold, 0, __ATOMIC_SEQ_CST); return 1; }
+    __atomic_store_n(&s_sputhr_hold, 1, __ATOMIC_SEQ_CST);
+    int n = 0;
+    for (int i = 0; i < MAX_SPU_THREADS; i++) n += ss_sputhr_running(i);
+    if (threads) *threads = n;
+    if (!n) return 1;
+    uint32_t seen[MAX_SPU_THREADS];
+    for (int k = 0; k < 2000; k++) {
+        int idle = 1;
+        for (int i = 0; i < MAX_SPU_THREADS && idle; i++)
+            if (ss_sputhr_running(i) && !__atomic_load_n(&s_sputhr_idle[i], __ATOMIC_SEQ_CST)) idle = 0;
+        if (idle) {
+            /* Idle may be inside the receive: a request sent just before the PPU
+             * stopped would still wake it. Take it as held once nothing moved
+             * for 5 ms. */
+            for (int i = 0; i < MAX_SPU_THREADS; i++) seen[i] = __atomic_load_n(&s_sputhr_reqs[i], __ATOMIC_SEQ_CST);
+            usleep(5000);
+            int still = 1;
+            for (int i = 0; i < MAX_SPU_THREADS && still; i++)
+                if (ss_sputhr_running(i) && (!__atomic_load_n(&s_sputhr_idle[i], __ATOMIC_SEQ_CST) ||
+                                             __atomic_load_n(&s_sputhr_reqs[i], __ATOMIC_SEQ_CST) != seen[i])) still = 0;
+            if (still) return 1;
+        }
+        usleep(500);
+    }
+    return 0;
+}
+void ss_sputhr_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("spu.groups", (void*)s_spu_groups, sizeof s_spu_groups);
+    add("spu.threads", (void*)s_spu_threads, sizeof s_spu_threads);
+    add("spu.next_group", (void*)&s_spu_next_group_id, sizeof s_spu_next_group_id);
+    add("spu.next_thread", (void*)&s_spu_next_thread_id, sizeof s_spu_next_thread_id);
+    add("spu.init", (void*)&s_spu_initialized, sizeof s_spu_initialized);
+}
+/* After the blobs are back, before the PPU threads start. Returns the number of
+ * threads started; *lost = running threads that could not be (not lifted). */
+int ss_sputhr_restore(int* lost)
+{
+    int n = 0, nl = 0;
+    for (int i = 0; i < MAX_SPU_THREADS; i++) {
+        spu_thread_t* t = &s_spu_threads[i];
+        s_sputhr_idle[i] = 0;
+        if (!t->in_use) continue;
+        const int was = t->running;
+        /* host pointers and handles from the saving process */
+        t->sctx = NULL; t->live_ctx = NULL; t->local_store = NULL;
+        t->fb_handler = NULL; t->fb_user = NULL;
+        memset(&t->host_thread, 0, sizeof t->host_thread);
+        pthread_mutex_init(&t->finish_event.mu, NULL);
+        pthread_cond_init(&t->finish_event.cv, NULL);
+        t->finish_event.done = 1;
+        t->running = 0;
+        t->recv_inflight = 0;
+        if (!was) continue;
+        if (!t->lifted_recv || !spu_lifted_thread_available(t->entry_point)) {
+            nl++;
+            fprintf(stderr, "[ss] load: SPU thread tid=0x%X (group 0x%X entry 0x%05X) was running, not started again\n",
+                    t->tid, t->group_id, t->entry_point);
+            continue;
+        }
+        t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
+        if (!t->sctx) { nl++; continue; }
+        spu_lifted_thread_desc d;
+        d.tid      = t->tid;
+        d.group_id = t->group_id;
+        d.entry    = t->entry_point;
+        d.img_ea   = t->img_ea;
+        for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
+        spu_lifted_thread_setup(t->sctx, &d);
+        t->lifted_recv = spu_lifted_recv_enabled();
+        t->running = 1;
+        t->finish_event.done = 0;
+        spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+        n++;
+    }
+    if (lost) *lost = nl;
+    return n;
+}
+#endif
