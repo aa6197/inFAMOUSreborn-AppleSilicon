@@ -907,8 +907,16 @@ volatile unsigned long long g_icall_main = 0;
 extern "C" int g_hlestat_on;
 int g_hlestat_on = -1;
 static struct { uint32_t nid; const char* name; unsigned long long n, cyc; } s_hs[512];
+#if defined(__APPLE__)
+/* Apple port, save-state probe (ppu_ss_probe.cpp, SS_PROBE=<secs>, test only). */
+extern "C" int g_ss_on;
+extern "C" void ppu_ss_point(ppu_context* ctx, int where, uint32_t num);
+#endif
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+#if defined(__APPLE__)
+    if (__builtin_expect(g_ss_on, 0)) { ppu_ss_point(ctx, 3, nid); ps3_hle_call_impl(nid, ctx); ppu_ss_point(ctx, 4, nid); return; }
+#endif
     if (__builtin_expect(g_hlestat_on < 0, 0)) { const char* e = getenv("HLESTAT"); g_hlestat_on = (e && *e == '1'); }
     if (!g_hlestat_on || !ctx || ctx->thread_id != 1) { ps3_hle_call_impl(nid, ctx); return; }
     const unsigned long long t0 = __rdtsc();

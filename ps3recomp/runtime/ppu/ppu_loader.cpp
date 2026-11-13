@@ -4729,8 +4729,19 @@ extern "C" void ps3_ab_start(void)
 extern "C" void ps3_ab_start(void) {}
 #endif
 
+#if defined(__APPLE__)
+/* Apple port, save-state probe (ppu_ss_probe.cpp, SS_PROBE=<secs>, test only). */
+extern "C" int g_ss_on;
+extern "C" void ppu_ss_point(ppu_context* ctx, int where, uint32_t num);
+#endif
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+#if defined(__APPLE__)
+    /* Safe point: entry here, exit in the guard below. */
+    struct _SsGuard { ppu_context* c; ~_SsGuard() { if (__builtin_expect(g_ss_on, 0)) ppu_ss_point(c, 2, 0); } } _ssg{ ctx };
+    if (__builtin_expect(g_ss_on, 0)) ppu_ss_point(ctx, 1, (uint32_t)ctx->gpr[11]);
+#endif
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs
      * early and unconditionally; used to measure how far a guest block clear

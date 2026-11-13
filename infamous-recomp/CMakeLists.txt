@@ -371,6 +371,10 @@ set(PS3RECOMP_SCAFFOLD
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
 )
+if(APPLE)
+    # Save-state phase 0 probe (SS_PROBE=<secs>, test only; empty off Apple).
+    list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_probe.cpp")
+endif()
 
 # ---------------------------------------------------------------------------
 # Lifted SPU images (optional)
