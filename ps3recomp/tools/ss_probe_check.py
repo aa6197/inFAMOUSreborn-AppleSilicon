@@ -3,23 +3,21 @@
 
 usage: ss_probe_check.py <stderr.log> <game binary> [--examples N]
 
-For every thread of every probe it compares the host call chain (native
+For every thread of every probe it lines up the host call chain (native
 frames of lifted functions, innermost first) with the guest chain (LR words
-found by walking the guest back chain). A host frame "matches" when a guest
-return address, in order, points just after a call instruction inside that
-function. The call site must be exact for a resume: a host link through
-ps3_indirect_call (IC) needs a guest bctrl there, a direct link a bl to the
-callee.
+found by walking the guest back chain), one guest entry per host frame, in
+order. A direct link needs a guest return address just after a call inside
+the caller. A link through ps3_indirect_call (IC) needs a bctrl return there;
+today bctrl does not set the guest LR, so that slot holds an older value.
 
 Thread verdicts:
-  ok        every host frame matched, call kinds right
-  stale     an indirect link has a wrong or no guest return address: bctrl
-            does not set the guest LR, so the callee saved an older one (0 at
-            a thread entry). Fixed if bctrl set the guest LR.
-  missing   a host frame reached by a direct call has no guest return address
-  extra     the guest chain has frames between matches that the host has not
-            (not counted right after a stale indirect link)
+  ok        every host frame has its guest return address
+  stale     only IC slots are wrong: fixed if bctrl set the guest LR
+  missing   a host frame has no guest entry even with that fix
+  extra     the guest chain has entries the host has not, even with that fix
   nolifted  no lifted frame on the host stack
+
+"frame links" counts each link by the first in-order match (for diagnosis).
 """
 import bisect
 import re
@@ -94,28 +92,96 @@ def host_frames(tokens):
     for tok in tokens:
         if tok.startswith("F:"):
             fn = int(tok[2:], 16)
-            if frames and frames[-1][0] == fn and not marks:
-                continue
-            frames.append((fn, tuple(marks)))
+            frames.append((fn, tuple(marks)))   # same fn twice in a row = recursion, keep both
             marks = []
         else:
             marks.append(tok)
     return frames
 
 
+def ra_in(syms, fn, ra):
+    """ra (a guest return address) is a call site inside fn or a later fragment of it."""
+    if not 0 <= ra - 4 - fn < LOOSE:
+        return False
+    c = containing(syms, ra - 4)
+    return c is not None and c >= fn
+
+
+def inner_skip(fr, g, syms):
+    """Guest entries inside the innermost function are its own (an older bl)."""
+    j = 0
+    inner = fr[0][0]
+    while j < len(g) and ra_in(syms, inner, g[j][0]) and not any(
+            0 <= g[j][0] - 4 - f < LOOSE and f > inner for f, _ in fr[1:2]):
+        j += 1
+    return j
+
+
+def align(fr, g, j0, syms, fix):
+    """Line host frames 1.. up with guest entries j0.., one guest entry per frame, in order.
+    Returns (cost, Counter of missing/extra/stale). A direct link needs a guest return
+    address inside the caller. An indirect link (IC) takes one guest entry: now it must be
+    a bctrl return inside the caller (else stale); with fix (bctrl sets the guest LR) any
+    entry, since that slot would then hold the right address. Guest entries past the last
+    host frame are outside the lifted code and do not count."""
+    n, m = len(fr), len(g)
+    INF = 1 << 20
+    cost = [[0] * (m + 1) for _ in range(n + 1)]
+    step = [[None] * (m + 1) for _ in range(n + 1)]
+    for k in range(n - 1, 0, -1):
+        cost[k][m] = cost[k + 1][m] + 1
+        step[k][m] = "missing"
+        fn, marks = fr[k]
+        ic = "IC" in marks
+        for j in range(m - 1, j0 - 1, -1):
+            ra, kind, _ = g[j]
+            if ic:
+                c = 0 if fix or (kind == "c" and ra_in(syms, fn, ra)) else 1
+                best, how = c + cost[k + 1][j + 1], ("take" if c == 0 else "stale")
+            else:
+                best, how = (cost[k + 1][j + 1], "take") if ra_in(syms, fn, ra) else (INF, None)
+            if 1 + cost[k][j + 1] < best:
+                best, how = 1 + cost[k][j + 1], "extra"
+            if 1 + cost[k + 1][j] < best:
+                best, how = 1 + cost[k + 1][j], "missing"
+            cost[k][j], step[k][j] = best, how
+    tally = Counter()
+    k, j = 1, j0
+    while k < n:
+        how = step[k][j]
+        if how != "take":
+            tally[how] += 1
+        if how == "extra":
+            j += 1
+        elif how == "missing":
+            k += 1
+        else:
+            k += 1
+            j += 1
+    return (cost[1][j0] if n > 1 else 0), tally
+
+
+def chain_verdict(th, syms):
+    """ok / stale (fixed if bctrl set the guest LR) / missing / extra / nolifted"""
+    fr = host_frames(th["h"])
+    if not fr:
+        return "nolifted", Counter()
+    j0 = inner_skip(fr, th["g"], syms)
+    cfix, tfix = align(fr, th["g"], j0, syms, True)
+    if cfix:
+        return ("missing" if tfix["missing"] else "extra"), tfix
+    cnow, tnow = align(fr, th["g"], j0, syms, False)
+    return ("stale" if cnow else "ok"), tnow
+
+
 def check_thread(th, syms):
+    """Link-by-link stats (first match in order, for the report)."""
     fr = host_frames(th["h"])
     if not fr:
         return "nolifted", {}
     g = th["g"]
-    j = 0
     info = Counter()
-    # Guest entries inside the innermost function are its own (an older bl).
-    inner = fr[0][0]
-    while j < len(g) and 0 <= g[j][0] - 4 - inner < LOOSE and containing(syms, g[j][0] - 4) is not None \
-            and containing(syms, g[j][0] - 4) >= inner and not any(
-                0 <= g[j][0] - 4 - f < LOOSE and f > inner for f, _ in fr[1:2]):
-        j += 1
+    j = inner_skip(fr, g, syms)
     verdict = "ok"
     ic_slack = 0   # frames after a stale indirect link where its older LR may show up
     for k in range(1, len(fr)):
@@ -126,12 +192,9 @@ def check_thread(th, syms):
             info["nested"] += 1
         found = None
         for jj in range(j, len(g)):
-            ra = g[jj][0]
-            if 0 <= ra - 4 - fn < LOOSE:
-                c = containing(syms, ra - 4)
-                if c is not None and c >= fn:
-                    found = jj
-                    break
+            if ra_in(syms, fn, g[jj][0]):
+                found = jj
+                break
         if found is None:
             if "IC" in marks:
                 # fn called its callee through bctrl, which leaves the guest LR
@@ -202,10 +265,11 @@ def main():
             st[th["st"]] += 1
             if th["st"] == "guest":
                 unsafe[th["t"]] += 1
-            v, info = check_thread(th, syms)
+            _, info = check_thread(th, syms)
+            infos.update(info)
+            v, _ = chain_verdict(th, syms)
             verdicts[v] += 1
             pv[v] += 1
-            infos.update(info)
             if v not in ("ok", "nolifted") and len(examples.setdefault(v, [])) < ex_n:
                 examples[v].append((p["idx"], th))
         if p["all_safe"] and pv["missing"] == pv["extra"] == pv["stale"] == 0:
