@@ -5161,7 +5161,7 @@ void rsx_metal_backend_wait_idle(void)
     }
 }
 
-/* Background memory trim (iOS, BG_TRIM=1, opt-in). A smaller app is less
+/* Background memory trim (iOS, BG_TRIM, default on; BG_TRIM=0 off). A smaller app is less
  * likely to be closed by iOS while in the background. Runs on the RSX thread
  * as it parks, so nothing encodes meanwhile. With the GPU idle it lets go of
  * memory that is refilled on use:

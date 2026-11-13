@@ -595,10 +595,10 @@ static bool SDLCALL app_events(void*, SDL_Event* e)
         rsx_metal_backend_wait_idle();
         fprintf(stderr, "[ios] background: frame clock %s after %d ms, GPU idle\n",
                 port_app_rsx_parked() ? "parked" : "NOT parked", waited);
-        /* BG_TRIM=1: the RSX thread let go of GPU memory as it parked (main.cpp);
-         * hand freed malloc pages back too. */
+        /* BG_TRIM (default on, BG_TRIM=0 off): the RSX thread let go of GPU
+         * memory as it parked (main.cpp); hand freed malloc pages back too. */
         const char* bt = getenv("BG_TRIM");
-        const size_t relief = (bt && *bt == '1') ? malloc_zone_pressure_relief(NULL, 0) : 0;
+        const size_t relief = (bt && *bt == '0') ? 0 : malloc_zone_pressure_relief(NULL, 0);
         fprintf(stderr, "[ios-mem] background: footprint %zu -> %zu MB (malloc gave back %zu MB), "
                 "available %zu MB\n", fp0, footprint_mb(), relief >> 20, os_proc_available_memory() >> 20);
         break;

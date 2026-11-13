@@ -50,10 +50,10 @@ Read this first every session. Newest entry on top.
   complete in 100/100 checks once bctrl sets the guest LR (now 0/100).
   Next: phase 1, an opt-in lifter flag for that. See entry "Save states
   phase 0, background trim, iPhone round 9".
-- **BG_TRIM=1 (11-13, iOS, opt-in):** lets go of the texture pool,
-  stage ring and geometry memo in the background. iPhone: ~520 MB less
-  in the background (1051 vs 1574 MB), clean resume. Default still off;
-  waiting on the user's call.
+- **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
+  texture pool, stage ring and geometry memo in the background. iPhone:
+  ~520 MB less in the background (1051 vs 1574 MB), clean resume.
+  `BG_TRIM=0` turns it off.
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -159,7 +159,7 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 - Checker fix (same day): it now lines chains up one entry per frame and
   keeps recursion (was 97/100 from checker limits).
 
-### Background memory trim (6e290c8, iOS, opt-in)
+### Background memory trim (6e290c8, iOS; default on since 11-13)
 
 - `BG_TRIM=1`: in the background, free the texture pool, stage ring and
   geometry memo (refilled on use), and ask malloc to give memory back.
@@ -179,8 +179,13 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
   - The `background: A -> B` line is taken before the RSX thread has
     parked, so the drop shows only at the foreground line. The event
     handler logs twice (old, harmless).
-- Not tested on the iPad yet (offline). Default stays off until the
-  user decides.
+- Not tested on the iPad yet (offline).
+- User's OK (11-13): **default on** for iOS; `BG_TRIM=0` turns it off.
+  The code is iOS-only (`PORT_IOS`), so the Mac and Windows are
+  unchanged.
+- Check with no switch set (`20261113-132656-iphone-bgdef1`): log says
+  `background trim: on`; 1692 MB going away, **1057 MB** while away;
+  picture right on return, back to 1556 MB once drawing again.
 
 ### iPhone round 9 (in-run A/B, 300 s window, 18 pairs each)
 

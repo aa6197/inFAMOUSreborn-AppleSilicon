@@ -3442,7 +3442,7 @@ static int eng_geo_on(void)
 }
 
 #if defined(__APPLE__)
-/* Apple port, background memory trim (iOS, BG_TRIM=1): the Metal backend
+/* Apple port, background memory trim (iOS, BG_TRIM, default on): the Metal backend
  * empties the arena's pages, so every memo entry is forgotten and draws refill
  * it. Called on the RSX thread with the GPU idle. */
 void rsx_draw_engine_geo_forget(void)

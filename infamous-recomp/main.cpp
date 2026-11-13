@@ -200,8 +200,9 @@ static std::atomic<int> s_app_paused{0};
 static std::atomic<int> s_rsx_parked{1};
 extern "C" void port_app_set_paused(int paused) { s_app_paused.store(paused ? 1 : 0, std::memory_order_release); }
 extern "C" int  port_app_rsx_parked(void)       { return s_rsx_parked.load(std::memory_order_acquire); }
-/* BG_TRIM=1 (opt-in): while parked, let go of GPU memory that is refilled on
- * use (rsx_metal_backend_bg_trim), so iOS is less likely to close the app. */
+/* BG_TRIM (default on, BG_TRIM=0 turns it off): while parked, let go of GPU
+ * memory that is refilled on use (rsx_metal_backend_bg_trim), so iOS is less
+ * likely to close the app. iPhone 16 Pro: 1051 vs 1574 MB in the background. */
 extern "C" void rsx_metal_backend_bg_trim(void);
 extern "C" void rsx_metal_backend_bg_restore(void);
 static int bg_trim_on(void)
@@ -209,7 +210,7 @@ static int bg_trim_on(void)
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("BG_TRIM");
-        on = (e && *e == '1') ? 1 : 0;
+        on = (e && *e == '0') ? 0 : 1;
         fprintf(stderr, "[ios-mem] background trim: %s (BG_TRIM)\n", on ? "on" : "off");
     }
     return on;
