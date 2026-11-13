@@ -36,9 +36,10 @@ Read this first every session. Newest entry on top.
   See entry "iPad: effect costs, shadow setting, RSX thread trims".
 - **11-12 night:** new Resolution setting (below 720p, MetalFX upscale;
   iPad 360p +16%) and the yellow/blue flash cause found: the particle
-  buffer was read as depth. Fix `ZS_CLEAR_CW=1` is opt-in, waiting for
-  the user's OK. See entry "Lower resolution setting, present shots,
-  yellow/blue flicker".
+  buffer was read as depth. See entry "Lower resolution setting, present
+  shots, yellow/blue flicker".
+- **11-13:** the flash fix is always on (user's OK), no switch. Checked
+  on the Mac and the iPad. See entry "Yellow/blue flash fix always on".
 - Signing works with my team (the PLA block is gone).
 - The iPad may be busy with another task: run `ios_device.sh check` first.
 - iPad speed now (11-11, round 5): **55.6 / 51.9 flips/s** with the hop gate,
@@ -118,6 +119,25 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 ---
 
+## 2026-11-13 — Yellow/blue flash fix always on
+
+- User's OK: the fix from 62dda0c is now always on (Apple), with no
+  switch. `ZS_CLEAR_CW` is gone: a colour clear always counts as a
+  colour write for the v73c rule (`ZS_CWRITTEN`), so a target that was
+  only cleared reads as colour, not as the depth at its address.
+- Windows: unchanged (Apple-only code). The D3D12 backend has the same
+  v73c rule, so it may show the same flash; not touched.
+- Mac, 66 s, Start at 50 s, no switches (`ZS_SUB_WATCH=1` only):
+  0 bad reads at 0x01AB8000 (was 44 without the fix), 46 kept as
+  colour (`[zskeep]`); reads at 0x0F340000 (shadow maps) 373 log lines
+  (377/378 before). Frame dump of the first kept frame looks normal (the
+  washed-out wake-up scene, no yellow).
+- iPad, 120 s, Start at 55 s, `ZS_SUB_WATCH=1` only: 0 bad reads at
+  0x01AB8000, 43 kept as colour, 0x0F340000 reads 381 log lines. No
+  crash, audio real time.
+- Not checked: a long gameplay soak with panning on the iPad, and the
+  user's own panning case.
+
 ## 2026-11-12 (night) — Lower resolution setting, present shots, yellow/blue flicker
 
 ### Resolution below 720p (7250177)
@@ -174,8 +194,8 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 - Mac pan test (6 min): all 48 bad reads at 0x01AB8000 became colour
   reads (`[zskeep]`); the reads at 0x0F340000 (shadow maps, soft smoke
   depth) are unchanged (154/267 vs 151/267 log lines). No speed cost.
-- **Default off** until the user OKs it (default picture change).
-  To turn on: make `eng_zs_clear_cw()` default 1.
+- Was default off until the user's OK; always on since 11-13 (see
+  entry "Yellow/blue flash fix always on").
 - New test switches: `ZS_SUB_WATCH=1`, `ZS_SUB_DUMP=<hex>`,
   `TEX_KIND_WATCH=1`, `FP_CONST_WATCH=1` (see the port notes).
 - Not checked yet: the iPad, and a long gameplay soak with the fix on.
