@@ -80,7 +80,12 @@ static uint64_t spu_host_ns(void)
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#if defined(__APPLE__)
+    { extern volatile int64_t g_ss_clock_off_ns;   /* sys_timer.c: save states (dec_base_ns is saved) */
+      return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec + (uint64_t)g_ss_clock_off_ns; }
+#else
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
 #endif
 }
 

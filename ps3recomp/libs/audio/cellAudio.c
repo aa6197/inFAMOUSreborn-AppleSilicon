@@ -2090,6 +2090,7 @@ void ss_audio_blobs(void (*add)(const char*, void*, size_t))
     add("audio.init", (void*)&s_audio_initialized, sizeof s_audio_initialized);
     add("audio.ports", (void*)s_ports, sizeof s_ports);
     add("audio.notify", (void*)s_notify_queues, sizeof s_notify_queues);
+    add("audio.start_us", (void*)&s_audio_start_us, sizeof s_audio_start_us);   /* guest clock: goes on after a load */
 }
 /* After the blobs are back. Returns the number of open ports, -1 if audio was not on. */
 int ss_audio_restore(void)
@@ -2103,8 +2104,6 @@ int ss_audio_restore(void)
     mutex_init(&s_audio_mutex);
     if (audio_backend_init() < 0)
         fprintf(stderr, "[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
-    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }   /* clocks: later step */
     if (audio_start_mix_thread() < 0)
         fprintf(stderr, "[cellAudio] WARNING: Could not start mixing thread\n");
     return n;

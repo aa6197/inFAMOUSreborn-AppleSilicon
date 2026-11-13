@@ -6,6 +6,14 @@
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+#if defined(__APPLE__)
+#include <unistd.h>
+/* Save states (Apple): the guest clocks are host CLOCK_MONOTONIC + this offset, so
+ * after a load the guest clock goes on from the save. 0 until a load (same results
+ * as before then). Read by ppu_timebase_now, sys_time_get_system_time (ppu_sysprx.cpp),
+ * cellGcm's flip and report times and the SPU decrementer (spu_channels.c). */
+volatile int64_t g_ss_clock_off_ns = 0;
+#endif
 #include <string.h>
 #include <stdlib.h>
 
@@ -68,8 +76,13 @@ uint64_t ppu_timebase_now(void)
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#if defined(__APPLE__)
+    const uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec + (uint64_t)g_ss_clock_off_ns;
+    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ + (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
+#else
     return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
            (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+#endif
 #endif
 }
 
@@ -483,6 +496,17 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
+#if defined(__APPLE__)
+/* Save states: while a save runs, timer ticks are dropped (they push events into
+ * the event queues the save is copying). */
+static volatile int s_timer_ss_hold, s_timer_ss_in_send;
+static void ss_timer_send(sys_timer_info* t)
+{
+    __atomic_add_fetch(&s_timer_ss_in_send, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s_timer_ss_hold, __ATOMIC_SEQ_CST)) timer_send_event(t);
+    __atomic_sub_fetch(&s_timer_ss_in_send, 1, __ATOMIC_SEQ_CST);
+}
+#endif
 
 #ifdef _WIN32
 static DWORD WINAPI timer_thread_proc(LPVOID param)
@@ -526,7 +550,11 @@ static void* timer_thread_proc(void* param)
 
         if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&t->mtx);
+#if defined(__APPLE__)
+            ss_timer_send(t);
+#else
             timer_send_event(t);
+#endif
             pthread_mutex_lock(&t->mtx);
         }
     }
@@ -816,6 +844,42 @@ void sys_timer_ss_restart(void)
         t->thread = 0;
         if (t->running && pthread_create(&t->thread, NULL, timer_thread_proc, t) != 0) t->running = 0;
     }
+}
+/* on = 1: drop timer ticks from now on and wait (up to ~1 s) for one being sent.
+ * No stdio: the save calls this while the PPU threads are suspended. */
+int ss_timer_hold(int on)
+{
+    __atomic_store_n(&s_timer_ss_hold, on ? 1 : 0, __ATOMIC_SEQ_CST);
+    if (!on) return 1;
+    for (int k = 0; k < 2000; k++) {
+        if (!__atomic_load_n(&s_timer_ss_in_send, __ATOMIC_SEQ_CST)) return 1;
+        usleep(500);
+    }
+    return 0;
+}
+static uint64_t s_ss_clock_guest_ns;   /* the guest clock at the save (blob "clock.guest_ns") */
+static uint64_t ss_clock_host_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+/* The save, with every guest thread stopped: note the guest clock. */
+void ss_clock_mark(void)
+{
+    s_ss_clock_guest_ns = ss_clock_host_ns() + (uint64_t)g_ss_clock_off_ns;
+}
+void ss_clock_blobs(void (*add)(const char*, void*, size_t))
+{
+    add("clock.guest_ns", (void*)&s_ss_clock_guest_ns, sizeof s_ss_clock_guest_ns);
+}
+/* The load, after the blobs are back and before any guest or SPU thread runs: the
+ * guest clock goes on from the save. Returns the saved guest time in ns. */
+uint64_t ss_clock_restore(void)
+{
+    if (s_ss_clock_guest_ns)
+        __atomic_store_n(&g_ss_clock_off_ns, (int64_t)(s_ss_clock_guest_ns - ss_clock_host_ns()), __ATOMIC_SEQ_CST);
+    return s_ss_clock_guest_ns;
 }
 #endif
 

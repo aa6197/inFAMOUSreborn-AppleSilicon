@@ -62,8 +62,10 @@ Read this first every session. Newest entry on top.
   runs on after a load. HLE library state works. The SPURS taskset
   (FIOS) task is saved and restored. Audio restore works, and with it
   **a load from the title reaches gameplay** (START, cutscene,
-  tutorial; 2 of 2 runs). Next: clocks. See entries "Save states:
-  audio", "Save states: SPURS taskset task",
+  tutorial; 4 of 4 runs). Clocks: the guest clock goes on from the
+  save. Next: longer play after a load, save from gameplay. See
+  entries "Save states: clocks", "Save states: audio",
+  "Save states: SPURS taskset task",
   "Save states: HLE libraries", "Save states: SPURS",
   "Save states: graphics",
   "Save states: load, PPU core",
@@ -151,6 +153,38 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: clocks (Mac)
+
+### Guest clock goes on after a load (Mac, test build only)
+
+- Problem: every guest clock was host `CLOCK_MONOTONIC` (time since the
+  Mac booted). After a load the game saw time jump forward by the gap
+  between save and load, and after a reboot it would jump backward.
+- Guest clocks found: PPU timebase (`ppu_timebase_now`, every lifted
+  `mftb`), `sys_time_get_system_time`, cellGcm flip and report times,
+  the SPU decrementer (`dec_base_ns` is in the saved SPU contexts),
+  cellAudio port timestamps (`s_audio_start_us`). Wall time
+  (`sys_time_get_current_time`) stays real time.
+- Now (Apple): these clocks add `g_ss_clock_off_ns` (sys_timer.c). It
+  is 0 until a load, so normal runs give the same values as before.
+- Save: `ss_clock_mark` notes the guest clock while every thread is
+  stopped (blob `clock.guest_ns`). `ss_timer_hold` drops timer ticks
+  during the save (they push events into the queues being copied).
+- Load: `ss_clock_restore` sets the offset first, before graphics,
+  SPURS, audio and the threads. `s_audio_start_us` is now a blob (it
+  was set again at load).
+- Results: save (`runs/20261113-184651-ss-csave1`): "timers held",
+  0 pages differ. The timer table still differs at byte 137: that is
+  inside its host condition variable (bytes 112-160), which the load
+  makes again. Harmless.
+- Load (`runs/20261113-184743-ss-cload1`, 21 s after the save): "guest
+  clock goes on from 6389214.313 s (offset -21.385 s)". Load again
+  3 min later (`runs/20261113-185040-ss-cload2`): offset -198.9 s. Both
+  reach gameplay after START.
+- Normal Mac build builds, boots and plays audio
+  (`runs/20261113-184940-mac-clkchk`).
+- Next: longer play after a load, then save from gameplay.
 
 ## 2026-11-13 (evening) — Save states: audio (Mac) — load reaches gameplay
 

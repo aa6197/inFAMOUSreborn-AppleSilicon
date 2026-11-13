@@ -61,6 +61,9 @@ static void sys_initialize_tls(ppu_context* ctx)
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
  * and every frontend animation timed off it crawled. */
+#if defined(__APPLE__)
+extern "C" volatile int64_t g_ss_clock_off_ns;   /* sys_timer.c: save states, 0 until a load */
+#endif
 static void sys_time_get_system_time(ppu_context* ctx)
 {
 #ifdef _WIN32
@@ -70,7 +73,11 @@ static void sys_time_get_system_time(ppu_context* ctx)
     ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
 #else
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+#if defined(__APPLE__)
+    ctx->gpr[3] = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec + (uint64_t)g_ss_clock_off_ns) / 1000ull;
+#else
     ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+#endif
 #endif
 }
 

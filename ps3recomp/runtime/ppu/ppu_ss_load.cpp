@@ -28,7 +28,9 @@
  * again and carries on from its saved SPU context (spu_workload.c).
  * Audio: the ports and notify queues come back as blobs; the host device opens
  * again and the mixing thread starts (ss_audio_restore).
- * Not yet: clocks (the next step).
+ * Clocks: the guest clocks (timebase, system time, GCM times, SPU decrementer,
+ * audio timestamps) are host time + g_ss_clock_off_ns; the load sets the offset
+ * so the guest clock goes on from the save (ss_clock_restore).
  */
 #if defined(__APPLE__)
 
@@ -73,6 +75,9 @@ extern "C" int  ss_spu_tasks_load(const uint8_t* p, uint64_t n);
 extern "C" int  ss_spu_tasks_start(void);
 extern "C" void ss_audio_blobs(ss_add_fn add);                     /* libs/audio/cellAudio.c */
 extern "C" int  ss_audio_restore(void);
+extern "C" void ss_clock_blobs(ss_add_fn add);                     /* syscalls/sys_timer.c */
+extern "C" uint64_t ss_clock_restore(void);
+extern "C" volatile int64_t g_ss_clock_off_ns;
 extern "C" void ss_pad_blobs(ss_add_fn add);                  /* libs/input/cellPad.c */
 extern "C" int  ss_pad_restore(void);
 extern "C" void ss_kb_blobs(ss_add_fn add);                   /* libs/input/cellKb.c */
@@ -105,6 +110,7 @@ static void ss_mods_do(void)
     ss_spurs_blobs(ss_file_mod_add);
     ss_spu_blobs(ss_file_mod_add);
     ss_audio_blobs(ss_file_mod_add);
+    ss_clock_blobs(ss_file_mod_add);
     /* HLE libraries with host-side state (init flags, callbacks, open dialog) */
     ss_pad_blobs(ss_file_mod_add);
     ss_kb_blobs(ss_file_mod_add);
@@ -307,6 +313,11 @@ static int ss_load_all(const char* path)
         fprintf(stderr, "[ss] load FAILED after it changed memory: %s\n", ss_file_why(in));
         abort();
     }
+    /* clocks first: SPU contexts and library blobs hold guest-clock times */
+    const uint64_t gclk = ss_clock_restore();
+    if (!gclk) fprintf(stderr, "[ss] load: no guest clock in the save (clock jumps)\n");
+    else fprintf(stderr, "[ss] load: guest clock goes on from %.3f s (offset %+.3f s)\n",
+                 gclk * 1e-9, (double)g_ss_clock_off_ns * 1e-9);
     const double t_mem = ss_lnow() - s_t0;
     uint64_t pm_n = 0;
     const uint8_t* pm = ss_file_sec(in, "spurs.pm", &pm_n);

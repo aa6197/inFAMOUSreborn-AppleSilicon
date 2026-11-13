@@ -69,11 +69,18 @@ static u64 get_timestamp_ns(void)
     return (u64)((double)now.QuadPart * 1000000000.0 / (double)s_qpc_freq.QuadPart);
 }
 #else
+#if defined(__APPLE__)
+extern volatile int64_t g_ss_clock_off_ns;   /* sys_timer.c: save states, 0 until a load */
+#endif
 static u64 get_timestamp_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#if defined(__APPLE__)
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec + (u64)g_ss_clock_off_ns;
+#else
     return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+#endif
 }
 #endif
 
