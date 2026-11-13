@@ -99,7 +99,7 @@ typedef struct {
 #endif
     int cwritten;          /* a draw with a colour mask != 0 targeted it   */
 #if defined(__APPLE__)
-    int ccleared;          /* ZS_CLEAR_CW: a colour clear targeted it      */
+    int ccleared;          /* a colour clear targeted it (ZS_CWRITTEN)     */
 #endif
     u32 feedback;          /* copy sampled by a draw that writes it, or 0  */
     u32 fb_serial;         /* the bind that last refreshed `feedback`      */
@@ -1012,12 +1012,6 @@ static int eng_zconv_on(void)
 }
 
 #if defined(__APPLE__)
-static int eng_zs_clear_cw(void)
-{
-    static int v = -1;
-    if (v < 0) v = eng_env_flag("ZS_CLEAR_CW", 0);
-    return v;
-}
 static int eng_zs_sub_watch(void)
 {
     static int v = -1;
@@ -4062,7 +4056,7 @@ static void eng_trace_tick(u32 frame)
 /* ZS_SUB_DUMP=<hex address> (test, with ZS_SUB_WATCH=1 and
  * PS3RECOMP_ENGINE_SURFACE_DUMP): the first time a display-size pass reads
  * the colour target at that address through the ZS_CWRITTEN rule (swapped
- * or, with ZS_CLEAR_CW, kept), trace and dump the next frame. */
+ * or kept because it was cleared), trace and dump the next frame. */
 static void eng_zs_dump_trigger(u32 tex_offset, const u32* target_slots, u32 n_targets)
 {
     static long addr = -2;
@@ -4336,14 +4330,14 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              * its shadow pass; the light pass then samples it as a depth
              * texture. The D3D12 backend's v73c rule (ZS_CWRITTEN). */
 #if defined(__APPLE__)
-            /* ZS_CLEAR_CW=1 (test): a colour clear counts as a colour write,
-             * so a target that was only cleared reads as colour, not as the
-             * depth at its address. The 512x288 particle buffer at
-             * 0x01AB8000 is made new each frame (the address changes size);
-             * on a frame with no particle draws it was read as that depth:
-             * the yellow/blue flash. ZS_SUB_WATCH also logs these keeps. */
+            /* A colour clear counts as a colour write, so a target that was
+             * only cleared reads as colour, not as the depth at its address.
+             * The 512x288 particle buffer at 0x01AB8000 is made new each
+             * frame (the address changes size); on a frame with no particle
+             * draws it was read as that depth: the yellow/blue flash.
+             * ZS_SUB_WATCH also logs these keeps. */
             if (zc != ENG_INVALID && !g.surfaces[i].cwritten && eng_zs_cwritten() &&
-                g.surfaces[i].ccleared && eng_zs_clear_cw()) {
+                g.surfaces[i].ccleared) {
                 static u64 kk[64]; static u32 kn[64], kused;
                 if (eng_zs_sub_watch()) {
                     const u64 key = g.ps_hash ^ ((u64)t.offset << 20) ^
@@ -5003,7 +4997,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         for (u32 i = 0; i < n_targets; i++)
             g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
 #if defined(__APPLE__)
-        /* ZS_CLEAR_CW (eng_zs_clear_cw): remembered for the ZS_CWRITTEN rule. */
+        /* Remembered for the ZS_CWRITTEN rule (cleared = written). */
         for (u32 i = 0; i < n_targets; i++) g.surfaces[targets[i]].ccleared = 1;
 #endif
     }
