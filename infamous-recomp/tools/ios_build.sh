@@ -14,6 +14,10 @@
 # BUILD_DIR (env): Default infamous-recomp/build-ios
 # PYTHON    (env): Default Homebrew python3.12
 # JOBS      (env): compile jobs. Each needs several GB of RAM. Default 4
+# GAME      (env): your game folder. Default ~/inFamous/BCES00220. When it has
+#                  PS3_GAME/USRDIR/EBOOT.elf, the app gets save states (the
+#                  in-game menu's Save state / Load state; the file is only read)
+# SAVE_STATES (env): 0 = build without save states
 #
 # Out: <build dir>/Release-iphoneos/inFamousRecomp.app
 #      To make an .ipa for SideStore / AltStore, run tools/release_apple.sh after.
@@ -34,10 +38,13 @@ PY=${PYTHON:-/opt/homebrew/bin/python3.12}
 BID=${BUNDLE_ID:-local.$(id -un | tr -cd 'a-zA-Z0-9').infamous}
 APP=$BD/Release-iphoneos/inFamousRecomp.app
 LOG=$BD/ios-build.log
+ELF=${GAME:-$HOME/inFamous/BCES00220}/PS3_GAME/USRDIR/EBOOT.elf
+ss=(-DPORT_SAVE_STATES=OFF)
+if [[ ${SAVE_STATES:-1} != 0 && -f $ELF ]]; then ss=(-DPORT_SAVE_STATES=ON -DPORT_SAVE_STATES_ELF=$ELF); fi
 
 [[ -d $P/lib ]] || { echo "no libraries in $P: run tools/ios_deps.sh first"; exit 1; }
 
-echo "=== configure ($BID, team $TEAM)"
+echo "=== configure ($BID, team $TEAM, ${ss[1]#-DPORT_})"
 mkdir -p $BD
 export PKG_CONFIG_LIBDIR=$P/lib/pkgconfig
 if ! cmake -S $ROOT -B $BD -G Xcode \
@@ -51,6 +58,7 @@ if ! cmake -S $ROOT -B $BD -G Xcode \
   -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
   -DCMAKE_OBJC_FLAGS_RELEASE="-O2 -DNDEBUG" -DCMAKE_OBJCXX_FLAGS_RELEASE="-O2 -DNDEBUG" \
   -DPS3RECOMP_DIR=$REPO/ps3recomp -DPython3_EXECUTABLE=$PY \
+  ${ss[@]} \
   -DPORT_TEAM_ID=$TEAM -DPORT_BUNDLE_ID=$BID -DPORT_IOS_ENTITLEMENTS=ON > $BD/ios-configure.log 2>&1; then
     tail -20 $BD/ios-configure.log
     echo "configure failed: see $BD/ios-configure.log"
