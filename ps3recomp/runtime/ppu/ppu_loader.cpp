@@ -2472,6 +2472,10 @@ static ppu_fn ppu_lookup(uint32_t a)
 }
 
 extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
+#if defined(__APPLE__)
+/* Save states (ppu_ss_resume.cpp, PORT_SAVE_STATES): registry lookup for rebuilding a saved call chain. */
+extern "C" ppu_fn ppu_ss_lookup(uint32_t a) { return ppu_lookup(a); }
+#endif
 
 /* Correct native memmove override for the game's hand-optimized memmove at
  * guest 0x0036FA74. The lifted 1306-instruction version is mis-lifted (flagged

@@ -284,6 +284,22 @@ endif()
 set(PORT_PPU_MEMLEAN "${_ppu_memlean_default}" CACHE STRING "Lifted PPU lean guest accessors (v243A/v245): OFF, AB or ALL")
 set_property(CACHE PORT_PPU_MEMLEAN PROPERTY STRINGS OFF AB ALL)
 set(PORT_PPU_MEMLEAN_LIST "${CMAKE_CURRENT_SOURCE_DIR}/tools/v243A_mem_hot.txt" CACHE FILEPATH "Function list for PORT_PPU_MEMLEAN=AB/ALL (v243A/v245)")
+# Save states phase 1 (Apple only, default OFF; SAVE_STATES_PLAN.md): ps3recomp/tools/ss_resume_pass.py runs last
+# over each register-cached TU and adds resume points (bctrl/blrl set the guest LR, each sc sets ctx->cia, labels
+# after calls, a resume block per function, a site table). Needs PORT_PPU_REGCACHE and the decrypted game ELF
+# (PORT_SAVE_STATES_ELF, read only, for the bctrl and sc addresses). OFF = no change to any TU.
+if(APPLE)
+    option(PORT_SAVE_STATES "Save states phase 1: resume points in the lifted PPU code (Apple only)" OFF)
+    set(PORT_SAVE_STATES_ELF "" CACHE FILEPATH "Decrypted EBOOT.elf for PORT_SAVE_STATES (read only)")
+    if(PORT_SAVE_STATES)
+        if(NOT PORT_PPU_REGCACHE)
+            message(FATAL_ERROR "PORT_SAVE_STATES needs PORT_PPU_REGCACHE=ON")
+        endif()
+        if(NOT EXISTS "${PORT_SAVE_STATES_ELF}")
+            message(FATAL_ERROR "PORT_SAVE_STATES needs PORT_SAVE_STATES_ELF = the decrypted EBOOT.elf")
+        endif()
+    endif()
+endif()
 if(PORT_PPU_REGCACHE)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(_rc_flags --stats)
@@ -333,11 +349,22 @@ if(PORT_PPU_REGCACHE)
                     "--list=${PORT_PPU_MEMLEAN_LIST}" "--hdr=${PS3RECOMP_DIR}/runtime/ppu/ppu_memory_v243.h" "--mode=${_ma_mode}" --stats)
                 set(_ma_deps "${PS3RECOMP_DIR}/tools/ppu_memacc_v243.py" "${PS3RECOMP_DIR}/runtime/ppu/ppu_memory_v243.h" "${PORT_PPU_MEMLEAN_LIST}")
             endif()
+            set(_ss_cmd "")   # PORT_SAVE_STATES: empty when OFF -> identical command
+            set(_ss_deps "")
+            if(APPLE AND PORT_SAVE_STATES)
+                string(REGEX REPLACE "^ppu_recomp_([0-9]+)\\..*$" "\\1" _ss_tu "${_name}")
+                set(_ss_cmd COMMAND "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/ss_resume_pass.py" "${_out}" "${_out}"
+                    "--raw=${_src}" "--elf=${PORT_SAVE_STATES_ELF}" "--hdr=${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_resume.h"
+                    "--tu=${_ss_tu}" --stats)
+                set(_ss_deps "${PS3RECOMP_DIR}/tools/ss_resume_pass.py" "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_resume.h"
+                    "${PORT_SAVE_STATES_ELF}")
+            endif()
             add_custom_command(
                 OUTPUT "${_out}"
                 COMMAND "${Python3_EXECUTABLE}" "${_rc_script}" "${_src}" "${_out}" ${_rc_flags}
                 ${_ma_cmd}
-                DEPENDS "${_src}" "${_rc_script}" ${_rc_deps} ${_ma_deps}
+                ${_ss_cmd}
+                DEPENDS "${_src}" "${_rc_script}" ${_rc_deps} ${_ma_deps} ${_ss_deps}
                 COMMENT "PPU register caching (v103): ${_name}")
             list(APPEND _rc_sources "${_out}")
         else()
@@ -374,6 +401,11 @@ set(PS3RECOMP_SCAFFOLD
 if(APPLE)
     # Save-state phase 0 probe (SS_PROBE=<secs>, test only; empty off Apple).
     list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_probe.cpp")
+    if(PORT_SAVE_STATES)
+        # Save states phase 1: site tables, exact chains, resume (ppu_ss_resume.h).
+        list(APPEND PS3RECOMP_SCAFFOLD "${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_resume.cpp")
+        set_source_files_properties("${PS3RECOMP_DIR}/runtime/ppu/ppu_ss_probe.cpp" PROPERTIES COMPILE_DEFINITIONS PORT_SAVE_STATES=1)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

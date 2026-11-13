@@ -51,8 +51,9 @@ Read this first every session. Newest entry on top.
   `SAVE_STATES_PLAN.md`. Phase 0 on the Mac: **go**. Every thread stops
   at a safe point in ≤1.3 ms; save ~233 MB (LZ4). Call chains are
   complete in 100/100 checks once bctrl sets the guest LR (now 0/100).
-  Next: phase 1, an opt-in lifter flag for that. See entry "Save states
-  phase 0, background trim, iPhone round 9".
+  Phase 1 (Mac, test build `PORT_SAVE_STATES`, default OFF): resume
+  chains work, 3600/3600 threads in 100 checks. Next: save file and
+  load. See entry "Save states phase 1: resume chains".
 - **BG_TRIM (11-13, iOS, default on, user's OK):** lets go of the
   texture pool, stage ring and geometry memo in the background. iPhone:
   ~520 MB less in the background (1051 vs 1574 MB), clean resume.
@@ -135,6 +136,48 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (late afternoon) — Save states phase 1: resume chains (Mac)
+
+### Resume chains (Mac, test build only)
+
+- New CMake option `PORT_SAVE_STATES` (Apple only, default OFF), build
+  dir `build-mac-ss`. A build-time pass (`ps3recomp/tools/ss_resume_pass.py`)
+  runs after register caching on each lifted file. It does not change
+  the lifter, so Windows output is the same.
+- The pass adds: the guest LR at each bctrl/blrl, `ctx->cia` at each
+  system call, a label after each call, a resume block at the start of
+  each function, and a site table per file. All 27,305 functions get a
+  resume block.
+- Save side (`ppu_ss_resume.cpp`): for each stopped thread, line up its
+  host frames with return addresses on the guest stack and look each
+  one up in the site tables. Any miss refuses the save.
+- Two fixes found by the first run (9 of 36 threads ok):
+  - 284 functions were skipped: their first line ends in a comment.
+  - A thread inside an HLE call: the import stub tail-calls the HLE
+    code, so the stub has no host frame. The save now reads the `bl`
+    before the return address to find the stub.
+- Result, `SS_PROBE=5 SS_PROBE_N=100 SS_PROBE_START=30`, 600 s
+  (`$WORK_DIR/runs/20261113-151115-ss2-probe`):
+  - **100/100 checks, 36/36 threads each: every chain complete**
+    (3600/3600, 0 failures). Every chain reaches the end of the guest
+    back chain.
+  - Stop: all threads safe in 100/100; median 0.55 ms, max 0.76 ms.
+  - Save size as phase 0: 355 MB non-zero, 233 MB LZ4 in ~390 ms.
+  - Chains are 1–21 frames.
+- Two stack slots can fit one frame (1,336 of 3,600 chains). Checked
+  with the `[ss]  a` line, 240 s run (`$WORK_DIR/runs/20261113-152421-ss2-amb`,
+  60 checks, 2160/2160 ok): all 972 cases are the caller of a frameless
+  HLE stub. The live LR (taken) is right; the other slot is stale, left
+  by an earlier call from the same function. Settled.
+- Where threads wait at a stop: `sys_lwcond_wait` (most),
+  `sys_event_queue_receive`, `sys_timer_usleep`, `sys_mutex_lock`.
+  These decide the load design (`SAVE_STATES_PLAN.md`, "Save and load
+  design").
+- Not measured yet: speed of the `build-mac-ss` build against
+  `build-mac`.
+- iOS Simulator build with the option also builds (the stack reads use
+  `vm_read_overwrite`; `mach_vm.h` is not allowed on iOS).
 
 ## 2026-11-13 (afternoon) — In-game menu (iOS)
 

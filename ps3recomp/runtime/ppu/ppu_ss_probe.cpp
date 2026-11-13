@@ -26,6 +26,9 @@
 #if defined(__APPLE__)
 
 #include "ppu_recomp.h"   /* ppu_context, vm_base */
+#if defined(PORT_SAVE_STATES)
+#include "ppu_ss_resume.h"   /* phase 1: exact chains from the site tables */
+#endif
 
 #include <dlfcn.h>
 #include <mach/mach.h>
@@ -58,8 +61,10 @@ struct ss_slot {
 
 struct ss_rec {
     int t, susp, parked, where, dsc, dhle, run_state, gend;
-    uint32_t sc, hle, park_num, sp, lr;
+    uint32_t sc, hle, park_num, sp, lr, cia, gtop;
     int nh, ng;
+    uint32_t wlo, whi;   /* PORT_SAVE_STATES: guest stack copy [wlo, whi) at s_win + woff */
+    size_t woff;
     uintptr_t h[SS_HF];
     uint32_t g[SS_GF + 1], gw[SS_GF + 1];
 };
@@ -193,6 +198,7 @@ static void ss_walk_guest(ss_rec* r, const ppu_context* c)
         r->g[r->ng] = ra; r->gw[r->ng] = ss_code(ra); r->ng++;
         cur = next;
     }
+    r->gtop = cur;
 }
 
 static const char* ss_sym(uintptr_t a, char* buf, size_t n)
@@ -234,6 +240,93 @@ static char ss_kind(uint32_t w, uint32_t ra, uint32_t* tgt)
 static int s_mem_every;
 static void ss_mem(int probe);
 
+#if defined(PORT_SAVE_STATES)
+/* Phase 1 check: build each thread's exact chain from the site tables (ss_chain_build)
+ * and log "[ss]  x ok ..." or "[ss]  x FAIL ...". The guest stack is copied while the
+ * threads are suspended (no malloc then: one static buffer, pages touched as used). */
+#define SS_WIN_MAX  (16u << 20)
+#define SS_WIN_T    (1u << 20)
+static uint8_t s_win[SS_WIN_MAX];
+
+static void ss_copy_stack(ss_rec* r, size_t* fill)
+{
+    r->wlo = r->whi = 0; r->woff = *fill;
+    uint32_t lo = r->sp & ~7u, hi = r->gtop + 0x100u;
+    if (hi < lo || hi - lo > SS_WIN_T) hi = lo + SS_WIN_T;
+    while (hi > lo && !ss_gok(lo, hi - lo)) hi -= 8;
+    if (hi <= lo || *fill + (hi - lo) > SS_WIN_MAX) return;
+    /* Guest stacks have guard pages (no access) between them: copy page by page
+     * through the kernel, which fails instead of faulting, and stop at the first
+     * page that cannot be read. */
+    uint32_t a = lo;
+    while (a < hi) {
+        const uint32_t end = ((a & ~0x3FFFu) + 0x4000u) < hi ? ((a & ~0x3FFFu) + 0x4000u) : hi;
+        vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)(vm_base + a), end - a,
+                                   (vm_address_t)(uintptr_t)(s_win + *fill + (a - lo)), &got) != KERN_SUCCESS ||
+            got != end - a)
+            break;
+        a = end;
+    }
+    hi = a;
+    if (hi <= lo) return;
+    r->wlo = lo; r->whi = hi;
+    *fill += hi - lo;
+}
+
+static void ss_classify(uintptr_t a, ss_hframe* o)
+{
+    o->cls = SS_H_OTHER; o->fn = 0;
+    Dl_info di;
+    if (!a || !dladdr((void*)a, &di) || !di.dli_sname) return;
+    const char* nm = di.dli_sname;
+    const char* f = strstr(nm, "func_");
+    if (f && !strstr(nm, "spu_func_")) {
+        char hex[9], *end;
+        if (strlen(f) < 13) return;
+        memcpy(hex, f + 5, 8); hex[8] = 0;
+        const unsigned long v = strtoul(hex, &end, 16);
+        if (end == hex + 8) { o->cls = SS_H_FUNC; o->fn = (uint32_t)v; }
+        return;
+    }
+    if (!strcmp(nm, "lv2_syscall")) o->cls = SS_H_SC;
+    else if (!strncmp(nm, "ps3_hle_call", 12)) o->cls = SS_H_HLE;
+    else if (!strncmp(nm, "ps3_indirect_call", 17)) o->cls = SS_H_IC;
+    else if (!strncmp(nm, "OUTLINED_FUNCTION", 17)) o->cls = SS_H_OUTLINED;
+}
+
+static void ss_exact(int idx, int nrec)
+{
+    static ss_rframe out[128];
+    ss_hframe hf[SS_HF];
+    int ok = 0, tried = 0;
+    for (int i = 0; i < nrec; i++) {
+        const ss_rec* r = &s_rec[i];
+        if (!r->susp) continue;
+        tried++;
+        int nh = 0;
+        for (int k = 0; k < r->nh; k++) {
+            if (k == 1 && r->nh > 2 && r->h[1] == r->h[2]) continue;   /* LR register = first saved LR */
+            ss_classify(r->h[k], &hf[nh++]);
+        }
+        const ss_gwin g = { r->wlo, r->whi, s_win + r->woff };
+        ss_chain_info info;
+        const int n = ss_chain_build(hf, nh, r->sp, r->lr, r->cia, r->parked ? r->where : 0, &g, out, 128, &info);
+        if (n > 0) {
+            ok++;
+            fprintf(stderr, "[ss]  x t=%d ok n=%d amb=%d top=%d\n", r->t, n, info.amb, info.top);
+            if (info.amb)
+                fprintf(stderr, "[ss]  a t=%d k=%d of %d fn=%08X took=%d ra=%08X other=%d ra=%08X in0=%08X\n", r->t,
+                        info.amb_k, n, info.amb_fn, info.amb_took, info.amb_ra_took, info.amb_other, info.amb_ra_other,
+                        out[n - 1].fn);
+        } else {
+            fprintf(stderr, "[ss]  x t=%d FAIL k=%d fn=%08X %s\n", r->t, info.fail_k, info.fail_fn, info.why);
+        }
+    }
+    fprintf(stderr, "[ss] exact probe %d: %d of %d threads ok\n", idx, ok, tried);
+}
+#endif
+
 static void ss_probe(int idx, int wait_ms)
 {
     const double t0 = ss_now();
@@ -256,6 +349,8 @@ static void ss_probe(int idx, int wait_ms)
 
     /* Suspend everyone first, then read: one consistent snapshot. */
     int nrec = 0;
+    size_t wfill = 0;
+    (void)wfill;
     for (int t = 0; t < SS_MAX && nrec < SS_MAX; t++) {
         ss_slot* s = &s_ss[t];
         if (!__atomic_load_n(&s->alive, __ATOMIC_ACQUIRE)) continue;
@@ -277,6 +372,10 @@ static void ss_probe(int idx, int wait_ms)
             r->run_state = bi.run_state;
         ss_walk_host(r, s);
         ss_walk_guest(r, s->ctx);
+        r->cia = (uint32_t)s->ctx->cia;
+#if defined(PORT_SAVE_STATES)
+        ss_copy_stack(r, &wfill);
+#endif
     }
     const double t_read = ss_now() - t0;
     for (int i = 0; i < nrec; i++)
@@ -310,6 +409,9 @@ static void ss_probe(int idx, int wait_ms)
         }
         fprintf(stderr, "%s\n", line);
     }
+#if defined(PORT_SAVE_STATES)
+    ss_exact(idx, nrec);
+#endif
     if (s_mem_every > 0 && (idx - 1) % s_mem_every == 0) ss_mem(idx);
     fflush(stderr);
 }

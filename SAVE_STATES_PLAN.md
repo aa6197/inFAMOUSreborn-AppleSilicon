@@ -125,6 +125,122 @@ build-and-run cycle about 15–20 min.
   take test cycles. Phase 0 makes the estimate firmer.
 - C is only worth it if A fails in phase 0.
 
+## Phase 1 design (11-13)
+
+Build side (CMake `PORT_SAVE_STATES`, Apple only, default OFF):
+
+- `ps3recomp/tools/ss_resume_pass.py` runs last on each lifted file the
+  Mac/iOS build compiles. It does not change the lifter, so there is no
+  regenerate and Windows output is untouched.
+- It adds:
+  - `ctx->lr = <return address>` before each bctrl/blrl. The address
+    comes from the game ELF (n-th bctrl between two known addresses).
+  - `ctx->cia = <address>` before each system call.
+  - a label after each call, and before/after each system call and HLE
+    call.
+  - a resume block at the start of each function: refill the saved
+    registers from the guest stack, call the next function of the
+    chain, jump to the label after that call.
+  - a site table per file: function, address, kind, stack offset.
+- All 27,305 lifted functions get a resume block. (The first count,
+  27,021, missed 284 functions whose opening line ends in a comment.)
+  One file is +30% object size (speed still to measure).
+- The `_cs_N` snapshots are declared before the resume block and their
+  lines become plain assignments (a jump may not skip a declaration with
+  a value). 3 functions have a hand-added hook line before them; a
+  resume skips it.
+
+Save side (`ppu_ss_resume.cpp`, `ss_chain_build`):
+
+- Host frames give the lifted functions, innermost first. The guest
+  stack gives the return address of each one. Each must be a known site
+  of that function, or the save is refused.
+- A thread inside an HLE call: the import stub tail-calls the HLE
+  code, so the stub has no host frame. The save reads the `bl` just
+  before the return address to find the stub and adds it to the chain.
+- A thread inside a guest callback (game code under an HLE call) is
+  refused for now.
+
+Load side: set `g_ss_resume`, give the thread its saved chain, call the
+outermost function. Each resume block takes its frame and calls the
+next. The innermost one re-runs (or skips past) its system call or HLE
+call.
+
+Still to do after the chains (most of the work):
+
+- Host state outside guest memory: lv2 objects (mutex, cond, semaphore,
+  event queues and ports, timers, threads), lwmutex/lwcond host slots,
+  memory allocators, file handles and offsets, SPU threads and SPURS
+  tables, RSX/GCM state and render targets, audio ports, pads, sysutil
+  callbacks, the clock offset.
+- Waits that cannot simply be re-run: `sys_cond_wait` and `lwcond_wait`
+  (they unlock first) need a "wait only" resume.
+- Revised time: chains and resume about 3–5 h; the rest of the state
+  about 10–20 h more.
+
+## Save and load design (11-13, after the chain test)
+
+Where threads are when the save stops them (100 checks, 36 threads):
+
+- Most PPU threads sit in a blocking call: `sys_lwcond_wait` (most),
+  `sys_event_queue_receive`, `sys_timer_usleep`, `sys_mutex_lock`, and
+  one HLE wait (`WaitOnAddress`).
+- On load each one runs its call again, but some calls cannot simply
+  run twice:
+  - `lwcond_wait` / `cond_wait` unlock their mutex first. Load needs a
+    "wait only" form: wait, then lock again. Simplest: lock again and
+    return OK at once (a spurious wake-up). The port already does this
+    every 1 ms for most `lwcond_wait` sites (the 1 ms poll cap), so the
+    game copes with it there; the "strict" sites need a real wait.
+  - `timer_usleep`: sleep only the time that was left.
+  - `event_queue_receive`, `mutex_lock`, `sem_wait`: safe to run again
+    (the queue, owner and count come back from the save).
+
+Save file (one per slot, device only):
+
+- Header: format version and a build id. Chains only fit the exact
+  build that made them, so a different build refuses the file.
+- Game memory: used pages only, LZ4.
+- PPU threads: registers, chain (from `ss_chain_build`), which call to
+  re-enter and how.
+- Kernel tables: mutex, cond, rwlock, semaphore, event queues and
+  ports, timers, lwmutex/lwcond host slots, memory allocators, threads.
+- Files: path, mode, offset. Reopened on load.
+- SPU: see below.
+- RSX: method registers, FIFO pointers, display buffers, render-target
+  pictures (GPU readback).
+- Audio ports, pads, sysutil callbacks, the clock offset.
+
+SPU (the hardest part):
+
+- SPURS policy modules run in short passes. The save waits for the
+  current pass to end, so nothing is mid-way.
+- SPURS tasks (for example the file task) and the raw SPU thread park
+  in the middle of their code (`WAIT_SIGNAL`, channel waits). Their
+  whole state is in local store + registers + pc, but their host
+  frames are not.
+- First try: resume them with the existing SPU interpreter from the
+  saved pc. It shares the same context and calls lifted code for any
+  known function, so it is correct, but the task's outer loop stays
+  interpreted (slower) until the task ends. Measure the cost; if too
+  slow, add SPU resume chains like the PPU ones.
+
+Load (fresh start, `SS_LOAD=<file>`):
+
+1. Boot as normal up to just before the first game thread runs (game
+   file loaded, system modules, Metal and audio up).
+2. Fill game memory, rebuild kernel tables and host objects.
+3. Start one host thread per saved PPU thread. Each sets its chain and
+   calls its outermost function; the resume blocks rebuild the stack.
+4. Start SPU threads and SPURS, audio, then the frame clock.
+
+Test ladder (Mac first; each step finds missing state):
+
+1. Save at ~5 s (few threads and objects), load, does the intro go on?
+2. Save at the main menu, load.
+3. Save in play, load, play 5 minutes.
+4. iPad, then Save/Load in the in-game menu.
+
 ## Risks
 
 - The stack walk may miss frames (functions that keep the return
