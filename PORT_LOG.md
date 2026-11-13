@@ -161,6 +161,64 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 ---
 
+## 2026-11-13 (night) — In-game menu: two groups, Restart now, tap to reopen
+
+### Why
+
+User feedback after testing save states:
+- the restart (Load state) closed the app and it did not open again;
+- what needs a restart was mixed with what changes at once;
+- the only sign of a needed restart was a text change, easy to miss.
+
+### What changed (iOS only: ios/game_menu.mm, ios/ios_shell.mm, CMakeLists.txt)
+
+- Two groups:
+  - "Saves and resolution": Save state, Load state, Resolution.
+  - "Graphics": Shadows, Upscaling (they change at once).
+- Load state: a tap picks a save (tick, orange); the same tap again
+  un-picks it. The "press again" timer is gone.
+- When Resolution differs from what the game runs with, or a save is
+  picked:
+  - an orange "Restart now" button shows in the group's header (short
+    pulse when it appears);
+  - the group gets an orange border;
+  - the header says what the restart does, e.g. "Restart to load Save
+    19:43 at 450p".
+- Reopen: iOS does not let an app open itself again. Restart now sets a
+  notification ("Tap to open inFamous again") for 1 s later, then closes
+  the app. One tap on it opens the game and the load runs.
+  - The first time, iOS asks for notification permission.
+  - Without permission: the header says "Closing. Open inFamous again
+    from the Home Screen." for 4 s, then the app closes.
+  - The next start clears the notification.
+- Resolution is written with `synchronize` before `_exit`.
+- The permission alert sends the app the "going to the background"
+  event. The background save is skipped while Restart now runs, so it
+  can't write over a picked auto.ss.
+- iPhone in landscape (short, wide screen): the groups sit side by side.
+- Test hooks: MENU_SCRIPT `load0` / `load1` now pick a save; new
+  `res0`..`res4` (pick a Resolution) and `restart`. `MENU_NOTIFY=0`
+  skips the notification.
+- Links UserNotifications (iOS target only).
+
+### Results (iPad Pro 11 M4, save-state build)
+
+| Test | Result |
+|---|---|
+| Pick Save + 450p (run 204732) | both groups shown, orange Restart now, header "Restart to load Save 19:43 at 450p" |
+| Restart now, `MENU_NOTIFY=0` | header "Closing. Open inFamous again ...", app closed after 4 s |
+| Next start (run 205136) | started at 62.5% (Resolution kept), marker read; that save refused: made by an older build (expected) |
+| Save, pick it + 540p, restart (run 205321) | marker written, app closed |
+| Next start (run 205440) | 75% (save made at 62.5%); all parts back; START → gameplay |
+
+- Not tested: the notification itself. It needs taps on "Allow" and on
+  the notification (user's hands).
+- iPad left at 540p, as it was.
+- `ios_device.sh run` with no `VAR=value` does not launch (devicectl
+  rejects an empty env). Pass any variable.
+
+---
+
 ## 2026-11-13 (evening) — Save states: movies after a load (Bink SPU worker), iPhone results
 
 ### Problem
