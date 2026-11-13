@@ -392,7 +392,7 @@ extern "C" void ss_resume_begin(const ss_rframe* f, int n);  /* ppu_ss_resume.cp
 extern "C" const ss_rframe* ss_load_take(ppu_context* ctx, int* n);   /* ppu_ss_load.cpp */
 extern "C" void ss_mods_init(void);                                  /* ppu_ss_load.cpp */
 #if defined(PORT_SAVE_STATES)
-extern "C" int  cellGcm_ss_hold(int on);                             /* libs/video/cellGcmSys.c */
+extern "C" int  ss_gcm_hold(int on);                             /* libs/video/cellGcmSys.c */
 #endif
 static int s_load;   /* SS_LOAD=<file> */
 
@@ -697,7 +697,7 @@ static int ss_save(const char* path, int wait_ms)
     uint64_t tab = 0;
     int ok = nsusp == nrec;
     const double t_hold = ss_now();
-    if (!cellGcm_ss_hold(1)) fprintf(stderr, "[ss] save: frame clock did not park\n");
+    if (!ss_gcm_hold(1)) fprintf(stderr, "[ss] save: frame clock did not park\n");
     const double t_held = ss_now() - t_hold;
     ok = ss_file_mem(o, &ms) && ok;
     ok = ss_file_tables(o, &tab) && ok;
@@ -711,7 +711,7 @@ static int ss_save(const char* path, int wait_ms)
         c_ok = ss_file_in_map(chk, path) && ss_file_mem_load(chk, 0, &cms, &c_mem) && ss_file_tables_load(chk, 0, &c_tab);
     }
     t_chk = ss_now() - t_chk;
-    cellGcm_ss_hold(0);
+    ss_gcm_hold(0);
     ss_resume_all(nrec);
     fprintf(stderr, "[ss] save: graphics held after %.1f ms\n", t_held * 1000.0);
     const double t_frozen = ss_now() - t0;

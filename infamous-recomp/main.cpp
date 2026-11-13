@@ -220,7 +220,7 @@ static int bg_trim_on(void)
 #if defined(__APPLE__)
 /* Save states (PORT_SAVE_STATES builds): a save or load holds the clock here (cellGcmSys.c). */
 extern "C" volatile int g_gcm_ss_park;
-extern "C" int cellGcm_ss_park_wait(void);
+extern "C" int ss_gcm_park_wait(void);
 #endif
 static DWORD WINAPI frame_clock(LPVOID)
 {
@@ -271,7 +271,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     if (s_flat < 0) { const char* e = getenv("RSX_IDLE_SLEEP"); s_flat = (e && *e == '1') ? 1 : 0; }
     for (;;) {
 #if defined(__APPLE__)
-        if (g_gcm_ss_park && cellGcm_ss_park_wait()) next_tick = GetTickCount64();
+        if (g_gcm_ss_park && ss_gcm_park_wait()) next_tick = GetTickCount64();
 #endif
 #if defined(PORT_IOS)
         if (const int why = s_app_paused.load(std::memory_order_acquire)) {

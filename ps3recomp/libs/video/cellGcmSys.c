@@ -4328,7 +4328,7 @@ static u64 s_ss_user_pending = 0;
 
 /* Frame clock (infamous-recomp/main.cpp), top of its loop: wait while held.
  * Returns 1 if it waited (the caller then restarts its vblank clock). */
-int cellGcm_ss_park_wait(void)
+int ss_gcm_park_wait(void)
 {
     if (!__atomic_load_n(&g_gcm_ss_park, __ATOMIC_ACQUIRE)) return 0;
     __atomic_store_n(&s_ss_parked, 1, __ATOMIC_RELEASE);
@@ -4341,7 +4341,7 @@ int cellGcm_ss_park_wait(void)
  * walker lock, so only the guest changes GCM / RSX state. It also waits for the
  * backend: the frame clock starts it before its loop. Returns 0 if the clock did
  * not park within 10 s. on = 0: let both go. */
-int cellGcm_ss_hold(int on)
+int ss_gcm_hold(int on)
 {
     if (!on) {
         ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
@@ -4358,7 +4358,7 @@ int cellGcm_ss_hold(int on)
     return ok;
 }
 
-void cellGcm_ss_blobs(void (*add)(const char*, void*, size_t))
+void ss_gcm_blobs(void (*add)(const char*, void*, size_t))
 {
 #define GCM_SS(name, v) add("gcm." name, (void*)&(v), sizeof(v))
     extern u32 g_rsx_last_reference, g_rsx_aa_control;
@@ -4428,7 +4428,7 @@ void cellGcm_ss_blobs(void (*add)(const char*, void*, size_t))
 /* After the blobs are back, with the hold taken: what the blobs cannot carry
  * (host pointers, the engine's display buffers, the clock), then the context
  * last, so the walker starts on a complete state. Returns the display buffers. */
-int cellGcm_ss_restore(void)
+int ss_gcm_restore(void)
 {
     s_flip_handler     = (CellGcmFlipHandler)(uintptr_t)s_flip_handler_opd;
     s_vblank_handler   = (CellGcmVBlankHandler)(uintptr_t)s_vblank_handler_opd;

@@ -151,10 +151,10 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 ### Graphics restore (Mac, test build only)
 
 - Save and load now carry the GCM / RSX state as "mod:" blobs
-  (`cellGcm_ss_blobs`, `rsx_draw_engine_ss_blobs`): display buffers,
+  (`ss_gcm_blobs`, `rsx_draw_engine_ss_blobs`): display buffers,
   IO map tables, handlers, labels, reports, the FIFO walker position and
   its RSX state, the draw engine's register file.
-- Both hold the graphics still (`cellGcm_ss_hold`): the frame clock
+- Both hold the graphics still (`ss_gcm_hold`): the frame clock
   parks at the top of its loop (`main.cpp`, Apple only) and the walker
   lock is taken. On load this also waits for the backend to be up.
 - The load does not run `cellGcmInit` again (it zeroes the control

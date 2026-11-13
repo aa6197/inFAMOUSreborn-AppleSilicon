@@ -18,7 +18,7 @@
  *     same wait again.
  *
  * Graphics: the GCM / RSX state comes back with the frame clock parked
- * (cellGcm_ss_hold); the walker then carries on from the saved FIFO position.
+ * (ss_gcm_hold); the walker then carries on from the saved FIFO position.
  * Not yet: audio, SPURS and SPU tasks (the next steps).
  */
 #if defined(__APPLE__)
@@ -51,9 +51,9 @@ extern "C" void ppu_fs_ss_blobs(ss_add_fn add);               /* ppu_fs.cpp */
 extern "C" int  ppu_fs_ss_restore(int* lost);
 extern "C" void sys_memory_ss_blobs(ss_add_fn add);           /* sys_memory.c */
 extern "C" void sys_vm_ss_blobs(ss_add_fn add);               /* sys_vm.c */
-extern "C" void cellGcm_ss_blobs(ss_add_fn add);              /* libs/video/cellGcmSys.c */
-extern "C" int  cellGcm_ss_hold(int on);
-extern "C" int  cellGcm_ss_restore(void);
+extern "C" void ss_gcm_blobs(ss_add_fn add);              /* libs/video/cellGcmSys.c */
+extern "C" int  ss_gcm_hold(int on);
+extern "C" int  ss_gcm_restore(void);
 extern "C" void rsx_draw_engine_ss_blobs(ss_add_fn add);      /* libs/video/rsx_draw_engine.c */
 extern "C" void rsx_draw_engine_ss_restore(void);
 extern "C" int  ss_site_has(uint32_t fn, uint64_t key);       /* ppu_ss_resume.cpp */
@@ -70,7 +70,7 @@ static void ss_mods_do(void)
     ppu_fs_ss_blobs(ss_file_mod_add);
     sys_memory_ss_blobs(ss_file_mod_add);
     sys_vm_ss_blobs(ss_file_mod_add);
-    cellGcm_ss_blobs(ss_file_mod_add);
+    ss_gcm_blobs(ss_file_mod_add);
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
 }
 extern "C" void ss_mods_init(void)
@@ -254,7 +254,7 @@ static int ss_load_all(const char* path)
     ss_mods_init();
     s_loading = 1;
     /* graphics: the frame clock parks (after starting the backend) and the walker stops */
-    if (!cellGcm_ss_hold(1)) fprintf(stderr, "[ss] load: frame clock did not park\n");
+    if (!ss_gcm_hold(1)) fprintf(stderr, "[ss] load: frame clock did not park\n");
 
     ss_mem_stats ms;
     uint64_t md = 0;
@@ -267,8 +267,8 @@ static int ss_load_all(const char* path)
     ss_file_in_free(in);
 
     rsx_draw_engine_ss_restore();
-    const int nbuf = cellGcm_ss_restore();
-    cellGcm_ss_hold(0);
+    const int nbuf = ss_gcm_restore();
+    ss_gcm_hold(0);
     fprintf(stderr, "[ss] load: graphics back (%d display buffers)\n", nbuf);
     ss_rehost_kernel();
     const int nlwm = ppu_sysprx_ss_restore();
