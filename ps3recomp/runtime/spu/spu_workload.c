@@ -255,6 +255,54 @@ typedef struct {
     uint32_t            taskid;
 } spu_async_job;
 
+#if defined(__APPLE__)
+/* Save states (Apple): one record per live async task thread, so the save can
+ * find each task's SPU context while it waits. The rest is in the "Save states"
+ * block at the end of this file. */
+#define SS_TASK_MAX 8
+typedef struct {
+    int           used, in_wait;      /* in_wait: inside WAIT_SIGNAL (written under s_sig_lock) */
+    spu_async_job job;
+    spu_context*  ctx;                /* set when the task enters WAIT_SIGNAL */
+    uint32_t      ts, tid, wobj;
+} ss_task_rec;
+static ss_task_rec s_ss_task[SS_TASK_MAX];
+static pthread_mutex_t s_ss_task_lock = PTHREAD_MUTEX_INITIALIZER;
+static int s_ss_task_over;            /* threads that found no free record: a save then fails */
+static volatile int s_ss_hold;        /* a save is running: a waiting task stays in its wait */
+static __thread ss_task_rec* t_ss_task;
+__thread int g_ss_spu_resumed_tls;    /* spu_interp.c: this thread runs a task resumed from a save */
+static void ss_task_claim(const spu_async_job* j)
+{
+    pthread_mutex_lock(&s_ss_task_lock);
+    t_ss_task = NULL;
+    for (int i = 0; i < SS_TASK_MAX; i++)
+        if (!s_ss_task[i].used) {
+            memset(&s_ss_task[i], 0, sizeof s_ss_task[i]);
+            s_ss_task[i].used = 1;
+            if (j) s_ss_task[i].job = *j;
+            t_ss_task = &s_ss_task[i];
+            break;
+        }
+    if (!t_ss_task) s_ss_task_over++;
+    pthread_mutex_unlock(&s_ss_task_lock);
+}
+static void ss_task_release(void)
+{
+    pthread_mutex_lock(&s_ss_task_lock);
+    if (t_ss_task) memset(t_ss_task, 0, sizeof *t_ss_task); else s_ss_task_over--;
+    t_ss_task = NULL;
+    pthread_mutex_unlock(&s_ss_task_lock);
+}
+/* spu_channels.c, WAIT_SIGNAL syscall: the context this task waits with. */
+void ss_spu_task_waiting(spu_context* ctx, uint32_t ts, uint32_t tid, uint32_t wobj)
+{
+    ss_task_rec* r = t_ss_task;
+    if (!r) return;
+    r->ctx = ctx; r->ts = ts; r->tid = tid; r->wobj = wobj;
+}
+#endif
+
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
  * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
  * shared taskset context in LS. Our default model runs each task ONCE on a
@@ -821,7 +869,17 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { g_spu_async_task_tls = 1; spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p) {
+    g_spu_async_task_tls = 1;
+#if defined(__APPLE__)
+    ss_task_claim((const spu_async_job*)p);   /* copies the job: spu_async_run frees it */
+#endif
+    spu_async_run((spu_async_job*)p);
+#if defined(__APPLE__)
+    ss_task_release();
+#endif
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -1445,13 +1503,22 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     unsigned waited_ms = 0;
     int autowoke = 0;
     pthread_mutex_lock(&s_sig_lock);
-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) &&
-           !spu_sig_shadow_test(taskset_ea, taskId)) {
+#if defined(__APPLE__)
+    if (t_ss_task) t_ss_task->in_wait = 1;   /* save states: the save may hold us here */
+#define SS_HOLD_WAIT || s_ss_hold
+#else
+#define SS_HOLD_WAIT
+#endif
+    while ((!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId) &&
+            !spu_sig_shadow_test(taskset_ea, taskId)) SS_HOLD_WAIT) {
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += (long)per_ms * 1000000L;
         while (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
             static int _n = 0;
+#if defined(__APPLE__)
+            if (s_ss_hold) continue;   /* no wake-up, autowake or drain while a save runs */
+#endif
             if (lfq && spu_lfq_should_autowake(lfq)) {
                 autowoke = 1;
                 { static int _a = 0; if ((_a < 16 && _a++ < 16))
@@ -1471,6 +1538,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     if (!drained) { spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId); spu_sig_shadow_clear(taskset_ea, taskId); s_sig_consumed[taskId]++; }
+#if defined(__APPLE__)
+    if (t_ss_task) t_ss_task->in_wait = 0;
+#endif
+#undef SS_HOLD_WAIT
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if ((_d < 24 && _d++ < 24))
@@ -1619,3 +1690,189 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 #endif
     return 1;
 }
+
+#if defined(__APPLE__)
+/* ---------------------------------------------------------------------------
+ * Save states (Apple; runtime/ppu/ppu_ss_probe.cpp saves, ppu_ss_load.cpp loads).
+ * A taskset task (inFamous: the FIOS streaming task) runs on its own host thread
+ * with its SPU context on that thread's stack. The save holds every such task in
+ * its WAIT_SIGNAL wait and writes its whole context (registers + local store);
+ * the context is exact there (the lifted code writes its registers back before
+ * the syscall branch). The load starts one thread per task that makes the same
+ * syscall again (a wait that had not finished is the same wait again) and then
+ * carries on at the syscall's return address, through the resolver.
+ * -----------------------------------------------------------------------*/
+void spu_coh_unregister(spu_context* ctx);   /* spu_coherency.c */
+#include <unistd.h>          /* usleep */
+typedef struct {
+    uint32_t ts, tid, image_id, args_ea;
+    uint32_t image_ea, image_size, have_r3, wobj;
+    uint32_t r3[4];
+    uint32_t ctx_size, pad[3];
+} ss_spu_task_disk;
+
+static int ss_task_ready(const ss_task_rec* r)
+{
+    return r->in_wait && r->ctx && r->ctx->ls == r->ctx->ls_store &&
+           (r->ctx->gpr[3]._u32[0] & 0x0Fu) == 2u && r->ts;
+}
+
+/* on = 1: wait (up to ~1 s) until every task thread is in its wait, then keep it
+ * there. No stdio: the save calls this while the PPU threads are suspended. */
+int ss_spu_tasks_hold(int on, int* tasks, int* held)
+{
+    if (!on) {
+        pthread_mutex_lock(&s_sig_lock);
+        s_ss_hold = 0;
+        pthread_cond_broadcast(&s_sig_cv);
+        pthread_mutex_unlock(&s_sig_lock);
+        return 1;
+    }
+    __atomic_store_n(&s_ss_hold, 1, __ATOMIC_SEQ_CST);
+    int n = 0, w = 0;
+    for (int k = 0; k < 1000; k++) {
+        if (pthread_mutex_trylock(&s_sig_lock) == 0) {
+            pthread_mutex_lock(&s_ss_task_lock);
+            n = 0; w = 0;
+            for (int i = 0; i < SS_TASK_MAX; i++) {
+                if (!s_ss_task[i].used) continue;
+                n++;
+                if (ss_task_ready(&s_ss_task[i])) w++;
+            }
+            const int over = s_ss_task_over;
+            pthread_mutex_unlock(&s_ss_task_lock);
+            pthread_mutex_unlock(&s_sig_lock);
+            if (over) break;
+            if (w == n) break;
+        }
+        usleep(1000);
+    }
+    if (tasks) *tasks = n;
+    if (held) *held = w;
+    return w == n && !s_ss_task_over;
+}
+
+/* Section "spu.tasks": u32 count, then per task a record and its whole context.
+ * Only valid while the hold is on. */
+void ss_spu_tasks_save(void (*put)(void*, const void*, size_t), void* o)
+{
+    extern uint8_t* vm_base;
+    uint32_t cnt = 0;
+    for (int i = 0; i < SS_TASK_MAX; i++) if (s_ss_task[i].used && ss_task_ready(&s_ss_task[i])) cnt++;
+    put(o, &cnt, 4);
+    for (int i = 0; i < SS_TASK_MAX; i++) {
+        const ss_task_rec* r = &s_ss_task[i];
+        if (!r->used || !ss_task_ready(r)) continue;
+        ss_spu_task_disk d;
+        memset(&d, 0, sizeof d);
+        d.ts = r->ts; d.tid = r->tid; d.wobj = r->wobj;
+        d.image_id = (uint32_t)r->job.image_id; d.args_ea = r->job.args_ea;
+        d.image_ea = r->job.image ? (uint32_t)(r->job.image - vm_base) : 0;
+        d.image_size = r->job.image_size; d.have_r3 = (uint32_t)r->job.have_r3;
+        memcpy(d.r3, r->job.r3, sizeof d.r3);
+        d.ctx_size = (uint32_t)sizeof(spu_context);
+        put(o, &d, sizeof d);
+        put(o, r->ctx, sizeof(spu_context));
+    }
+}
+
+static spu_context*     s_ss_load_ctx[SS_TASK_MAX];
+static ss_spu_task_disk s_ss_load_rec[SS_TASK_MAX];
+static int              s_ss_load_n;
+
+/* Returns the number of tasks, -1 if the section does not fit this build. */
+int ss_spu_tasks_load(const uint8_t* p, uint64_t n)
+{
+    uint32_t cnt;
+    if (n < 4) return -1;
+    memcpy(&cnt, p, 4); p += 4; n -= 4;
+    if (cnt > SS_TASK_MAX) return -1;
+    s_ss_load_n = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        ss_spu_task_disk d;
+        if (n < sizeof d) return -1;
+        memcpy(&d, p, sizeof d); p += sizeof d; n -= sizeof d;
+        if (d.ctx_size != sizeof(spu_context) || n < d.ctx_size || d.tid >= 128) return -1;
+        spu_context* c = NULL;
+        if (posix_memalign((void**)&c, 64, sizeof *c) != 0 || !c) return -1;
+        memcpy(c, p, sizeof *c); p += d.ctx_size; n -= d.ctx_size;
+        c->ls = c->ls_store;                        /* host fields: as the policy contexts (spurs_policy.c) */
+        c->ch_wait_cv = NULL; c->ch_wait_lock = NULL;
+        c->irq_frame = NULL;
+        c->ch_out_mbox.lock = 0; c->ch_in_mbox.lock = 0; c->ch_out_intr_mbox.lock = 0;
+        c->ch_sig_notify[0].lock = 0; c->ch_sig_notify[1].lock = 0;
+        if (c->resv_valid) { c->resv_valid = 0; c->event_status |= 0x400u; }   /* SPU_EVENT_LR: reservation lost */
+        c->host_depth = 0; c->drain_ret_pc = 0;     /* no lifted host frame is live any more */
+        s_ss_load_ctx[s_ss_load_n] = c;
+        s_ss_load_rec[s_ss_load_n] = d;
+        s_ss_load_n++;
+    }
+    return s_ss_load_n;
+}
+
+static void* ss_spu_resume_thread(void* p)
+{
+    extern uint8_t* vm_base;
+    const int i = (int)(intptr_t)p;
+    spu_context* c = s_ss_load_ctx[i];
+    const ss_spu_task_disk d = s_ss_load_rec[i];
+    g_spu_async_task_tls = 1;
+    g_ss_spu_resumed_tls = 1;
+    spu_async_job j;
+    memset(&j, 0, sizeof j);
+    j.image = d.image_ea ? vm_base + d.image_ea : NULL; j.image_size = d.image_size;
+    j.args_ea = d.args_ea; j.image_id = (int)d.image_id;
+    memcpy(j.r3, d.r3, sizeof j.r3); j.have_r3 = (int)d.have_r3;
+    j.taskset_ea = d.ts; j.taskid = d.tid;
+    ss_task_claim(&j);
+    spu_taskset_mark(d.ts, d.tid, 1);
+    spu_serial_acquire();
+    extern void spu_spurs_taskset_syscall(spu_context*);
+    extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+    spu_spurs_taskset_syscall(c);                   /* the same WAIT_SIGNAL again (r3 still holds the call) */
+    c->pc = c->gpr[0]._u32[0] & SPU_LS_MASK;        /* then on at its return address, as the resolver does */
+    spu_run_with_halt(spu_indirect_branch, c);
+    spu_serial_release();
+    spu_coh_unregister(c);
+    fprintf(stderr, "[ss] resumed SPU task %u of taskset 0x%08X ended\n", d.tid, d.ts);
+    spu_taskset_task_exited(d.ts, d.tid);
+    ss_task_release();
+    free(c);
+    return NULL;
+}
+
+/* After the load: one host thread per saved task (same 256 MB stack as a dispatch). */
+int ss_spu_tasks_start(void)
+{
+    int started = 0;
+    for (int i = 0; i < s_ss_load_n; i++) {
+        pthread_t th;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        int prc = EINVAL;
+        if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+            prc = pthread_create(&th, &attr, ss_spu_resume_thread, (void*)(intptr_t)i);
+        pthread_attr_destroy(&attr);
+        if (prc != 0) continue;
+        pthread_detach(th);
+        started++;
+    }
+    return started;
+}
+
+/* Host signal tables (who to wake, owed event-flag bits, latched wakes, signal
+ * shadows). The parked list is not saved: a resumed task parks again. */
+void ss_spu_blobs(void (*add)(const char*, void*, size_t))
+{
+#define SPU_SS(nm, v) add("spu." nm, (void*)&(v), sizeof(v))
+    SPU_SS("obj_wake", s_obj_wake);
+    SPU_SS("obj_wake_n", s_obj_wake_count);
+    SPU_SS("efbits_obj", s_efbits_obj);
+    SPU_SS("efbits_val", s_efbits_val);
+    SPU_SS("wake_latch", s_wake_latch);
+    SPU_SS("sh_ts", s_shadow_ts);
+    SPU_SS("sh_task", s_shadow_task);
+    SPU_SS("sh_pend", s_shadow_pend);
+#undef SPU_SS
+}
+#endif

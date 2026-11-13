@@ -2882,6 +2882,10 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
                 ctx->gpr[3]._u32[0] = 0;
                 return;
             }
+#if defined(__APPLE__)
+            { extern void ss_spu_task_waiting(spu_context*, uint32_t, uint32_t, uint32_t);
+              ss_spu_task_waiting(ctx, ts, tid, wobj); }   /* save states: spu_workload.c */
+#endif
             yz_lockstep_block_begin(ctx);
             { extern
 #if defined(_MSC_VER)

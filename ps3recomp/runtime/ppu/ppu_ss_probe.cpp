@@ -395,6 +395,8 @@ extern "C" void ss_mods_init(void);                                  /* ppu_ss_l
 extern "C" int  ss_gcm_hold(int on);                             /* libs/video/cellGcmSys.c */
 extern "C" int  ss_spurs_hold(int on, long* threads, long* parked);   /* libs/spurs/cellSpurs.c */
 extern "C" void spurs_pm_ss_save(void (*put)(void*, const void*, size_t), void* o);   /* runtime/spu/spurs_policy.c */
+extern "C" int  ss_spu_tasks_hold(int on, int* tasks, int* held);   /* runtime/spu/spu_workload.c */
+extern "C" void ss_spu_tasks_save(void (*put)(void*, const void*, size_t), void* o);
 extern "C" int  ss_sysutil_presave(void);                           /* libs/system/cellSysutil.c */
 static void ss_put_cb(void* o, const void* p, size_t n) { ss_file_put((ss_out*)o, p, n); }
 #endif
@@ -708,6 +710,9 @@ static int ss_save(const char* path, int wait_ms)
     const int sk_ok = ss_spurs_hold(1, &sk_n, &sk_p);
     const double t_spurs = ss_now() - t_hold;
     ok = sk_ok && ok;
+    int st_n = 0, st_w = 0;   /* SPURS taskset tasks (own threads): held in their wait */
+    const int st_ok = ss_spu_tasks_hold(1, &st_n, &st_w);
+    ok = st_ok && ok;
     const int gcm_ok = ss_gcm_hold(1);
     const double t_held = ss_now() - t_hold;
     ok = ss_file_mem(o, &ms) && ok;
@@ -716,6 +721,9 @@ static int ss_save(const char* path, int wait_ms)
     ok = ss_file_tables(o, &tab) && ok;
     ss_file_sec_begin(o, "spurs.pm");
     spurs_pm_ss_save(ss_put_cb, o);
+    ss_file_sec_end(o);
+    ss_file_sec_begin(o, "spu.tasks");
+    ss_spu_tasks_save(ss_put_cb, o);
     ss_file_sec_end(o);
     ss_mem_stats cms;
     uint64_t c_mem = 0;
@@ -728,11 +736,12 @@ static int ss_save(const char* path, int wait_ms)
     }
     t_chk = ss_now() - t_chk;
     ss_gcm_hold(0);
+    ss_spu_tasks_hold(0, NULL, NULL);
     ss_spurs_hold(0, NULL, NULL);
     ss_resume_all(nrec);
-    fprintf(stderr, "[ss] save: SPURS %ld of %ld kernel threads parked after %.1f ms; graphics %s after %.1f ms; "
-            "sysutil completions %d\n",
-            sk_p, sk_n, t_spurs * 1000.0, gcm_ok ? "held" : "NOT held", t_held * 1000.0, ncomp);
+    fprintf(stderr, "[ss] save: SPURS %ld of %ld kernel threads parked after %.1f ms; SPU tasks %d of %d held; "
+            "graphics %s after %.1f ms; sysutil completions %d\n",
+            sk_p, sk_n, t_spurs * 1000.0, st_w, st_n, gcm_ok ? "held" : "NOT held", t_held * 1000.0, ncomp);
     const double t_frozen = ss_now() - t0;
     if (chk) {
         if (c_ok) {

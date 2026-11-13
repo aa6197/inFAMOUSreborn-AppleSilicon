@@ -23,7 +23,10 @@
  * then the kernel threads start again (they were parked between passes at the save).
  * HLE libraries: init flags, callbacks and an open dialog come back as blobs; the
  * pad opens its host side again (ss_pad_restore).
- * Not yet: audio and SPURS taskset tasks (the next steps).
+ * SPURS taskset tasks on their own threads (inFamous: the FIOS streaming task) were
+ * held in their WAIT_SIGNAL wait at the save; each gets a new thread that waits
+ * again and carries on from its saved SPU context (spu_workload.c).
+ * Not yet: audio, clocks (the next steps).
  */
 #if defined(__APPLE__)
 
@@ -63,6 +66,9 @@ extern "C" void rsx_draw_engine_ss_restore(void);
 extern "C" void ss_spurs_blobs(ss_add_fn add);            /* libs/spurs/cellSpurs.c */
 extern "C" int  ss_spurs_restore(void);
 extern "C" int  spurs_pm_ss_load(const uint8_t* p, uint64_t n);   /* runtime/spu/spurs_policy.c */
+extern "C" void ss_spu_blobs(ss_add_fn add);                       /* runtime/spu/spu_workload.c */
+extern "C" int  ss_spu_tasks_load(const uint8_t* p, uint64_t n);
+extern "C" int  ss_spu_tasks_start(void);
 extern "C" void ss_pad_blobs(ss_add_fn add);                  /* libs/input/cellPad.c */
 extern "C" int  ss_pad_restore(void);
 extern "C" void ss_kb_blobs(ss_add_fn add);                   /* libs/input/cellKb.c */
@@ -93,6 +99,7 @@ static void ss_mods_do(void)
     ss_gcm_blobs(ss_file_mod_add);
     rsx_draw_engine_ss_blobs(ss_file_mod_add);
     ss_spurs_blobs(ss_file_mod_add);
+    ss_spu_blobs(ss_file_mod_add);
     /* HLE libraries with host-side state (init flags, callbacks, open dialog) */
     ss_pad_blobs(ss_file_mod_add);
     ss_kb_blobs(ss_file_mod_add);
@@ -300,6 +307,10 @@ static int ss_load_all(const char* path)
     const uint8_t* pm = ss_file_sec(in, "spurs.pm", &pm_n);
     const int npm = pm ? spurs_pm_ss_load(pm, pm_n) : 0;
     if (npm < 0) { fprintf(stderr, "[ss] load FAILED: SPURS policy contexts do not fit this build\n"); abort(); }
+    uint64_t st_n = 0;
+    const uint8_t* st = ss_file_sec(in, "spu.tasks", &st_n);
+    const int nst = st ? ss_spu_tasks_load(st, st_n) : 0;
+    if (nst < 0) { fprintf(stderr, "[ss] load FAILED: SPU tasks do not fit this build\n"); abort(); }
     ss_file_in_free(in);
 
     rsx_draw_engine_ss_restore();
@@ -314,7 +325,9 @@ static int ss_load_all(const char* path)
             ms.ranges, ms.nonzero / 1048576.0, t_mem * 1000.0, nlwm, nf, flost);
 
     const int nsi = ss_spurs_restore();
-    fprintf(stderr, "[ss] load: SPURS back (%d instances, %d policy contexts)\n", nsi, npm);
+    const int nsts = ss_spu_tasks_start();
+    fprintf(stderr, "[ss] load: SPURS back (%d instances, %d policy contexts, %d of %d SPU tasks started)\n",
+            nsi, npm, nsts, nst);
     const int pad = ss_pad_restore();
     const int ncomp = ss_sysutil_restore();
     const int dlg = ss_msgdialog_restore();

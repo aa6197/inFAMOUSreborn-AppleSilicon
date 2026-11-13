@@ -60,9 +60,10 @@ Read this first every session. Newest entry on top.
   Graphics (GCM / RSX) restore works: the walker runs on from the saved
   FIFO spot and a flip goes through. SPURS restore works: the title
   runs on after a load. HLE library state works: START plays the
-  opening cutscene after a load, then black (the game waits on file
-  loads). Next: the SPURS taskset (FIOS) task, audio, clocks. See
-  entries "Save states: HLE libraries", "Save states: SPURS",
+  opening cutscene after a load, then black. The SPURS taskset (FIOS)
+  task is saved and restored, but it was not the cause. Next: audio,
+  clocks. See entries "Save states: SPURS taskset task",
+  "Save states: HLE libraries", "Save states: SPURS",
   "Save states: graphics",
   "Save states: load, PPU core",
   "Save states: save file writer", "Save states: re-entry test" and
@@ -149,6 +150,33 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+## 2026-11-13 (evening) — Save states: SPURS taskset task (Mac)
+
+### Taskset task restore (Mac, test build only)
+
+- The game has one SPURS taskset task outside the policy modules: FIOS
+  (taskset 0x405C2E00, task 0, image 2). It runs on its own host thread
+  and waits in WAIT_SIGNAL.
+- Save: `ss_spu_tasks_hold` takes the signal lock (try-lock, up to
+  1 s) and keeps each task in its wait loop. Each waiting task is saved
+  with its whole SPU context (section `spu.tasks`), plus the wake
+  tables (`mod:spu.*` blobs).
+- Load: the contexts come back (host pointers cleared, as for the
+  policy contexts). A new thread per task enters the wait again
+  (`spu_spurs_taskset_syscall`), then runs on from link r0. A resumed
+  task handles its 0xA70 syscalls as the standalone case
+  (`g_ss_spu_resumed_tls`, both interpreter loops).
+- The Apple-only hooks cost one thread-local check per wait.
+- Results: save (`runs/20261113-175755-ss-tsave1`, at 30 s): "SPU
+  tasks 1 of 1 held", frozen 731 ms, file 241 MB. Load
+  (`runs/20261113-175835-ss-tload1`): "1 of 1 SPU tasks started", the
+  task waits again.
+- Finding: in a normal run the FIOS task makes one syscall and never
+  wakes (`runs/20261113-180131-ss-sysimg2`, `SPU_SYSCALL_IMG=2`). File
+  loads after START run on the PPU. So this task was not why the screen
+  went black after a load. Next: audio.
+- Normal Mac build builds.
 
 ## 2026-11-13 (evening) — Save states: HLE libraries (Mac)
 

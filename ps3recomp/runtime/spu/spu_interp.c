@@ -507,6 +507,9 @@ extern volatile int g_abx;
 typedef void (*spu_plug_fn_t)(spu_context*);
 extern spu_plug_fn_t spu_plug_lookup(spu_context* ctx, uint32_t pc);
 volatile long g_spu_plug_rejoins;   /* v135: interpreter -> compiled plugin hand-backs ([plug] line) */
+#if defined(__APPLE__)
+extern __thread int g_ss_spu_resumed_tls;   /* spu_workload.c: a task resumed from a save state (standalone 0xA70) */
+#endif
 static uint32_t spu_interp_run_until_fast(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
@@ -543,6 +546,14 @@ static uint32_t spu_interp_run_until_fast(spu_context* ctx, uint32_t start_lsa, 
                 ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
                 continue;
             }
+#if defined(__APPLE__)
+            if (g_ss_spu_resumed_tls && !ctx->policy_mode && sc == 0xA70u) {   /* as the resolver's standalone case */
+                extern void spu_spurs_taskset_syscall(spu_context*);
+                spu_spurs_taskset_syscall(ctx);
+                ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                continue;
+            }
+#endif
         }
         /* rejoin: same condition as the old loop; the bitmap only skips lookups that must miss
          * (registered addresses are exact keys; the flag is re-derived whenever the registry grew). */
@@ -662,6 +673,14 @@ static uint32_t spu_interp_run_until_impl(spu_context* ctx, uint32_t start_lsa, 
                 ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* resume at link r0 */
                 continue;
             }
+#if defined(__APPLE__)
+            if (g_ss_spu_resumed_tls && !ctx->policy_mode && sc == 0xA70u) {   /* as the resolver's standalone case */
+                extern void spu_spurs_taskset_syscall(spu_context*);
+                spu_spurs_taskset_syscall(ctx);
+                ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                continue;
+            }
+#endif
         }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
