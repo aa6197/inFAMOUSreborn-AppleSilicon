@@ -4,7 +4,8 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- **End-user release (new):** prebuilt Mac app and iPad .ipa with no game
+- **End-user release:** v0.1.0 is on GitHub (11-13, IPA + Mac zip, user's
+  choice; see entry "First GitHub release"). Prebuilt Mac app and iPad .ipa with no game
   files. The player picks their own disc image or game folder at first
   start; the app unpacks it, decrypts EBOOT.BIN and checks it. See entry
   "End-user release: in-app disc import". Make the files with
@@ -160,6 +161,42 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 | 25 | 11-11 | Round 12: encode thread with MetalFX off (not kept) | 52.8 / 52.9 | 51.6 / 52.3 | -1.7% | Real GPU load with MetalFX off: ~70%. The GPU is not the limit; the 3 fast cores are. |
 
 ---
+
+
+## 2026-11-13 (late) — First GitHub release v0.1.0 (IPA + Mac zip)
+
+- The user's choice: the release has the prebuilt IPA and Mac zip. I told
+  them first that this is not the same legal setup as the original repo
+  (the binary holds code translated from the game, and the EBOOT key).
+  The repo stays private.
+- Files (`$WORK_DIR/dist/0.1.0`):
+  - `inFamous-0.1.0-ios.ipa`: from `build-ios-ss` (save states, the new
+    two-group menu). sha256 61a9fc45…
+  - `inFamous-0.1.0-mac.zip`: from `build-mac-release` (no save states
+    on Mac yet). sha256 9b2f1808…
+  - THIRD_PARTY_NOTICES.txt, SHA256SUMS.txt.
+- Made with `DEPS_DIR=$WORK_DIR/deps IOS_BUILD=$REPO/infamous-recomp/build-ios-ss
+  infamous-recomp/tools/release_apple.sh 0.1.0 $WORK_DIR/dist/0.1.0`.
+
+### Checks
+
+| test | result |
+|---|---|
+| game file check (release script) | none: ipa 6 files, Mac app 5 files |
+| ipa signing | no provisioning profile; only the two kernel entitlements |
+| personal info in the binaries | no user paths, team, device ids or names |
+| Mac exe | links system libs only, minos 13.0 |
+| Mac release build, headless 100 s (run 20261113-210827-relsmoke) | 17620 flips at 108.7 s, no crash |
+| normal iOS build (`build-ios`) with the UserNotifications link | compiles |
+
+### Other changes
+
+- `release_apple.sh`: `IOS_BUILD=<dir>` picks the iOS build folder.
+- `ios_build.sh`: save states on when `$GAME` (default
+  `~/inFamous/BCES00220`) has `PS3_GAME/USRDIR/EBOOT.elf` (only read);
+  `SAVE_STATES=0` leaves them out.
+- README: in-game menu, save states, iPhone speed now (about 25–30 fps).
+- GitHub: tag `v0.1.0` on the published main, release with the four files.
 
 ## 2026-11-13 (night) — In-game menu: two groups, Restart now, tap to reopen
 
