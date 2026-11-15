@@ -284,12 +284,27 @@ static bool pm_patch_script(uint32_t A)
     return true;
 }
 
-/* "<key>\0<text>\0" -> new text (when it fits) */
+#if defined(__APPLE__)
+/* Save states: a loaded state already holds the patched script (pm_patch_script moved the command array and
+ * overwrote anchor word 7), so the anchor no longer matches. Without this the thread scanned 512 MB of guest
+ * memory every 2 s for 20 minutes after each load (~18% of an iPhone core, ~43% of a Mac core). */
+static bool pm_script_patched(uint32_t A)
+{
+    const uint32_t a_as2 = A + 0x16B4, a_hdr = A + 0x707C;
+    if (!pm_match(A, PM_ANCHOR_W, 7) || !pm_readable(a_as2, 0x40) || !pm_readable(a_hdr, 16)) return false;
+    return vm_read32(A + 0x1C) == a_as2 + 0x30 && vm_read32(a_hdr + 4) == 9 && vm_read32(a_hdr) == a_as2 + 4;
+}
+#endif
+
+/* "<key>\0<text>\0" -> new text (when it fits). 1 = patched; Apple: 2 = it already was (a loaded save state) */
 static int pm_patch_lang_at(uint8_t* p, size_t keylen, const char* nt)
 {
     uint8_t* t = p + keylen + 1; size_t L = 0;
     while (L < 64 && t[L]) L++;
     const size_t nl = std::strlen(nt);
+#if defined(__APPLE__)
+    if (L == nl && !std::memcmp(t, nt, nl)) return 2;
+#endif
     if (L == 0 || L >= 64 || nl > L || !std::memcmp(t, nt, nl)) return 0;
     std::memcpy(t, nt, nl); std::memset(t + nl, 0, L - nl);
     return 1;
@@ -302,6 +317,12 @@ static void pm_thread()
     uint32_t A = 0; bool lq = false, ls = false, script_done = false;
     for (int pass = 0; pass < 600 && !(script_done && lq && ls); pass++) {
         if (!script_done && pm_match(0x4222AA84u, PM_ANCHOR_W, 9)) { A = 0x4222AA84u; script_done = pm_patch_script(A); }
+#if defined(__APPLE__)
+        if (!script_done && pm_script_patched(0x4222AA84u)) {
+            A = 0x4222AA84u; script_done = true;
+            std::fprintf(stderr, "[pausemenu] script 0x%08X already patched (save state)\n", A);
+        }
+#endif
         /* scan committed guest memory 0x40000000..0x60000000 for the script anchor and the two lang keys */
         static const char k_q[] = "u_menu_quit_demo", k_s[] = "u_menu_restart_demo";
         uint8_t* lo = vm_base + 0x40000000ull; uint8_t* hi = vm_base + 0x60000000ull;
@@ -314,13 +335,19 @@ static void pm_thread()
                     if (!script_done && q[0] == 0x01 && !std::memcmp(q, PM_ANCHOR_B, 16)) {
                         const uint32_t ea = (uint32_t)(q - vm_base);
                         if (pm_match(ea, PM_ANCHOR_W, 9)) { A = ea; script_done = pm_patch_script(ea); }
+#if defined(__APPLE__)
+                        else if (pm_script_patched(ea)) {
+                            A = ea; script_done = true;
+                            std::fprintf(stderr, "[pausemenu] script 0x%08X already patched (save state)\n", A);
+                        }
+#endif
                     }
                 }
                 if (!(lq && ls))
                     for (uint8_t* q = (rb < p ? p : rb); q + 96 < re; q++) {
                         if (q[0] != 'u' || q[1] != '_' || q[2] != 'm') continue;
-                        if (!std::memcmp(q, k_q, sizeof k_q)) { if (pm_patch_lang_at(q, sizeof k_q - 1, "Quit Game")) { lq = true; std::fprintf(stderr, "[pausemenu] text Quit Game @0x%08X\n", (uint32_t)(q - vm_base)); } }
-                        else if (!std::memcmp(q, k_s, sizeof k_s)) { if (pm_patch_lang_at(q, sizeof k_s - 1, "Settings")) { ls = true; std::fprintf(stderr, "[pausemenu] text Settings @0x%08X\n", (uint32_t)(q - vm_base)); } }
+                        if (!std::memcmp(q, k_q, sizeof k_q)) { if (int r = pm_patch_lang_at(q, sizeof k_q - 1, "Quit Game")) { lq = true; std::fprintf(stderr, "[pausemenu] text Quit Game @0x%08X%s\n", (uint32_t)(q - vm_base), r == 2 ? " (already)" : ""); } }
+                        else if (!std::memcmp(q, k_s, sizeof k_s)) { if (int r = pm_patch_lang_at(q, sizeof k_s - 1, "Settings")) { ls = true; std::fprintf(stderr, "[pausemenu] text Settings @0x%08X%s\n", (uint32_t)(q - vm_base), r == 2 ? " (already)" : ""); } }
                     }
             }
             p = rb + m.size;
