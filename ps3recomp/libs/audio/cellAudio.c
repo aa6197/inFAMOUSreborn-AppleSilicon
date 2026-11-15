@@ -773,6 +773,13 @@ static int audio_block_empty(const float* src, u32 nfloats)
 static int s_sent = -1;
 static int s_stall_run[CELL_AUDIO_PORT_MAX];
 static unsigned long long s_n_stall, s_n_stall_giveup;
+static unsigned long long s_gu_t0; static int s_gu_n;   /* give-ups in the current 5 s window */
+#if defined(__APPLE__)
+/* Save states: the mixer restarts before the producer threads, and a save freezes them for up to ~1 s, so a few
+ * give-ups right after a save or load are expected. Until this time (time(NULL) s) they don't count toward the
+ * sentinel-off rule (iPhone/iPad: every save switched the sentinel off for the session -> choppy audio). */
+static volatile unsigned long long s_gu_grace_until;
+#endif
 static int audio_sent_on(void)
 {
     if (s_sent < 0) { const char* e = getenv("AUDIO_SENTINEL"); s_sent = (e && *e == '0') ? 0 : 1; }
@@ -881,12 +888,16 @@ static void audio_mix_one_block(void)
         if (hole && audio_sent_on()) {
             if (s_stall_run[p] < audio_stall_max()) { stall = 1; s_stall_run[p]++; s_n_stall++; }
             else {
-                static unsigned long long s_gu_t0; static int s_gu_n;
                 const unsigned long long now = (unsigned long long)time(NULL);
                 if (now - s_gu_t0 > 5) { s_gu_t0 = now; s_gu_n = 0; }
                 s_stall_run[p] = 0; s_port_recent[p] = 0; s_n_stall_giveup++;
-                fprintf(stderr, "[audio] v145 port %d: producer silent for %d blocks -> advancing\n", p, audio_stall_max());
-                if (++s_gu_n >= 3) {
+                int counts = 1;
+#if defined(__APPLE__)
+                if (now < s_gu_grace_until) counts = 0;
+#endif
+                fprintf(stderr, "[audio] v145 port %d: producer silent for %d blocks -> advancing%s\n", p, audio_stall_max(),
+                        counts ? "" : " (after a save/load: not counted)");
+                if (counts && ++s_gu_n >= 3) {
                     s_sent = 0;
                     for (int q = 0; q < CELL_AUDIO_PORT_MAX; q++) {
                         AudioPortSlot* pq = &s_ports[q];
@@ -2074,9 +2085,16 @@ s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
  * -----------------------------------------------------------------------*/
 /* on = 1: park the mixing thread (waits up to ~1 s). No stdio: the save calls
  * this while the PPU threads are suspended. */
+/* Forget the stall state and open the give-up grace window. Only while the mixer is parked or not started. */
+static void audio_ss_settle(void)
+{
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) { s_stall_run[p] = 0; s_port_recent[p] = 0; }
+    s_gu_n = 0;
+    s_gu_grace_until = (unsigned long long)time(NULL) + 8;
+}
 int ss_audio_hold(int on)
 {
-    if (!on) { __atomic_store_n(&s_audio_ss_hold, 0, __ATOMIC_SEQ_CST); return 1; }
+    if (!on) { audio_ss_settle(); __atomic_store_n(&s_audio_ss_hold, 0, __ATOMIC_SEQ_CST); return 1; }
     __atomic_store_n(&s_audio_ss_hold, 1, __ATOMIC_SEQ_CST);
     if (!s_mix_thread_running) return 1;
     for (int k = 0; k < 2000; k++) {
@@ -2104,6 +2122,7 @@ int ss_audio_restore(void)
     mutex_init(&s_audio_mutex);
     if (audio_backend_init() < 0)
         fprintf(stderr, "[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
+    audio_ss_settle();
     if (audio_start_mix_thread() < 0)
         fprintf(stderr, "[cellAudio] WARNING: Could not start mixing thread\n");
     return n;
