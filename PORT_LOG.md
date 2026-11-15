@@ -70,7 +70,10 @@ Read this first every session. Newest entry on top.
   works (save ~0.8 s, load ~0.5 s). Movies after a load work again
   (the Bink decoder thread is saved and started again), also a save
   made in the middle of a movie. iOS save states done; next: Mac.
+  11-15: ticking audio after any save and extra CPU after a load are
+  fixed (entry "Save states: ticking audio, pause-menu scan").
   See entries
+  "Save states: ticking audio, pause-menu scan",
   "Save states: movies after a load", "Save states on iPad",
   "Save states: clocks", "Save states: audio",
   "Save states: SPURS taskset task",
@@ -162,6 +165,45 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 
 ---
 
+
+## 2026-11-15 — Save states: ticking audio, pause-menu scan
+
+User report (iPhone and iPad): after a resume the audio goes "tick tick
+tick", and on the iPhone the game stutters more.
+
+**1. Ticking audio after any save** (menu save or the background
+auto.ss save, then play on in the same session).
+- Cause: while the save holds the mixer, the audio producers stop. When
+  it lets go, ports with no new block hit the v145 stall limit
+  (24 blocks) and give up. 3 give-ups in 5 s turn the sentinel off for
+  the rest of the session, so holes play as clicks again.
+- Fix (`cellAudio.c`, Apple only): `audio_ss_settle()` on release of the
+  save hold and after `ss_audio_restore`: clears the stall counters and
+  gives 8 s in which give-ups don't count toward the sentinel-off rule
+  (logged "after a save/load: not counted"). The 5 s window counters are
+  now file statics so the reset can reach them.
+- Mac check: save at 200 s, sentinel stays on, 0 give-ups after it.
+
+**2. Extra CPU after a load** (the iPhone stutter, and more audio holes).
+- Cause: `pm_thread` (`stubs.cpp`, adds "Settings" / "Quit Game" to the
+  pause menu) scans guest memory 0x40000000–0x60000000 every 2 s until
+  it has patched the script and both texts. After a load they are
+  already patched (they are in the saved memory), so it never found
+  anything to patch and scanned 512 MB every 2 s for 20 min. Measured
+  with `sample`: ~43% of a core on the Mac; ~18% of an iPhone core (on a
+  6-core phone that is already short of cores).
+- Fix (Apple only): `pm_script_patched()` sees the already-patched script
+  (its jump goes to our blob, header count 9), and `pm_patch_lang_at()`
+  returns 2 when the text is already ours. Logs "already patched (save
+  state)" / "(already)", then "done". Windows code paths unchanged.
+- Mac check after a load: "done: script ok, 2 texts" at once. Late
+  audio holes summed over the run's `[audio-rate]` lines: old build
+  442 (17 lines, run busyB), new build 2 (20 lines, run fixD, with a
+  save at 60 s and no sentinel-off). Different save files, same scene.
+
+Both are in the iOS save-state build (`build-ios-ss`, 11-15 14:00). Not
+yet installed on the iPhone / iPad: a new build can't load saves from
+the old one, so the user decides when.
 
 ## 2026-11-13 (late) — First GitHub release v0.1.0 (IPA + Mac zip)
 
