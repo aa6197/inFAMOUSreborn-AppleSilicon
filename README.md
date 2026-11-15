@@ -33,7 +33,7 @@ This is a Mac and iPad port of [inFAMOUSreborn](https://github.com/whompay/inFAM
 
 There are two ways to get the app:
 
-- **Download it** from the [Releases](https://github.com/SubhanHabib/inFAMOUSreborn-AppleSilicon/releases) page. You don't need any developer tools. Steps below
+- **Download it** from the [Releases](https://github.com/username-promised-to-me-3000-years-ago/inFAMOUSreborn-AppleSilicon/releases) page. You don't need any developer tools. Steps below
 - **Build it yourself** on a Mac. See [Build it yourself](#build-it-yourself)
 
 Either way, you then [add your game](#add-your-game) in the app.
@@ -139,7 +139,7 @@ You need a Mac with Apple Silicon, Xcode, [Homebrew](https://brew.sh), your own 
    ```
 2. Get the code and build the installer
    ```bash
-   git clone https://github.com/SubhanHabib/inFAMOUSreborn-AppleSilicon.git
+   git clone https://github.com/username-promised-to-me-3000-years-ago/inFAMOUSreborn-AppleSilicon.git
    cd inFAMOUSreborn-AppleSilicon
    cd installer && cargo build --release && cd ..
    ```
