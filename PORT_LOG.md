@@ -4,8 +4,9 @@ Read this first every session. Newest entry on top.
 
 ## Now
 
-- **End-user release:** v0.1.0 is on GitHub (11-13, IPA + Mac zip, user's
-  choice; see entry "First GitHub release"). Prebuilt Mac app and iPad .ipa with no game
+- **End-user release:** v0.1.1 is on GitHub (11-15, IPA + Mac zip, user's
+  choice; v0.1.0 release deleted; see entries "Release v0.1.1" and
+  "First GitHub release"). Prebuilt Mac app and iPad .ipa with no game
   files. The player picks their own disc image or game folder at first
   start; the app unpacks it, decrypts EBOOT.BIN and checks it. See entry
   "End-user release: in-app disc import". Make the files with
@@ -166,6 +167,22 @@ Table: `python3.12 $WORK_DIR/tools/speed_table.py`.
 ---
 
 
+## 2026-11-15 — Release v0.1.1
+
+- User asked: push, new release, remove the old one.
+- `project(VERSION 0.1.1)` (only used by `ios/Info.plist.in`).
+  Rebuilt `build-mac-release` and `build-ios-ss`, then
+  `DEPS_DIR=$WORK_DIR/deps IOS_BUILD=<repo>/infamous-recomp/build-ios-ss
+  release_apple.sh 0.1.1 $WORK_DIR/dist/0.1.1`: game-file check clean.
+- Published the clean copy (leak check clean) and pushed it to the
+  private repo's `main` (e1cdc2a).
+- GitHub release **v0.1.1** (Latest): IPA 52.8 MB, Mac zip 47.3 MB,
+  SHA256SUMS, THIRD_PARTY_NOTICES. Notes: as 0.1.0 plus "Fixed in 0.1.1"
+  (audio ticks after a save, smoother after a load, 0.1.0 saves don't
+  load). The v0.1.0 release is deleted; its git tag is kept.
+- The iPhone and iPad have the same code (installed before the version
+  bump, so they still say 0.1.0 in Settings).
+
 ## 2026-11-15 — Save states: ticking audio, pause-menu scan
 
 User report (iPhone and iPad): after a resume the audio goes "tick tick
@@ -201,9 +218,8 @@ auto.ss save, then play on in the same session).
   442 (17 lines, run busyB), new build 2 (20 lines, run fixD, with a
   save at 60 s and no sentinel-off). Different save files, same scene.
 
-Both are in the iOS save-state build (`build-ios-ss`, 11-15 14:00). Not
-yet installed on the iPhone / iPad: a new build can't load saves from
-the old one, so the user decides when.
+Both are in the iOS save-state build (`build-ios-ss`). Installed on the
+iPhone and the iPad (11-15, user's OK; old saves no longer load there).
 
 ## 2026-11-13 (late) — First GitHub release v0.1.0 (IPA + Mac zip)
 
