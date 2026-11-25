@@ -14,7 +14,7 @@
  * 87.5, 75, 62.5, 50 = 630p, 540p, 450p, 360p), upscaled to the screen
  * (rsx_draw_engine.c RENDER_SCALE). Read at start: a change needs a restart.
  *
- * "Upscaling": 1 MetalFX (default on iOS), 0 plain linear (METALFX). */
+ * "Upscaling": 1 MetalFX, 0 plain linear (default; METALFX). */
 #pragma once
 #import <Foundation/Foundation.h>
 #include <stdio.h>

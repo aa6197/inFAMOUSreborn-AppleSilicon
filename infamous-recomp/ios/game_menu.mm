@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 extern "C" void port_app_set_paused(int paused);   /* main.cpp: 0 run, 1 background, 2 menu */
@@ -54,7 +55,7 @@ typedef struct { const char* title; NSString* key; int n; const char* names[5]; 
 static const MenuRow kRows[] = {
     { "Shadows",    @"Shadows",     3, { "On", "Near only", "Off" },                     { 2, 1, 0 } },
     { "Resolution", @"RenderScale", 5, { "720p", "630p", "540p", "450p", "360p" },        { 100, 87.5, 75, 62.5, 50 } },
-    { "Upscaling",  @"Upscaling",   2, { "MetalFX", "Simple" },                          { 1, 0 } },
+    { "Upscaling",  @"Upscaling",   2, { "Simple", "MetalFX" },                          { 0, 1 } },
 };
 enum { NROWS = sizeof kRows / sizeof kRows[0], ROW_SHADOWS = 0, ROW_RESOLUTION = 1, ROW_UPSCALING = 2 };
 /* What the gamepad can point at, top to bottom. */
@@ -104,7 +105,12 @@ static double running_value(int row)
     switch (row) {
     case ROW_SHADOWS: { const int n = rsx_engine_shadow_maps(); return n < 0 ? 2 : n == 0 ? 0 : 1; }
     case ROW_RESOLUTION: return (e = getenv("RENDER_SCALE")) && *e ? atof(e) : 100;
-    default: return (e = getenv("METALFX")) && *e == '0' ? 0 : 1;
+    case ROW_UPSCALING:
+        e = getenv("METALFX");
+        if (e && *e) return *e != '0';
+        e = getenv("UPSCALER");
+        return e && *e ? strcasecmp(e, "off") != 0 : 0;
+    default: return 0;
     }
 }
 
