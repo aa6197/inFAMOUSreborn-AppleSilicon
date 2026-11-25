@@ -190,6 +190,8 @@ Want an `.ipa` file instead, to install with SideStore or AltStore? After step 4
 infamous-recomp/tools/release_apple.sh
 ```
 
+You can also build one on demand from GitHub Actions: open **Actions → Build iOS IPA → Run workflow**. This workflow only runs when manually started on `main`, and uploads the IPA as a downloadable artifact. It requires an Apple Silicon Mac registered as a self-hosted GitHub Actions runner, with the generated `infamous-recomp/recompiled` sources in its persistent workspace. Those sources are generated locally from your own game files; they are not included in this repository. The workflow builds ad-hoc, so install the downloaded IPA with SideStore, AltStore or Sideloadly.
+
 The release apps are made with the same script. See [PORT_LOG.md](PORT_LOG.md) for the release build, the iPad build and every switch.
 
 ## Credits
