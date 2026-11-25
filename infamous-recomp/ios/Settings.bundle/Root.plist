@@ -11,7 +11,7 @@
 			<key>Title</key>
 			<string>Graphics</string>
 			<key>FooterText</key>
-			<string>Shadows take a lot of work every frame. Near only or Off gives a higher frame rate. Upscaling and Shadows change when you go back to the game. Resolution changes the next time the game starts.</string>
+			<string>Shadows take a lot of work every frame. Near only or Off gives a higher frame rate. Simple upscaling is faster; MetalFX is available if you prefer a sharper image. Upscaling and Shadows change when you go back to the game. Resolution changes the next time the game starts.</string>
 		</dict>
 		<dict>
 			<key>Type</key>
@@ -69,16 +69,16 @@
 			<key>Key</key>
 			<string>Upscaling</string>
 			<key>DefaultValue</key>
-			<integer>1</integer>
+			<integer>0</integer>
 			<key>Titles</key>
 			<array>
-				<string>MetalFX</string>
 				<string>Simple</string>
+				<string>MetalFX</string>
 			</array>
 			<key>Values</key>
 			<array>
-				<integer>1</integer>
 				<integer>0</integer>
+				<integer>1</integer>
 			</array>
 		</dict>
 	</array>

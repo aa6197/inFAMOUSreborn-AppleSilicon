@@ -4375,7 +4375,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage,
  * equivalent is FSR / DLSS upscaling (UPSCALER in settings.ini). Only the
  * letterboxed present uses it, so a game-sized window or headless output is
  * unchanged. METALFX=1/0 wins; else UPSCALER=off turns it off and any other
- * UPSCALER value on; else it is on for iOS and off for macOS. */
+ * UPSCALER value on; else it is off by default. */
 static int eng_metalfx_on(void)
 {
     if (s_mfx_on >= 0) return s_mfx_on;
@@ -4383,7 +4383,7 @@ static int eng_metalfx_on(void)
     const char* u = getenv("UPSCALER");
     if (e && *e)      s_mfx_on = (*e != '0');
     else if (u && *u) s_mfx_on = (strcasecmp(u, "off") != 0);
-    else              s_mfx_on = TARGET_OS_IPHONE ? 1 : 0;
+    else              s_mfx_on = 0;
     if (s_mfx_on && ![MTLFXSpatialScalerDescriptor supportsDevice:s_dev]) {
         fprintf(stderr, "[metalfx] spatial scaler not supported on this GPU; plain scaling\n");
         s_mfx_on = 0;
