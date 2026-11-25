@@ -1,0 +1,77 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version used in the IPA filename
+        required: true
+        default: "0.1.1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Keep this workflow on the trusted default branch: the runner has local,
+    # generated game code which must not be exposed to untrusted branches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Keep ignored generated sources and build dependencies in the
+          # persistent workspace between manually triggered runs.
+          clean: false
+
+      - name: Validate build inputs
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$ ]]; then
+            echo "::error::Version must be 1-32 letters, numbers, dots, underscores, or hyphens."
+            exit 1
+          fi
+          if [[ ! -f infamous-recomp/recompiled/ppu_recomp.h ]] ||
+             ! find infamous-recomp/recompiled -maxdepth 1 -type f \( -name '*.c' -o -name '*.cpp' \) -print -quit | grep -q .; then
+            echo "::error::Generated game sources are missing. Prepare infamous-recomp/recompiled in this persistent runner workspace using your own game files."
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: brew install cmake ninja python@3.12
+
+      - name: Build iOS libraries
+        shell: bash
+        run: |
+          deps_dir="$HOME/inFamous/deps"
+          if [[ ! -f "$deps_dir/iphoneos/.github-actions-ready" ]]; then
+            DEPS_DIR="$deps_dir" PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+              infamous-recomp/tools/ios_deps.sh
+            touch "$deps_dir/iphoneos/.github-actions-ready"
+          fi
+
+      - name: Build iOS app
+        run: |
+          DEPS_DIR="$HOME/inFamous/deps" \
+          PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+          SAVE_STATES=0 \
+            infamous-recomp/tools/ios_build.sh ""
+
+      - name: Package IPA
+        env:
+          VERSION: ${{ inputs.version }}
+          IPA_DIR: ${{ runner.temp }}/ipa
+        run: |
+          mkdir -p "$IPA_DIR"
+          DEPS_DIR="$HOME/inFamous/deps" \
+            infamous-recomp/tools/release_apple.sh "$VERSION" "$IPA_DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: inFamous-${{ inputs.version }}-ios
+          path: ${{ runner.temp }}/ipa/inFamous-${{ inputs.version }}-ios.ipa
+          if-no-files-found: error
+          retention-days: 14
